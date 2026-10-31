@@ -31,18 +31,10 @@ PROVIDERS = [
     ("huggingface", "HuggingFace", "HUGGINGFACE_API_KEY", "https://router.huggingface.co/v1/chat/completions", "Qwen/Qwen2.5-7B-Instruct"),
 ]
 
-def on_render():
-    # Render sets RENDER=true; there is no local Ollama there.
-    return bool(os.environ.get("RENDER"))
-
 def default_model():
-    # On Render default to the first cloud provider that has its key set,
-    # so chat works instead of pointing at a nonexistent local Ollama.
-    if not on_render():
-        return "local"
-    for pid, _name, env, _url, _model in PROVIDERS:
-        if pid not in ("local", "ollama-qwen") and os.environ.get(env):
-            return pid
+    # Termux-only dashboard: the phone's local Ollama Llama comes first,
+    # matching Vektor's local-first cascade. Cloud fallback is picked
+    # per-message from the Models tab.
     return "local"
 
 def provider_models():
@@ -50,7 +42,7 @@ def provider_models():
         if bool(os.environ.get(env)):
             return True
         if pid == "local":
-            return not on_render()  # no Ollama on Render
+            return True  # Termux-only dashboard: the phone's Ollama is the home model
         if pid == "ollama-qwen":
             return bool(os.environ.get("OLLAMA_BASE_URL"))
         return False
