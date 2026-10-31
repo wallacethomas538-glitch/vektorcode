@@ -31,8 +31,30 @@ PROVIDERS = [
     ("huggingface", "HuggingFace", "HUGGINGFACE_API_KEY", "https://router.huggingface.co/v1/chat/completions", "Qwen/Qwen2.5-7B-Instruct"),
 ]
 
+def on_render():
+    # Render sets RENDER=true; there is no local Ollama there.
+    return bool(os.environ.get("RENDER"))
+
+def default_model():
+    # On Render default to the first cloud provider that has its key set,
+    # so chat works instead of pointing at a nonexistent local Ollama.
+    if not on_render():
+        return "local"
+    for pid, _name, env, _url, _model in PROVIDERS:
+        if pid not in ("local", "ollama-qwen") and os.environ.get(env):
+            return pid
+    return "local"
+
 def provider_models():
-    return [{"id":pid,"name":name,"provider":name,"key_env":env,"configured":bool(os.environ.get(env)) or pid == "local" or (pid == "ollama-qwen" and bool(os.environ.get("OLLAMA_BASE_URL"))),"model":model,"quota":"Configured" if (bool(os.environ.get(env)) or pid == "local" or (pid == "ollama-qwen" and os.environ.get("OLLAMA_BASE_URL"))) else "TBD","cost":0} for pid,name,env,url,model in PROVIDERS]
+    def is_configured(pid, env):
+        if bool(os.environ.get(env)):
+            return True
+        if pid == "local":
+            return not on_render()  # no Ollama on Render
+        if pid == "ollama-qwen":
+            return bool(os.environ.get("OLLAMA_BASE_URL"))
+        return False
+    return [{"id":pid,"name":name,"provider":name,"key_env":env,"configured":is_configured(pid, env),"model":model,"quota":"Configured" if is_configured(pid, env) else "TBD","cost":0} for pid,name,env,url,model in PROVIDERS]
 
 MODELS = provider_models()
 TOOLS = [
@@ -120,7 +142,7 @@ class Handler(BaseHTTPRequestHandler):
         # The dashboard's selected provider is currently represented by the
         # configured OpenAI-compatible endpoint/model. Keep the API key
         # server-side and never accept provider credentials from the browser.
-        selected = data.get("model") or self.setting("active_model", "local")
+        selected = data.get("model") or self.setting("active_model", default_model())
         entry = next((x for x in PROVIDERS if x[0] == selected), PROVIDERS[0])
         pid, provider, key_env, endpoint, model = entry
         if endpoint == "local": endpoint = (os.environ.get("OLLAMA_BASE_URL", LLM_URL).rstrip("/") + "/v1/chat/completions") if pid == "local" or os.environ.get("OLLAMA_BASE_URL") else os.environ.get("QWEN_API_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions")
@@ -198,7 +220,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/state":
             conn = db(); sessions = [dict(x) for x in conn.execute("SELECT * FROM sessions ORDER BY updated DESC")]
             receipts = [dict(x) for x in conn.execute("SELECT * FROM receipts ORDER BY created DESC LIMIT 30")]; conn.close()
-            enabled = self.setting("tools", []); active = self.setting("active_model", "local")
+            enabled = self.setting("tools", []); active = self.setting("active_model", default_model())
             self.send_json({"models":provider_models(), "tools":[{"id":a,"name":b,"description":c,"enabled":a in enabled,"locked":a in {"fangs","antivirus","shell","web","composio"}} for a,b,c in TOOLS], "active_model":active, "health":self.setting("health", {"providers":[]}), "mcp":{"connected":bool(os.environ.get("MCP_SERVER_URL") or os.environ.get("COMPOSIO_MCP_URL")),"capabilities":[x[1] for x in TOOLS]}, "composio":{"connected":bool(os.environ.get("COMPOSIO_API_KEY") or os.environ.get("COMPOSIO_MCP_URL"))}, "meta":{"configured":meta_ready(),"profile":self.setting("meta_profile", None)}, "media":{"provider":"Pollinations","configured":bool(os.environ.get("POLLINATIONS_API_KEY"))}, "auth":{"enabled":bool(os.environ.get("VEKTORCODE_TOOL_PASSWORD")),"authenticated":require_auth(self)}, "sessions":sessions, "receipts":receipts, "kill_switch":self.setting("kill_switch", False)}); return
         if self.path in ("/", "/index.html") or self.path.startswith("/static/"):
             rel = "index.html" if self.path in ("/", "/index.html") else self.path.removeprefix("/static/")
