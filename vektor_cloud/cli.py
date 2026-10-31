@@ -29,9 +29,10 @@ def cmd_do(args):
 
 
 def cmd_chat(args):
-    """Interactive chat session (draft-only)."""
-    core = VektorCore()
-    print("Vektor chat — type 'exit' to quit. Draft-only, nothing executes.")
+    """Interactive chat session — real replies through the free cascade."""
+    from vektor_cloud.free_cascade import Cascade
+    cascade = Cascade()
+    print("Vektor chat — type 'exit' to quit. Free-tier only, nothing paid, nothing executes.")
     while True:
         try:
             user_in = input("\nYou: ").strip()
@@ -43,8 +44,11 @@ def cmd_chat(args):
             break
         if not user_in:
             continue
-        result = core.run_command(user_in, approved=False)
-        print(f"\nVektor: {result.get('output', result.get('reason', 'No output'))}")
+        result = cascade.chat(user_in)
+        if result.get("status") == "ok":
+            print(f"\nVektor: {result['reply']}")
+        else:
+            print(f"\nVektor: {result.get('reason', 'No output')}")
     return 0
 
 

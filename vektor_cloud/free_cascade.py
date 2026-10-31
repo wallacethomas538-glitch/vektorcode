@@ -43,3 +43,99 @@ class Cascade:
             self.ledger.record(prov, model, 0.0)
         # No real model call in scaffold — this is the routing decision, tested with fakes below.
         return {"status": "routed_free", "provider": prov, "key_index": i, "cost": 0, "executed": False}
+
+# --- Real chat path (added 2026-10-31): actual HTTP calls, never paid. ---
+import json
+import urllib.request
+import urllib.error
+from urllib.parse import quote
+
+_CHAT_MODELS = {
+    "GROQ": "llama-3.3-70b-versatile",
+    "OPENROUTER": "meta-llama/llama-3.3-70b-instruct:free",
+    "GEMINI": "gemini-2.0-flash",
+    "POLLINATIONS": None,  # keyless GET
+}
+_PROVIDER_ORDER = ("GROQ", "OPENROUTER", "GEMINI", "POLLINATIONS")
+
+
+def _post_json(url, body, headers, timeout=30):
+    req = urllib.request.Request(
+        url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _extract_openai_text(data):
+    try:
+        return data["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError, TypeError, AttributeError):
+        return ""
+
+
+def _call_provider(provider, key, prompt):
+    """One real chat call. Returns reply text, or None if the key/provider failed."""
+    from vektor_cloud import free_providers
+    if provider == "POLLINATIONS":
+        url = free_providers.text_url("POLLINATIONS") + quote(prompt)
+        from vektor_cloud.egress import guard_url
+        guard_url(url)
+        with urllib.request.urlopen(url, timeout=60) as resp:
+            return resp.read().decode("utf-8").strip() or None
+    url = free_providers.text_url(provider)
+    if not url:
+        return None
+    if provider == "GEMINI":
+        body = {"contents": [{"parts": [{"text": prompt}]}]}
+        data = _post_json(f"{url}/{_CHAT_MODELS['GEMINI']}:generateContent?key={key}",
+                          body, {"Content-Type": "application/json"})
+        try:
+            return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except (KeyError, IndexError, TypeError):
+            return None
+    # OpenAI-compatible (Groq, OpenRouter)
+    body = {"model": _CHAT_MODELS[provider],
+            "messages": [{"role": "user", "content": prompt}]}
+    headers = {"Content-Type": "application/json",
+               "Authorization": f"Bearer {key}"}
+    if provider == "OPENROUTER":
+        headers["HTTP-Referer"] = "https://gojojoes.com"
+        headers["X-Title"] = "Vektor"
+    data = _post_json(url, body, headers)
+    return _extract_openai_text(data) or None
+
+
+def chat(self, prompt: str) -> dict:
+    """Real conversational reply through the free cascade.
+
+    Tries each provider's keys in order. On 429/quota or bad key, marks
+    that key dry and moves on. Never touches a paid model. Returns
+    {'status': 'ok', 'provider': ..., 'reply': ...} or honest degradation.
+    """
+    for prov in _PROVIDER_ORDER:
+        keys = keys_for(prov) if prov != "POLLINATIONS" else [None]
+        for i, k in enumerate(keys):
+            if prov != "POLLINATIONS" and (prov, i) in self.dry:
+                continue
+            try:
+                reply = _call_provider(prov, k, prompt)
+            except urllib.error.HTTPError as e:
+                if e.code in (401, 403, 429):
+                    if prov != "POLLINATIONS":
+                        self.mark_dry(prov, i)
+                    continue
+                return {"status": "error",
+                        "reason": f"{prov} returned HTTP {e.code}"}
+            except Exception as e:
+                continue  # network/timeout: try next key/provider
+            if reply:
+                if self.ledger is not None:
+                    self.ledger.record(prov, _CHAT_MODELS.get(prov) or "pollinations", 0.0)
+                return {"status": "ok", "provider": prov, "reply": reply}
+            if prov != "POLLINATIONS":
+                self.mark_dry(prov, i)
+    return {"status": "all_free_tiers_dry",
+            "reason": "No free provider answered. Set a key (e.g. GEMINI_API_KEY) and try again."}
+
+
+Cascade.chat = chat
