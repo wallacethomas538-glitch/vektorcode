@@ -13,15 +13,27 @@ DB = ROOT / "vektorcode.db"
 VEKTOR_ROOT = Path(os.environ.get("VEKTOR_ROOT", str(ROOT.parent / "vektor")))
 VEKTOR_STATE = Path(os.environ.get("VEKTOR_STATE_DIR", str(ROOT.parent / ".vektor")))
 PORT = int(os.environ.get("VEKTORCODE_PORT", "8765"))
-LLM_URL = os.environ.get("HERMES_LLM_URL", "http://127.0.0.1:11434/v1/chat/completions")
-LLM_MODEL = os.environ.get("HERMES_LLM_MODEL", "llama3.2")
+LLM_URL = os.environ.get("LLM_URL", "http://127.0.0.1:11434/v1/chat/completions")
+LLM_MODEL = os.environ.get("LLM_MODEL", "llama3.2")
 
-MODELS = [
-    {"id":"local", "name":"Local model", "provider":"Local", "quota":"Unlimited", "cost":0},
-    {"id":"groq", "name":"Groq free tier", "provider":"Groq", "quota":"Unknown until connected", "cost":0},
-    {"id":"gemini", "name":"Gemini free tier", "provider":"Gemini", "quota":"Unknown until connected", "cost":0},
-    {"id":"openrouter", "name":"OpenRouter free", "provider":"OpenRouter", "quota":"Unknown until connected", "cost":0},
+PROVIDERS = [
+    ("local", "Local (Ollama)", "OLLAMA_BASE_URL", "local", "llama3.2"),
+    ("groq", "Groq", "GROQ_API_KEY", "https://api.groq.com/openai/v1/chat/completions", "llama-3.1-8b-instant"),
+    ("gemini", "Gemini", "GEMINI_API_KEY", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", "gemini-2.0-flash"),
+    ("openrouter", "OpenRouter", "OPENROUTER_API_KEY", "https://openrouter.ai/api/v1/chat/completions", "openrouter/auto"),
+    ("meta", "Meta", "META_API_KEY", "https://api.llama.com/v1/chat/completions", "Llama-4-Scout-17B-16E-Instruct-FP8"),
+    ("openai", "OpenAI", "OPENAI_API_KEY", "https://api.openai.com/v1/chat/completions", "gpt-4o-mini"),
+    ("ollama-qwen", "Ollama / Qwen", "QWEN_API_KEY", "local", "qwen2.5:7b"),
+    ("cohere", "Cohere", "COHERE_API_KEY", "https://api.cohere.com/compatibility/v1/chat/completions", "command-r7b-12-2024"),
+    ("mistral", "Mistral", "MISTRAL_API_KEY", "https://api.mistral.ai/v1/chat/completions", "mistral-small-latest"),
+    ("together", "Together AI", "TOGETHER_API_KEY", "https://api.together.xyz/v1/chat/completions", "meta-llama/Llama-3.3-70B-Instruct-Turbo"),
+    ("huggingface", "HuggingFace", "HUGGINGFACE_API_KEY", "https://router.huggingface.co/v1/chat/completions", "Qwen/Qwen2.5-7B-Instruct"),
 ]
+
+def provider_models():
+    return [{"id":pid,"name":name,"provider":name,"key_env":env,"configured":bool(os.environ.get(env)) or pid == "local" or (pid == "ollama-qwen" and bool(os.environ.get("OLLAMA_BASE_URL"))),"model":model,"quota":"Configured" if (bool(os.environ.get(env)) or pid == "local" or (pid == "ollama-qwen" and os.environ.get("OLLAMA_BASE_URL"))) else "TBD","cost":0} for pid,name,env,url,model in PROVIDERS]
+
+MODELS = provider_models()
 TOOLS = [
     ("fangs", "FANGS scans", "Network and surface scans"),
     ("antivirus", "Antivirus", "Local malware checks"),
@@ -52,7 +64,7 @@ def vektor_system_prompt():
         content = read_context_file(memory_dir / name, 12000)
         if content:
             memories.append(f"## {name}\n{content}")
-    parts = ["You are VektorCode, the Vektor assistant. Follow the shared Vektor identity and memory below."]
+    parts = ["You are Vektor, the VektorCode assistant. Follow the shared Vektor identity and memory below."]
     if soul:
         parts.append(f"# Shared identity (SOUL.md)\n{soul}")
     if memories:
@@ -107,26 +119,32 @@ class Handler(BaseHTTPRequestHandler):
         # The dashboard's selected provider is currently represented by the
         # configured OpenAI-compatible endpoint/model. Keep the API key
         # server-side and never accept provider credentials from the browser.
-        model = os.environ.get("HERMES_LLM_MODEL", LLM_MODEL)
+        selected = data.get("model") or self.setting("active_model", "local")
+        entry = next((x for x in PROVIDERS if x[0] == selected), PROVIDERS[0])
+        pid, provider, key_env, endpoint, model = entry
+        if endpoint == "local": endpoint = (os.environ.get("OLLAMA_BASE_URL", LLM_URL).rstrip("/") + "/v1/chat/completions") if pid == "local" or os.environ.get("OLLAMA_BASE_URL") else os.environ.get("QWEN_API_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions")
+        if pid != "local" and not os.environ.get(key_env):
+            self.send_json({"ok":False,"error":provider + " is not configured"}, 400); return
+        model = os.environ.get("LLM_MODEL", model) if pid == "local" else model
         # Keep the shared identity server-side; clients cannot override it.
         llm_messages = [{"role":"system", "content":vektor_system_prompt()}] + messages
         payload = json.dumps({"model":model, "messages":llm_messages, "stream":False}).encode()
         headers = {"Content-Type":"application/json"}
-        api_key = os.environ.get("HERMES_LLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
+        api_key = os.environ.get(key_env) if pid != "local" else os.environ.get("OLLAMA_API_KEY")
         if api_key: headers["Authorization"] = "Bearer " + api_key
         started = time.time()
         try:
-            req = Request(os.environ.get("HERMES_LLM_URL", LLM_URL), data=payload, headers=headers, method="POST")
+            req = Request(endpoint, data=payload, headers=headers, method="POST")
             with urlopen(req, timeout=120) as response: result = json.loads(response.read())
             choice = result.get("choices", [{}])[0]
             message = choice.get("message", {}).get("content", "")
             if not isinstance(message, str) or not message.strip():
                 self.send_json({"ok":False, "error":"LLM returned an empty response"}, 502); return
             latency = round((time.time() - started) * 1000)
-            receipt("hermes_chat", {"model":model, "latency_ms":latency})
-            self.send_json({"ok":True, "message":message, "model":model, "latency_ms":latency})
+            receipt("vektor_chat", {"provider":provider,"model":model, "latency_ms":latency})
+            self.send_json({"ok":True, "message":message, "model":model, "provider":provider, "latency_ms":latency})
         except (HTTPError, URLError, TimeoutError, ValueError) as exc:
-            receipt("hermes_chat_error", {"error":str(exc)[:240]}, True)
+            receipt("vektor_chat_error", {"provider":provider,"error":str(exc)[:240]}, True)
             self.send_json({"ok":False, "error":"LLM unavailable: " + str(exc)[:240]}, 502)
     def web_search(self, data):
         query = data.get("query", "")
@@ -177,7 +195,7 @@ class Handler(BaseHTTPRequestHandler):
             conn = db(); sessions = [dict(x) for x in conn.execute("SELECT * FROM sessions ORDER BY updated DESC")]
             receipts = [dict(x) for x in conn.execute("SELECT * FROM receipts ORDER BY created DESC LIMIT 30")]; conn.close()
             enabled = self.setting("tools", []); active = self.setting("active_model", "local")
-            self.send_json({"models":MODELS, "tools":[{"id":a,"name":b,"description":c,"enabled":a in enabled,"locked":a in {"fangs","antivirus","shell","web","composio"}} for a,b,c in TOOLS], "active_model":active, "health":self.setting("health", {"api":"Local ready","latency_ms":0,"error_rate":"0%","uptime":"Local process"}), "composio":{"connected":bool(os.environ.get("COMPOSIO_MCP_URL"))}, "meta":{"configured":meta_ready(),"profile":self.setting("meta_profile", None)}, "media":{"provider":"Pollinations","configured":bool(os.environ.get("POLLINATIONS_API_KEY"))}, "auth":{"enabled":bool(os.environ.get("VEKTORCODE_TOOL_PASSWORD")),"authenticated":bool(getattr(self,"auth",False))}, "sessions":sessions, "receipts":receipts, "kill_switch":self.setting("kill_switch", False)}); return
+            self.send_json({"models":provider_models(), "tools":[{"id":a,"name":b,"description":c,"enabled":a in enabled,"locked":a in {"fangs","antivirus","shell","web","composio"}} for a,b,c in TOOLS], "active_model":active, "health":self.setting("health", {"providers":[]}), "mcp":{"connected":bool(os.environ.get("MCP_SERVER_URL") or os.environ.get("COMPOSIO_MCP_URL")),"capabilities":[x[1] for x in TOOLS]}, "composio":{"connected":bool(os.environ.get("COMPOSIO_API_KEY") or os.environ.get("COMPOSIO_MCP_URL"))}, "meta":{"configured":meta_ready(),"profile":self.setting("meta_profile", None)}, "media":{"provider":"Pollinations","configured":bool(os.environ.get("POLLINATIONS_API_KEY"))}, "auth":{"enabled":bool(os.environ.get("VEKTORCODE_TOOL_PASSWORD")),"authenticated":require_auth(self)}, "sessions":sessions, "receipts":receipts, "kill_switch":self.setting("kill_switch", False)}); return
         if self.path in ("/", "/index.html") or self.path.startswith("/static/"):
             rel = "index.html" if self.path in ("/", "/index.html") else self.path.removeprefix("/static/")
             target = (ROOT / "static" / rel).resolve()
@@ -243,7 +261,20 @@ class Handler(BaseHTTPRequestHandler):
             conn=db(); conn.execute("DELETE FROM sessions WHERE id=?",(data.get("id"),)); conn.commit(); conn.close(); receipt("delete_session",data); self.send_json({"ok":True}); return
         if path == "/api/kill": self.save_setting("kill_switch", True); receipt("kill_switch",{"enabled":True},True,True); self.send_json({"ok":True,"kill_switch":True}); return
         if path == "/api/health":
-            health={"api":"Local ready","latency_ms":0,"error_rate":"0%","uptime":"Local process"}; self.save_setting("health",health); receipt("health_refresh",{}); self.send_json({"ok":True,"health":health}); return
+            results=[]
+            for pid,name,key_env,url,model in PROVIDERS:
+                configured = pid == "local" or bool(os.environ.get(key_env)) or (pid == "ollama-qwen" and bool(os.environ.get("OLLAMA_BASE_URL")))
+                if not configured: results.append({"id":pid,"provider":name,"status":"tbd","configured":False,"latency_ms":None,"error_rate":"—","uptime":"—"}); continue
+                target = (os.environ.get("OLLAMA_BASE_URL", LLM_URL).rstrip("/") + "/api/tags") if pid == "local" or (pid == "ollama-qwen" and os.environ.get("OLLAMA_BASE_URL")) else os.environ.get("QWEN_API_URL", url) if pid == "ollama-qwen" else url
+                started=time.time()
+                try:
+                    headers={"User-Agent":"VektorCode/1.0"}; key=os.environ.get(key_env)
+                    if key and pid not in {"local","ollama-qwen"}: headers["Authorization"]="Bearer "+key
+                    req=Request(target,headers=headers,method="GET")
+                    with urlopen(req,timeout=8): pass
+                    results.append({"id":pid,"provider":name,"status":"online","configured":True,"latency_ms":round((time.time()-started)*1000),"error_rate":"0%","uptime":"reachable"})
+                except Exception as exc: results.append({"id":pid,"provider":name,"status":"error","configured":True,"latency_ms":round((time.time()-started)*1000),"error_rate":"100%","uptime":str(exc)[:80]})
+            health={"providers":results}; self.save_setting("health",health); receipt("health_refresh",{"providers":len(results)}); self.send_json({"ok":True,"health":health}); return
         self.send_error(404)
 
 if __name__ == "__main__":
