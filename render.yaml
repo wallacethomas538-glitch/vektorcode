@@ -1,15 +1,17 @@
 services:
   - type: web
-    name: vektorcode-dashboard
+    name: vektorcode-agent
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
+    startCommand: python agent_api.py
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
         value: "3.11.9"
+      - key: VEKTOR_MODE
+        value: "cloud"
+      - key: VEKTOR_ROLE
+        value: "coder"
       - key: VEKTORCODE_TOOL_PASSWORD
-        sync: false
-      - key: VEKTORCODE_PUBLIC_URL
         sync: false

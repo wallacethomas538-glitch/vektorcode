@@ -72,16 +72,22 @@ def guard_url(url: str):
     Enforces: https only, no credentials in URL, no fragments, port 443 or
     unset, and host on the allowlist. Returns the parsed URL parts.
     Raises EgressBlocked or ValueError on any violation.
+
+    Loopback exception: plain HTTP is allowed for loopback hosts
+    (localhost / 127.0.0.1 / ::1) because that traffic never leaves the
+    device. This is what lets the phone's local Ollama serve the Termux
+    dashboard and CLI. Everything else stays HTTPS-only.
     """
     p = urlsplit(url)
     host = (p.hostname or "").lower()
-    if p.scheme != "https":
+    loopback = host in ("localhost", "127.0.0.1", "::1")
+    if p.scheme != "https" and not (loopback and p.scheme == "http"):
         raise EgressBlocked(f"Only HTTPS allowed — refused: {p.scheme or '(no scheme)'}")
     if p.username is not None or p.password is not None:
         raise EgressBlocked("Credentials in URL — refused")
     if p.fragment:
         raise EgressBlocked("URL fragments not allowed — refused")
-    if p.port not in (None, 443):
+    if p.port not in (None, 443) and not loopback:
         raise EgressBlocked(f"Only port 443 allowed — refused: {p.port}")
     guard_host(host)
     return p
