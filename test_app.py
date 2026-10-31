@@ -3,7 +3,7 @@ from pathlib import Path
 import app
 class DashboardTest(unittest.TestCase):
     def test_catalogs(self):
-        self.assertEqual({x['id'] for x in app.MODELS},{'local','groq','gemini','openrouter'})
+        self.assertEqual({x['id'] for x in app.MODELS}, {x[0] for x in app.PROVIDERS})
         self.assertIn(('composio','Composio MCP','Connected extended tools'),app.TOOLS)
     def test_receipt_db(self):
         old=app.DB

@@ -9,10 +9,11 @@ from urllib.error import HTTPError, URLError
 from pathlib import Path
 
 ROOT = Path(__file__).parent
-DB = ROOT / "vektorcode.db"
+DB = Path(os.environ.get("VEKTORCODE_DB", str(ROOT / "vektorcode.db")))
 VEKTOR_ROOT = Path(os.environ.get("VEKTOR_ROOT", str(ROOT.parent / "vektor")))
 VEKTOR_STATE = Path(os.environ.get("VEKTOR_STATE_DIR", str(ROOT.parent / ".vektor")))
-PORT = int(os.environ.get("VEKTORCODE_PORT", "8765"))
+HOST = os.environ.get("VEKTORCODE_HOST", "0.0.0.0")
+PORT = int(os.environ.get("PORT", os.environ.get("VEKTORCODE_PORT", "8765")))
 LLM_URL = os.environ.get("LLM_URL", "http://127.0.0.1:11434/v1/chat/completions")
 LLM_MODEL = os.environ.get("LLM_MODEL", "llama3.2")
 
@@ -169,6 +170,9 @@ class Handler(BaseHTTPRequestHandler):
             receipt("web_search_error", {"error":str(exc)[:240]}, True)
             self.send_json({"ok":False, "error":"Web search unavailable: " + str(exc)[:180]}, 502)
     def do_GET(self):
+        if self.path == "/health":
+            self.send_json({"ok": True, "service": "vektorcode"})
+            return
         if self.path == "/api/meta/login":
             if not meta_ready(): self.send_json({"ok":False,"error":"Meta OAuth is not configured on Render"}, 503); return
             state = secrets.token_urlsafe(24); self.save_setting("meta_oauth_state", state)
@@ -278,5 +282,5 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(404)
 
 if __name__ == "__main__":
-    db().close(); print(f"VektorCode dashboard: http://127.0.0.1:{PORT}")
-    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+    db().close(); print(f"VektorCode dashboard: http://{HOST}:{PORT}")
+    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()

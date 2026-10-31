@@ -6,12 +6,12 @@ Run:
 
 ```sh
 cd ~/vektorcode
-python3 app.py
+python3 main.py
 ```
 
-Open http://127.0.0.1:8765. Hermes uses an OpenAI-compatible endpoint. By default it calls local Ollama at `http://127.0.0.1:11434/v1/chat/completions` with model `llama3.2`.
+Open http://127.0.0.1:8765. The server binds to `0.0.0.0` and honors Render's `PORT` variable (or `VEKTORCODE_PORT` locally). By default it calls local Ollama at `http://127.0.0.1:11434/v1/chat/completions` with model `llama3.2`.
 
-For a hosted provider, set `HERMES_LLM_URL`, `HERMES_LLM_MODEL`, and `HERMES_LLM_API_KEY` before starting the dashboard. The key stays server-side.
+For a hosted provider, set the provider-specific API key (for example `GROQ_API_KEY` or `OPENAI_API_KEY`) before starting the dashboard. The key stays server-side.
 
 VektorCode reads the shared identity and memory from `../vektor/SOUL.md` and
 `~/.vektor/memories/`. Explicitly approved notes can be saved with
