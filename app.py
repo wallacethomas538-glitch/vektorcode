@@ -3,6 +3,8 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json, os, secrets, sqlite3, time, uuid
 from urllib.request import Request, urlopen
+from urllib.parse import urlencode, unquote, urlparse, parse_qs
+import re
 from urllib.error import HTTPError, URLError
 from pathlib import Path
 
@@ -28,6 +30,12 @@ TOOLS = [
     ("web", "Web research", "Manual external research"),
     ("composio", "Composio MCP", "Connected extended tools"),
 ]
+
+def public_base(handler):
+    return os.environ.get("VEKTORCODE_PUBLIC_URL", "http://127.0.0.1:%s" % PORT).rstrip("/")
+
+def meta_ready():
+    return bool(os.environ.get("META_APP_ID") and os.environ.get("META_APP_SECRET"))
 
 def read_context_file(path, limit=24000):
     """Read shared Vektor context without making chat depend on its presence."""
@@ -120,12 +128,56 @@ class Handler(BaseHTTPRequestHandler):
         except (HTTPError, URLError, TimeoutError, ValueError) as exc:
             receipt("hermes_chat_error", {"error":str(exc)[:240]}, True)
             self.send_json({"ok":False, "error":"LLM unavailable: " + str(exc)[:240]}, 502)
+    def web_search(self, data):
+        query = data.get("query", "")
+        if not isinstance(query, str) or not query.strip() or len(query) > 300:
+            self.send_json({"ok":False, "error":"Enter a search query (1-300 characters)"}, 400); return
+        try:
+            url = "https://html.duckduckgo.com/html/?" + urlencode({"q": query.strip()})
+            req = Request(url, headers={"User-Agent":"VektorCode/1.0"})
+            with urlopen(req, timeout=15) as response: html = response.read().decode("utf-8", "replace")
+            results = []
+            for match in re.finditer(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', html, re.I | re.S):
+                href = unquote(re.sub(r'&amp;', '&', match.group(1)))
+                title = re.sub(r'<.*?>', '', match.group(2)).strip()
+                title = re.sub(r'\s+', ' ', title)
+                if href.startswith('//'): href = 'https:' + href
+                if href.startswith('http'):
+                    results.append({"title": title, "url": href})
+                if len(results) >= 8: break
+            receipt("web_search", {"query":query.strip(), "results":len(results)})
+            self.send_json({"ok":True, "query":query.strip(), "results":results})
+        except (HTTPError, URLError, TimeoutError, UnicodeError) as exc:
+            receipt("web_search_error", {"error":str(exc)[:240]}, True)
+            self.send_json({"ok":False, "error":"Web search unavailable: " + str(exc)[:180]}, 502)
     def do_GET(self):
+        if self.path == "/api/meta/login":
+            if not meta_ready(): self.send_json({"ok":False,"error":"Meta OAuth is not configured on Render"}, 503); return
+            state = secrets.token_urlsafe(24); self.save_setting("meta_oauth_state", state)
+            redirect = os.environ.get("META_REDIRECT_URI", public_base(self) + "/api/meta/callback")
+            params = urlencode({"client_id":os.environ["META_APP_ID"],"redirect_uri":redirect,"state":state,"scope":os.environ.get("META_SCOPES","public_profile,email"),"response_type":"code"})
+            self.send_response(302); self.send_header("Location", "https://www.facebook.com/v24.0/dialog/oauth?" + params); self.end_headers(); return
+        if self.path.startswith("/api/meta/callback"):
+            query = parse_qs(urlparse(self.path).query); code = query.get("code", [""])[0]; state = query.get("state", [""])[0]
+            if not code or not secrets.compare_digest(state, self.setting("meta_oauth_state", "")):
+                self.send_error(400, "Invalid Meta OAuth state"); return
+            redirect = os.environ.get("META_REDIRECT_URI", public_base(self) + "/api/meta/callback")
+            token_url = "https://graph.facebook.com/v24.0/oauth/access_token?" + urlencode({"client_id":os.environ["META_APP_ID"],"client_secret":os.environ["META_APP_SECRET"],"redirect_uri":redirect,"code":code})
+            try:
+                with urlopen(Request(token_url), timeout=20) as response: token = json.loads(response.read())
+                access_token = token["access_token"]
+                with urlopen(Request("https://graph.facebook.com/me?" + urlencode({"fields":"id,name,email","access_token":access_token})), timeout=20) as response: profile = json.loads(response.read())
+                self.save_setting("meta_profile", {"id":profile.get("id"),"name":profile.get("name"),"email":profile.get("email")})
+                self.save_setting("meta_access_token", access_token)
+                receipt("meta_login", {"id":profile.get("id"),"name":profile.get("name")}, True, True)
+                self.send_response(302); self.send_header("Location", "/?meta=connected"); self.end_headers()
+            except (HTTPError, URLError, KeyError, ValueError) as exc: self.send_error(502, "Meta login failed: " + str(exc)[:160])
+            return
         if self.path == "/api/state":
             conn = db(); sessions = [dict(x) for x in conn.execute("SELECT * FROM sessions ORDER BY updated DESC")]
             receipts = [dict(x) for x in conn.execute("SELECT * FROM receipts ORDER BY created DESC LIMIT 30")]; conn.close()
             enabled = self.setting("tools", []); active = self.setting("active_model", "local")
-            self.send_json({"models":MODELS, "tools":[{"id":a,"name":b,"description":c,"enabled":a in enabled,"locked":a in {"fangs","antivirus","shell","web","composio"}} for a,b,c in TOOLS], "active_model":active, "health":self.setting("health", {"api":"Local ready","latency_ms":0,"error_rate":"0%","uptime":"Local process"}), "composio":{"connected":bool(os.environ.get("COMPOSIO_MCP_URL"))}, "auth":{"enabled":bool(os.environ.get("VEKTORCODE_TOOL_PASSWORD")),"authenticated":bool(getattr(self,"auth",False))}, "sessions":sessions, "receipts":receipts, "kill_switch":self.setting("kill_switch", False)}); return
+            self.send_json({"models":MODELS, "tools":[{"id":a,"name":b,"description":c,"enabled":a in enabled,"locked":a in {"fangs","antivirus","shell","web","composio"}} for a,b,c in TOOLS], "active_model":active, "health":self.setting("health", {"api":"Local ready","latency_ms":0,"error_rate":"0%","uptime":"Local process"}), "composio":{"connected":bool(os.environ.get("COMPOSIO_MCP_URL"))}, "meta":{"configured":meta_ready(),"profile":self.setting("meta_profile", None)}, "media":{"provider":"Pollinations","configured":bool(os.environ.get("POLLINATIONS_API_KEY"))}, "auth":{"enabled":bool(os.environ.get("VEKTORCODE_TOOL_PASSWORD")),"authenticated":bool(getattr(self,"auth",False))}, "sessions":sessions, "receipts":receipts, "kill_switch":self.setting("kill_switch", False)}); return
         if self.path in ("/", "/index.html") or self.path.startswith("/static/"):
             rel = "index.html" if self.path in ("/", "/index.html") else self.path.removeprefix("/static/")
             target = (ROOT / "static" / rel).resolve()
@@ -136,6 +188,17 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         data = self.body(); path = self.path
         if path == "/api/chat": self.chat(data); return
+        if path == "/api/web-search": self.web_search(data); return
+        if path == "/api/media":
+            kind, prompt = data.get("kind"), data.get("prompt", "")
+            if kind not in {"image", "audio"} or not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 1200:
+                self.send_json({"ok":False,"error":"Choose image or audio and enter a prompt up to 1200 characters"}, 400); return
+            endpoint = os.environ.get("POLLINATIONS_API_URL", "https://gen.pollinations.ai") + "/" + kind + "/" + __import__('urllib.parse').parse.quote(prompt.strip())
+            if kind == "image": endpoint += "?width=1024&height=1024&nologo=true"
+            headers = {"User-Agent":"VektorCode/1.0"}; key = os.environ.get("POLLINATIONS_API_KEY")
+            if key: headers["Authorization"] = "Bearer " + key
+            receipt("media_generate", {"kind":kind,"provider":"Pollinations"})
+            self.send_json({"ok":True,"kind":kind,"url":endpoint,"provider":"Pollinations"}); return
         if path == "/api/receipt": receipt(data.get("action","manual action"), data.get("detail",{}), data.get("sensitive",False), data.get("approved",False)); self.send_json({"ok":True}); return
         if path in ("/api/memory/save", "/api/skill/save"):
             if not require_auth(self): self.send_json({"ok":False,"error":"Authentication required"}, 401); return
