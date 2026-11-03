@@ -131,7 +131,32 @@ def get_next_key(pid):
 120|    conn.execute("INSERT INTO receipts VALUES (?,?,?,?,?,?)", (rid, action, json.dumps(detail), int(sensitive), int(approved), time.time()))
 121|    conn.commit(); conn.close(); return rid
 122|
-123|class Handler(BaseHTTPRequestHandler):
+123|
+def call_mcp_tool(tool_name, arguments):
+    """Bridge to Composio/MCP servers."""
+    mcp_url = os.environ.get("COMPOSIO_MCP_URL") or os.environ.get("MCP_SERVER_URL")
+    if not mcp_url:
+        return {"ok": False, "error": "No MCP server configured (COMPOSIO_MCP_URL missing)"}
+    
+    api_key = os.environ.get("COMPOSIO_API_KEY")
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    
+    payload = json.dumps({
+        "tool": tool_name,
+        "arguments": arguments
+    }).encode()
+    
+    try:
+        req = Request(mcp_url, data=payload, headers=headers, method="POST")
+        with urlopen(req, timeout=60) as response:
+            return {"ok": True, "result": json.loads(response.read())}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+class Handler(BaseHTTPRequestHandler):
 124|    def log_message(self, *_): pass
 125|    def send_json(self, value, status=200):
 126|        raw = json.dumps(value).encode(); self.send_response(status)
@@ -144,6 +169,7 @@ def get_next_key(pid):
 133|        return json.loads(row[0]) if row else default
 134|    def save_setting(self, key, value):
 135|        conn = db(); conn.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, json.dumps(value))); conn.commit(); conn.close()
+
     def chat(self, data):
         if self.setting("kill_switch", False):
             self.send_json({"ok":False, "error":"Kill switch is active"}, 423); return
@@ -165,7 +191,6 @@ def get_next_key(pid):
         llm_messages = [{"role":"system", "content":vektor_system_prompt()}] + messages
         payload = json.dumps({"model":model, "messages":llm_messages, "stream":False}).encode()
         
-        # Rotation Loop
         keys = [k for k in KEY_POOLS.get(pid, []) if k.strip()]
         if pid == "local": keys = [os.environ.get("OLLAMA_API_KEY", "")]
         
@@ -183,25 +208,41 @@ def get_next_key(pid):
                 with urlopen(req, timeout=120) as response: 
                     result = json.loads(response.read())
                 
+                # --- MCP TOOL CALL CHECK ---
                 choice = result.get("choices", [{}])[0]
-                message = choice.get("message", {}).get("content", "")
+                tool_calls = choice.get("message", {}).get("tool_calls")
+                
+                if tool_calls:
+                    tool_results = []
+                    for tc in tool_calls:
+                        t_name = tc.get("function", {}).get("name")
+                        t_args = json.loads(tc.get("function", {}).get("arguments", "{}"))
+                        res = call_mcp_tool(t_name, t_args)
+                        tool_results.append({"tool_call_id": tc.get("id"), "role": "tool", "name": t_name, "content": json.dumps(res)})
+                    
+                    llm_messages += [{"role": "assistant", "tool_calls": tool_calls}] + tool_results
+                    payload = json.dumps({"model":model, "messages":llm_messages, "stream":False}).encode()
+                    
+                    req = Request(endpoint, data=payload, headers=headers, method="POST")
+                    with urlopen(req, timeout=120) as response: 
+                        result = json.loads(response.read())
+                
+                message = result.get("choices", [{}])[0].get("message", {}).get("content", "")
                 if not isinstance(message, str) or not message.strip():
-                    continue # Try next key if response is empty
+                    continue 
                 
                 latency = round((time.time() - started) * 1000)
                 receipt("vektor_chat", {"provider":provider,"model":model, "latency_ms":latency, "attempt": attempt+1})
                 self.send_json({"ok":True, "message":message, "model":model, "provider":provider, "latency_ms":latency})
-                return # Success!
+                return 
             except HTTPError as e:
-                if e.code == 429: # Rate Limit - move to next key
-                    continue
-                receipt("vektor_chat_error", {"provider":provider,"error":str(e)[:240]}, True)
+                if e.code == 429: continue
                 self.send_json({"ok":False, "error":"LLM error: " + str(e)[:240]}, 502); return
-            except (URLError, TimeoutError, ValueError) as exc:
-                receipt("vektor_chat_error", {"provider":provider,"error":str(exc)[:240]}, True)
+            except Exception as exc:
                 self.send_json({"ok":False, "error":"LLM unavailable: " + str(exc)[:240]}, 502); return
         
         self.send_json({"ok":False, "error":"All keys in pool exhausted (Rate Limited)"}, 429)
+
 
 172|    def web_search(self, data):
 173|        query = data.get("query", "")
@@ -264,6 +305,11 @@ def get_next_key(pid):
 230|            self.send_response(200); self.send_header("Content-Type",mime); self.send_header("Content-Length",str(len(raw))); self.end_headers(); self.wfile.write(raw); return
 231|        self.send_error(404)
 232|    def do_POST(self):
+        if path == "/api/mcp":
+            data = self.body()
+            res = call_mcp_tool(data.get("tool"), data.get("arguments", {}))
+            self.send_json(res); return
+
 233|        data = self.body(); path = self.path
 234|        if path == "/api/chat": self.chat(data); return
 235|        if path == "/api/web-search": self.web_search(data); return
