@@ -22,53 +22,8 @@ function updateForge(text) {
     }
 }
 
-
-function updateForge(text) {
-    const codeRegex = /```(?:[a-z]*)\n([\s\S]*?)\n```/g;
-    const matches = [...text.matchAll(codeRegex)];
-    if (matches.length > 0) {
-        const code = matches[0][1];
-        const fileMatch = text.match(/File: ([\S\s]+?)\n/);
-        const fileName = fileMatch ? fileMatch[1] : "unknown_file.py";
-        
-        $('forge-file').textContent = fileName;
-        $('forge-editor').textContent = code;
-        
-        const forge = document.getElementById('forge-section');
-        if (forge) {
-            forge.style.boxShadow = "0 0 20px #62a8ff55";
-            setTimeout(() => forge.style.boxShadow = "none", 2000);
-        }
-    }
-}
-
-let state,lastHealth=0;const $=id=>document.getElementById(id);function toast(s){$('toast').textContent=s;$('toast').style.display='block';setTimeout(()=>$('toast').style.display='none',2200)}async function post(url,data={}){let r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});return r.json()}function render(){let m=state.models.find(x=>x.id===state.active_model)||state.models[0];$('active').textContent='Active: '+m.name;$('quota').textContent=m.quota;$('model').innerHTML=state.models.map(x=>`<option value="${x.id}" ${x.id===state.active_model?'selected':''}>${x.provider}: ${x.name}${x.configured?'':' — key needed'}</option>`).join('');$('api').textContent=state.health.api||'—';$('latency').textContent=(state.health.latency_ms??'—')+' ms';$('errors').textContent=state.health.error_rate||'—';$('uptime').textContent=state.health.uptime||'—';$('composio').textContent='Composio: '+(state.composio.connected?'connected':'disconnected');$('sessions').innerHTML=state.sessions.length?state.sessions.map(s=>`<div class="card"><div><b>${s.title}</b><small> · ${s.model} · ${s.tokens} tokens · $${s.cost.toFixed(2)}</small></div><button onclick="del('${s.id}')">Delete</button></div>`).join(''):'<span class="muted">No sessions yet.</span>';$('tools').innerHTML=state.tools.map(t=>`<label class="card tool"><input type="checkbox" onchange="toggle('${t.id}',this.checked)"><span><b>${t.name}</b><small>${t.description}</small></span></label>`).join('');$('receipts').innerHTML=state.receipts.map(r=>`<div class="receipt">${new Date(r.created*1000).toLocaleString()} — ${r.action}${r.sensitive?' · Aegis Gate':''}</div>`).join('')}async function load(){state=await (await fetch('/api/state')).json();render()}async function del(id){await post('/api/session/delete',{id});toast('Session deleted');load()}async function toggle(id,on){await post('/api/receipt',{action:'tool_toggle',detail:{tool:id,enabled:on},sensitive:true,approved:false});toast(on?'Tool enabled for manual use':'Tool disabled');load()}$('model').onchange=async e=>{state.active_model=e.target.value;await post('/api/receipt',{action:'model_selected',detail:{model:e.target.value}});render()};$('new-session').onclick=async()=>{await post('/api/session',{title:'New session',model:state.active_model});toast('Session started');load()};$('refresh').onclick=async()=>{if(Date.now()-lastHealth<30000){toast('Health refresh limited to 30 seconds');return}lastHealth=Date.now();let r=await post('/api/health');state.health=r.health;await load();toast('Health refreshed')};$('kill').onclick=async()=>{if(confirm('Activate kill switch? This records a sensitive action.')){await post('/api/kill');toast('Kill switch recorded')}};load();
-let chatMessages=[];function chatAdd(role,text){const e=document.createElement('div');e.className='chat-message '+role;e.innerHTML='<b></b><p></p>';e.querySelector('b').textContent=role==='user'?'You':'Vektor';e.querySelector('p').textContent=text;$('chat-log').append(e);e.scrollIntoView({block:'nearest'})}$('chat-form').onsubmit=async e=>{e.preventDefault();const i=$('chat-input'),t=i.value.trim();if(!t)return;i.value='';chatAdd('user',t);chatMessages.push({role:'user',content:t});$('send').disabled=true;$('chat-status').textContent='Vektor is thinking…';try{const r=await post('/api/chat',{messages:chatMessages});if(!r.ok)throw Error(r.error);chatMessages.push({role:'assistant',content:r.message});updateForge(r.message); updateForge(r.message); chatAdd('assistant',r.message);if($('speak').checked&&'speechSynthesis' in window)speechSynthesis.speak(new SpeechSynthesisUtterance(r.message));$('chat-status').textContent=r.model+' · '+r.latency_ms+' ms'}catch(x){chatAdd('assistant','I could not reach the configured LLM. '+x.message);$('chat-status').textContent='LLM unavailable'
-async function applyForgeCode() {
-    const code = $('forge-editor').textContent;
-    const file = $('forge-file').textContent;
-    if (!code || file === "No file selected") return toast("No code to apply!");
-    
-    $('apply-code').disabled = true;
-    $('apply-code').textContent = "APPLYING...";
-    
-    try {
-        const r = await post('/api/receipt', {
-            action: 'forge_apply',
-            detail: { file: file, code: code },
-            sensitive: true
-        });
-        if (r.ok) toast("Code applied to system successfully!");
-        else throw Error(r.error || "Application failed");
-    } catch (x) {
-        toast("Error: " + x.message);
-    } finally {
-        $('apply-code').disabled = false;
-        $('apply-code').textContent = "APPLY TO SYSTEM";
-    }
-}
-$('apply-code').onclick = applyForgeCode;
-
+let state,lastHealth=0;const $=id=>document.getElementById(id);function toast(s){$('toast').textContent=s;$('toast').style.display='block';setTimeout(()=>$('toast').style.display='none',2200)}async function post(url,data={}){let r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});try{return await r.json()}catch(e){return {ok:r.ok}}}function render(){let m=state.models.find(x=>x.id===state.active_model)||state.models[0];$('active').textContent='Active: '+m.name;$('quota').textContent=m.quota;$('model').innerHTML=state.models.map(x=>`<option value="${x.id}" ${x.id===state.active_model?'selected':''}>${x.provider}: ${x.name}${x.configured?'':' — key needed'}</option>`).join('');$('api').textContent=state.health.api||'—';$('latency').textContent=(state.health.latency_ms??'—')+' ms';$('errors').textContent=state.health.error_rate||'—';$('uptime').textContent=state.health.uptime||'—';$('composio').textContent='Composio: '+(state.composio.connected?'connected':'disconnected');$('sessions').innerHTML=state.sessions.length?state.sessions.map(s=>`<div class="card"><div><b>${s.title}</b><small> · ${s.model} · ${s.tokens} tokens · $${s.cost.toFixed(2)}</small></div><button onclick="del('${s.id}')">Delete</button></div>`).join(''):'<span class="muted">No sessions yet.</span>';$('tools').innerHTML=state.tools.map(t=>`<label class="card tool${t.locked?' locked':''}" title="${t.locked?'Unlock tools to enable this action':''}"><input type="checkbox" ${t.enabled?'checked':''} onchange="toggle('${t.id}',this.checked)"><span><b>${t.name}</b>${t.locked?' (locked)':''}<small>${t.description}</small>${t.approval_required?'<small>Requires Aegis approval.</small>':''}</span></label>`).join('');$('receipts').innerHTML=state.receipts.map(r=>`<div class="receipt">${new Date(r.created*1000).toLocaleString()} — ${r.action}${r.sensitive?' · Aegis Gate':''}</div>`).join('')}async function load(){state=await (await fetch('/api/state')).json();render()}async function del(id){await post('/api/session/delete',{id});toast('Session deleted');load()}async function toggle(id,on){const r=await post('/api/tool',{tool:id,enabled:on});if(!r.ok){if(r.error==='Authentication required'){openLogin();toast('Unlock tools to continue')}else{toast(r.error||'Could not update tool')}load();return}toast(on?'Tool enabled for manual use':'Tool disabled');load()}function openLogin(){const d=$('login');if(d&&typeof d.showModal==='function')d.showModal()}$('login-submit').onclick=async e=>{e.preventDefault();const r=await post('/api/login',{password:$('password').value});if(r.ok){$('login').close();toast('Tools unlocked');load()}else toast('Wrong password')};$('model').onchange=async e=>{state.active_model=e.target.value;await post('/api/receipt',{action:'model_selected',detail:{model:e.target.value}});render()};$('new-session').onclick=async()=>{await post('/api/session',{title:'New session',model:state.active_model});toast('Session started');load()};$('refresh').onclick=async()=>{if(Date.now()-lastHealth<30000){toast('Health refresh limited to 30 seconds');return}lastHealth=Date.now();let r=await post('/api/health');state.health=r.health;await load();toast('Health refreshed')};$('kill').onclick=async()=>{if(confirm('Activate kill switch? This records a sensitive action.')){await post('/api/kill');toast('Kill switch recorded')}};load();
+let chatMessages=[];function chatAdd(role,text){const e=document.createElement('div');e.className='chat-message '+role;e.innerHTML='<b></b><p></p>';e.querySelector('b').textContent=role==='user'?'You':'Vektor';e.querySelector('p').textContent=text;$('chat-log').append(e);e.scrollIntoView({block:'nearest'})}$('chat-form').onsubmit=async e=>{e.preventDefault();const i=$('chat-input'),t=i.value.trim();if(!t)return;i.value='';chatAdd('user',t);chatMessages.push({role:'user',content:t});$('send').disabled=true;$('chat-status').textContent='Vektor is thinking…';try{const r=await post('/api/chat',{messages:chatMessages});if(!r.ok)throw Error(r.error);chatMessages.push({role:'assistant',content:r.message});updateForge(r.message);chatAdd('assistant',r.message);if($('speak').checked&&'speechSynthesis' in window)speechSynthesis.speak(new SpeechSynthesisUtterance(r.message));$('chat-status').textContent=r.model+' · '+r.latency_ms+' ms'}catch(x){chatAdd('assistant','I could not reach the configured LLM. '+x.message);$('chat-status').textContent='LLM unavailable'}finally{$('send').disabled=false;i.focus()}};
 
 async function applyForgeCode() {
     const code = $('forge-editor') ? $('forge-editor').textContent : "";
@@ -96,8 +51,6 @@ async function applyForgeCode() {
     }
 }
 if ($('apply-code')) $('apply-code').onclick = applyForgeCode;
-
-}finally{$('send').disabled=false;i.focus()}};
 // Browser-native voice input. No server-side audio service or API key required.
 const SpeechRecognition=window.SpeechRecognition||window.webkitSpeechRecognition;
 const mic=$('mic');
