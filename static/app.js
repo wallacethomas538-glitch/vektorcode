@@ -1,74 +1,130 @@
+async function api(path, data = null, method = 'GET') {
+    const options = {
+        method: method,
+        headers: { 'Content-Type': 'application/json' }
+    };
+    if (data) options.body = JSON.stringify(data);
+    const res = await fetch(path, options);
+    if (res.status === 401) {
+        alert('Authentication required. Please login.');
+        return null;
+    }
+    return res.json();
+}
 
-function updateForge(text) {
-    const codeRegex = /```(?:[a-z]*)\n([\s\S]*?)\n```/g;
-    const matches = [...text.matchAll(codeRegex)];
-    if (matches.length > 0) {
-        const code = matches[0][1];
-        const fileMatch = text.match(/File: ([\S\s]+?)\n/);
-        const fileName = fileMatch ? fileMatch[1] : "unknown_file.py";
-        
-        if ($('forge-file')) $('forge-file').textContent = fileName;
-        if ($('forge-editor')) {
-            $('forge-editor').textContent = code;
-            const placeholder = $('forge-editor').querySelector('.placeholder');
-            if (placeholder) placeholder.remove();
-        }
-        
-        const forge = document.getElementById('forge-section');
-        if (forge) {
-            forge.style.boxShadow = "0 0 20px #62a8ff55";
-            setTimeout(() => forge.style.boxShadow = "none", 2000);
-        }
+async function init() {
+    await loadModels();
+    await loadSessions();
+    await updateStatus();
+}
+
+async function loadModels() {
+    const state = await api('/api/state');
+    const select = document.getElementById('active-model');
+    select.innerHTML = state.models.map(m => 
+        `<option value="${m.id}" ${m.id === state.active_model ? 'selected' : ''}>${m.name}</option>`
+    ).join('');
+}
+
+async function loadSessions() {
+    const state = await api('/api/state');
+    const list = document.getElementById('session-list');
+    list.innerHTML = state.sessions.map(s => 
+        `<div class="session-item" onclick="resumeSession('${s.id}')">${s.title}</div>`
+    ).join('');
+}
+
+async function updateStatus() {
+    const state = await api('/api/state');
+    document.getElementById('mcp-status').innerText = state.mcp.connected ? 'Online' : 'Offline';
+}
+
+async function changeModel(val) {
+    await api('/api/model', { model: val }, 'POST');
+    updateStatus();
+}
+
+async function resumeSession(id) {
+    await api('/api/session/resume', { id }, 'POST');
+    // In a real app, we'd load the messages here
+    addMessage('system', 'Session resumed. How can the Master Architect help you today?');
+}
+
+function addMessage(role, text) {
+    const flow = document.getElementById('chat-flow');
+    const msg = document.createElement('div');
+    msg.className = `message ${role}`;
+    msg.innerText = text;
+    flow.appendChild(msg);
+    flow.scrollTop = flow.scrollHeight;
+}
+
+async function sendMessage() {
+    const input = document.getElementById('user-input');
+    const text = input.value.trim();
+    if (!text) return;
+
+    addMessage('user', text);
+    input.value = '';
+
+    const res = await api('/api/chat', { 
+        messages: [{ role: 'user', content: text }],
+        model: document.getElementById('active-model').value
+    }, 'POST');
+
+    if (res && res.ok) {
+        addMessage('agent', res.message);
+        checkForCode(res.message);
+    } else {
+        addMessage('agent', 'Error: ' + (res?.error || 'Unknown failure'));
     }
 }
 
-let state,lastHealth=0;const $=id=>document.getElementById(id);function toast(s){$('toast').textContent=s;$('toast').style.display='block';setTimeout(()=>$('toast').style.display='none',2200)}async function post(url,data={}){let r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});try{return await r.json()}catch(e){return {ok:r.ok}}}function render(){let m=state.models.find(x=>x.id===state.active_model)||state.models[0];$('active').textContent='Active: '+m.name;$('quota').textContent=m.quota;$('model').innerHTML=state.models.map(x=>`<option value="${x.id}" ${x.id===state.active_model?'selected':''}>${x.provider}: ${x.name}${x.configured?'':' — key needed'}</option>`).join('');$('api').textContent=state.health.api||'—';$('latency').textContent=(state.health.latency_ms??'—')+' ms';$('errors').textContent=state.health.error_rate||'—';$('uptime').textContent=state.health.uptime||'—';$('composio').textContent='Composio: '+(state.composio.connected?'connected':'disconnected');$('sessions').innerHTML=state.sessions.length?state.sessions.map(s=>`<div class="card"><div><b>${s.title}</b><small> · ${s.model} · ${s.tokens} tokens · $${s.cost.toFixed(2)}</small></div><button onclick="del('${s.id}')">Delete</button></div>`).join(''):'<span class="muted">No sessions yet.</span>';$('tools').innerHTML=state.tools.map(t=>`<label class="card tool${t.locked?' locked':''}" title="${t.locked?'Unlock tools to enable this action':''}"><input type="checkbox" ${t.enabled?'checked':''} onchange="toggle('${t.id}',this.checked)"><span><b>${t.name}</b>${t.locked?' (locked)':''}<small>${t.description}</small>${t.approval_required?'<small>Requires Aegis approval.</small>':''}</span></label>`).join('');$('receipts').innerHTML=state.receipts.map(r=>`<div class="receipt">${new Date(r.created*1000).toLocaleString()} — ${r.action}${r.sensitive?' · Aegis Gate':''}</div>`).join('')}async function load(){state=await (await fetch('/api/state')).json();render()}async function del(id){await post('/api/session/delete',{id});toast('Session deleted');load()}async function toggle(id,on){const r=await post('/api/tool',{tool:id,enabled:on});if(!r.ok){if(r.error==='Authentication required'){openLogin();toast('Unlock tools to continue')}else{toast(r.error||'Could not update tool')}load();return}toast(on?'Tool enabled for manual use':'Tool disabled');load()}function openLogin(){const d=$('login');if(d&&typeof d.showModal==='function')d.showModal()}$('login-submit').onclick=async e=>{e.preventDefault();const r=await post('/api/login',{password:$('password').value});if(r.ok){$('login').close();toast('Tools unlocked');load()}else toast('Wrong password')};$('model').onchange=async e=>{state.active_model=e.target.value;await post('/api/receipt',{action:'model_selected',detail:{model:e.target.value}});render()};$('new-session').onclick=async()=>{await post('/api/session',{title:'New session',model:state.active_model});toast('Session started');load()};$('refresh').onclick=async()=>{if(Date.now()-lastHealth<30000){toast('Health refresh limited to 30 seconds');return}lastHealth=Date.now();let r=await post('/api/health');state.health=r.health;await load();toast('Health refreshed')};$('kill').onclick=async()=>{if(confirm('Activate kill switch? This records a sensitive action.')){await post('/api/kill');toast('Kill switch recorded')}};load();
-let chatMessages=[];function chatAdd(role,text){const e=document.createElement('div');e.className='chat-message '+role;e.innerHTML='<b></b><p></p>';e.querySelector('b').textContent=role==='user'?'You':'Vektor';e.querySelector('p').textContent=text;$('chat-log').append(e);e.scrollIntoView({block:'nearest'})}$('chat-form').onsubmit=async e=>{e.preventDefault();const i=$('chat-input'),t=i.value.trim();if(!t)return;i.value='';chatAdd('user',t);chatMessages.push({role:'user',content:t});$('send').disabled=true;$('chat-status').textContent='Vektor is thinking…';try{const r=await post('/api/chat',{messages:chatMessages});if(!r.ok)throw Error(r.error);chatMessages.push({role:'assistant',content:r.message});updateForge(r.message);chatAdd('assistant',r.message);if($('speak').checked&&'speechSynthesis' in window)speechSynthesis.speak(new SpeechSynthesisUtterance(r.message));$('chat-status').textContent=r.model+' · '+r.latency_ms+' ms'}catch(x){chatAdd('assistant','I could not reach the configured LLM. '+x.message);$('chat-status').textContent='LLM unavailable'}finally{$('send').disabled=false;i.focus()}};
-
-async function applyForgeCode() {
-    const code = $('forge-editor') ? $('forge-editor').textContent : "";
-    const file = $('forge-file') ? $('forge-file').textContent : "";
-    if (!code || file === "No file selected") return toast("No code to apply!");
-    
-    const btn = $('apply-code');
-    if (!btn) return;
-    btn.disabled = true;
-    btn.textContent = "APPLYING...";
-    
-    try {
-        const r = await post('/api/receipt', {
-            action: 'forge_apply',
-            detail: { file: file, code: code },
-            sensitive: true
-        });
-        if (r.ok) toast("Code applied to system successfully!");
-        else throw Error(r.error || "Application failed");
-    } catch (x) {
-        toast("Error: " + x.message);
-    } finally {
-        btn.disabled = false;
-        btn.textContent = "APPLY TO SYSTEM";
+function checkForCode(text) {
+    const codeRegex = /```(?:[a-z]+)?\n([\s\S]*?)\n```/g;
+    const match = codeRegex.exec(text);
+    if (match) {
+        const code = match[1];
+        document.getElementById('forge-code').innerText = code;
+        document.getElementById('forge-meta').innerText = 'Code synthesized in The Forge';
     }
 }
-if ($('apply-code')) $('apply-code').onclick = applyForgeCode;
-// Browser-native voice input. No server-side audio service or API key required.
-const SpeechRecognition=window.SpeechRecognition||window.webkitSpeechRecognition;
-const mic=$('mic');
-if(!SpeechRecognition){mic.disabled=true;mic.title='Speech recognition is not supported by this browser';$('chat-status').textContent='Voice input is not supported in this browser. You can still use spoken replies.';}
-else{
- const recognition=new SpeechRecognition();recognition.lang=navigator.language||'en-US';recognition.interimResults=true;recognition.continuous=false;
- let listening=false,finalText='';
- recognition.onstart=()=>{listening=true;finalText='';mic.textContent='■ Stop';mic.classList.add('recording');$('chat-status').textContent='Listening… speak now.';};
- recognition.onresult=e=>{let interim='';for(let n=e.resultIndex;n<e.results.length;n++){const part=e.results[n][0].transcript;if(e.results[n].isFinal)finalText+=part;else interim+=part;}$('chat-input').value=[finalText,interim].filter(Boolean).join(' ').trim();};
- recognition.onerror=e=>{$('chat-status').textContent=e.error==='not-allowed'?'Microphone permission denied. Allow microphone access for this site.':'Voice input error: '+e.error;};
- recognition.onend=()=>{listening=false;mic.textContent='🎙️ Speak';mic.classList.remove('recording');if(finalText.trim()){$('chat-input').value=finalText.trim();$('chat-status').textContent='Voice captured. Tap Send to submit.';}};
- mic.onclick=()=>{if(listening){recognition.stop();return;}try{recognition.start();}catch(e){$('chat-status').textContent='Voice input could not start: '+e.message;}};
+
+function handleInput(e) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+    }
+    if (e.ctrlKey && e.key === 'k') {
+        e.preventDefault();
+        togglePalette();
+    }
 }
-const botBay=document.createElement('section');botBay.className='bot-bay';botBay.innerHTML='<div class="section-head"><div><h2>Bot launch bay</h2><p class="muted">Start a focused Vektor worker manually.</p></div><span class="pill">MANUAL</span></div><div class="bot-grid"><div class="bot-card"><span class="bot-icon">⌁</span><div><b>Research bot</b><small>Web research and source synthesis</small></div><button data-bot="Research">Launch</button></div><div class="bot-card"><span class="bot-icon">◈</span><div><b>Build bot</b><small>Inspect code and plan implementation</small></div><button data-bot="Build">Launch</button></div><div class="bot-card"><span class="bot-icon">◉</span><div><b>Guardian bot</b><small>Security and health checks</small></div><button data-bot="Guardian">Launch</button></div></div>';$('chat-section').after(botBay);botBay.querySelectorAll('button').forEach(b=>b.onclick=async()=>{b.disabled=true;b.textContent='Launching…';const r=await post('/api/receipt',{action:'bot_launch',detail:{bot:b.dataset.bot},sensitive:true});b.textContent=r.ok?'Launched':'Retry';toast(r.ok?b.dataset.bot+' bot launch recorded':'Launch failed');setTimeout(()=>{b.disabled=false;b.textContent='Launch'},1200)});
-const webBay=document.createElement('section');webBay.className='web-bay';webBay.innerHTML='<div class="section-head"><div><h2>Web browsing</h2><p class="muted">Search the web and open sources for review.</p></div><span class="pill">LIVE WEB</span></div><form id="web-form" class="web-form"><input id="web-query" placeholder="Search the web…" aria-label="Web search"><button>Search</button></form><div id="web-results" class="web-results"></div>';$('chat-section').after(webBay);$('web-form').onsubmit=async e=>{e.preventDefault();const q=$('web-query').value.trim();if(!q)return;$('web-results').innerHTML='<span class="muted">Searching…</span>';try{const r=await post('/api/web-search',{query:q});if(!r.ok)throw Error(r.error);$('web-results').innerHTML=r.results.length?r.results.map(x=>`<a class="web-result" href="${x.url}" target="_blank" rel="noopener"><b>${x.title}</b><small>${x.url}</small></a>`).join(''):'<span class="muted">No results found.</span>'}catch(x){$('web-results').textContent=x.message}};
-const studio=document.createElement('section');studio.className='studio';studio.innerHTML='<div class="section-head"><div><h2>Creative Studio</h2><p class="muted">Generate images and voice clips with Pollinations.</p></div><span class="pill">FREE TIER</span></div><select id="media-kind"><option value="image">Image</option><option value="audio">Voice / audio</option></select><textarea id="media-prompt" rows="3" placeholder="Describe an image or paste a voice script"></textarea><button id="generate-media">Generate</button><div id="media-output" class="media-output"></div>';$('chat-section').after(studio);$('generate-media').onclick=async()=>{const kind=$('media-kind').value,prompt=$('media-prompt').value.trim();if(!prompt)return toast('Enter a prompt or script');$('media-output').textContent='Generating…';const r=await post('/api/media',{kind,prompt});if(!r.ok){$('media-output').textContent=r.error;return}$('media-output').innerHTML=kind==='image'?`<img src="${r.url}" alt="Generated image"><a href="${r.url}" target="_blank" rel="noopener">Open image</a>`:`<audio controls src="${r.url}"></audio><a href="${r.url}" target="_blank" rel="noopener">Open audio</a>`};
-const meta=document.createElement('section');meta.className='meta-panel';meta.innerHTML='<div class="section-head"><div><h2>Meta account</h2><p id="meta-status" class="muted">Checking connection…</p></div><button id="meta-login">Connect Meta</button></div><p class="muted">Secure OAuth connection for your Render deployment.</p>';$('chat-section').after(meta);$('meta-login').onclick=()=>location.href='/api/meta/login';
-fetch('/api/state').then(r=>r.json()).then(s=>{$('meta-status').textContent=s.meta.configured?(s.meta.profile?'Connected as '+s.meta.profile.name:'Meta OAuth ready — click Connect Meta'):'Add META_APP_ID and META_APP_SECRET in Render'});
-const logo=document.createElement('img');logo.src='/static/vektor-logo.webp';logo.alt='Vektor logo';logo.className='vektor-logo';document.querySelector('header').prepend(logo);document.head.insertAdjacentHTML('beforeend','<style>.vektor-logo{width:52px;height:52px;object-fit:cover;border-radius:14px;margin-right:14px;box-shadow:0 0 24px #8b5cf655}.vektor-logo+div{flex:1} .studio textarea{display:block;width:100%;margin:10px 0;background:#090e19;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:11px;font:inherit}.media-output{display:grid;gap:10px;margin-top:14px}.media-output img{max-width:100%;border-radius:10px;border:1px solid var(--line)}.media-output a{color:var(--blue)}</style>');
-// Vektor multi-page navigation: all existing panels remain manual and are shown one at a time.
-const panels=[...document.querySelectorAll('main>section')];const byTitle=t=>panels.find(s=>s.querySelector('h2')?.textContent.toLowerCase().includes(t));const mapping={"chat-section":byTitle('vektor chat'),"models-page":byTitle('models'),"health-page":byTitle('health'),"sessions-page":byTitle('chat sessions'),"tools-page":byTitle('tools'),"receipts-page":byTitle('receipts'),"studio-page":document.querySelector('.studio'),"settings-page":document.querySelector('.meta-panel')};Object.entries(mapping).forEach(([id,p])=>{if(p)p.id=id;p?.classList.add('page-panel')});document.querySelectorAll('#tabs button').forEach((b,i)=>b.onclick=()=>{document.querySelectorAll('.page-panel').forEach(p=>p.classList.toggle('page-active',p.id===b.dataset.target));document.querySelectorAll('#tabs button').forEach(x=>x.classList.toggle('active',x===b))});document.querySelector('#tabs button').click();
+
+function togglePalette() {
+    const p = document.getElementById('command-palette');
+    p.style.display = p.style.display === 'none' ? 'flex' : 'none';
+    if (p.style.display === 'flex') document.getElementById('palette-search').focus();
+}
+
+function clearChat() {
+    document.getElementById('chat-flow').innerHTML = '';
+}
+
+function copyForge() {
+    const code = document.getElementById('forge-code').innerText;
+    navigator.clipboard.writeText(code);
+    alert('Copied to clipboard!');
+}
+
+async function applyForge() {
+    const code = document.getElementById('forge-code').innerText;
+    // This would call a specific /api/apply endpoint
+    alert('Applying code to system... (Requires backend endpoint)');
+}
+
+window.addEventListener('keydown', (e) => {
+    if (e.ctrlKey && e.key === 'k') togglePalette();
+});
+
+init();

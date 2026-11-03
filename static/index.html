@@ -1,62 +1,96 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>VektorCode Control</title><link rel="stylesheet" href="/static/style.css">
-<style>
-    .forge-section { background: #0a0f1a; border: 1px solid #62a8ff33; border-radius: 12px; margin-bottom: 20px; overflow: hidden; }
-    .forge-container { display: flex; flex-direction: column; height: 400px; }
-    .forge-meta { display: flex; justify-content: space-between; align-items: center; padding: 10px 15px; background: #111827; border-bottom: 1px solid #62a8ff33; color: #8b9ab3; font-family: 'JetBrains Mono', monospace; font-size: 12px; }
-    .apply-btn { background: #62a8ff; color: #05070a; border: none; padding: 5px 12px; border-radius: 4px; font-weight: bold; cursor: pointer; transition: all 0.2s; }
-    .apply-btn:hover { background: #8b5cf6; color: white; box-shadow: 0 0 15px #8b5cf6aa; }
-    .forge-editor { flex: 1; background: #05070a; color: #a5b4fc; padding: 15px; font-family: 'JetBrains Mono', monospace; font-size: 13px; overflow: auto; white-space: pre; border: none; outline: none; }
-    .forge-editor .placeholder { color: #4b5563; font-style: italic; text-align: center; margin-top: 100px; }
-</style>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VektorCode // Cyber-Command</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+    <div class="nexus-container">
+        <!-- LEFT PANEL: THE MIND -->
+        <aside class="mind-panel">
+            <div class="panel-header">
+                <img src="vektor-logo.webp" alt="Vektor Logo" class="logo">
+                <span class="brand">VektorCode <small>v2.0</small></span>
+            </div>
+            
+            <div class="section-label">SESSIONS</div>
+            <div id="session-list" class="session-list">
+                <!-- Sessions loaded via JS -->
+            </div>
+            
+            <div class="section-label">THE BRAIN</div>
+            <div class="model-selector">
+                <select id="active-model" onchange="changeModel(this.value)">
+                    <!-- Models loaded via JS -->
+                </select>
+            </div>
 
-<style>
-    .forge-section { background: #0a0f1a; border: 1px solid #62a8ff33; border-radius: 12px; margin-bottom: 20px; overflow: hidden; }
-    .forge-container { display: flex; flex-direction: column; height: 400px; }
-    .forge-meta { display: flex; justify-content: space-between; align-items: center; padding: 10px 15px; background: #111827; border-bottom: 1px solid #62a8ff33; color: #8b9ab3; font-family: 'JetBrains Mono', monospace; font-size: 12px; }
-    .apply-btn { background: #62a8ff; color: #05070a; border: none; padding: 5px 12px; border-radius: 4px; font-weight: bold; cursor: pointer; transition: all 0.2s; }
-    .apply-btn:hover { background: #8b5cf6; color: white; box-shadow: 0 0 15px #8b5cf6aa; }
-    .forge-editor { flex: 1; background: #05070a; color: #a5b4fc; padding: 15px; font-family: 'JetBrains Mono', monospace; font-size: 13px; overflow: auto; white-space: pre; border: none; outline: none; }
-    .forge-editor .placeholder { color: #4b5563; font-style: italic; text-align: center; margin-top: 100px; }
-</style>
-</head><body>
-<header><img src="/static/vektor-logo.webp" alt="Vektor" class="vektor-logo"><div><small>VEKTORCODE</small><h1>Vektor control</h1></div><button id="kill" class="danger">KILL SWITCH</button></header>
-<main><div class="banner"><b>Manual execution only</b><span>Every action waits for your tap. Sensitive actions require Aegis Gate approval.</span></div><nav id="tabs" class="tabs"><button data-target="forge-section">The Forge</button><button data-target="forge-section">The Forge</button><button data-target="chat-section">Chat</button><button data-target="models-page">Models</button><button data-target="studio-page">Image Studio</button><button data-target="tools-page">Tools</button><button data-target="health-page">Health</button><button data-target="sessions-page">Sessions</button><button data-target="receipts-page">Receipts</button><button data-target="settings-page">Settings</button></nav>
-<section><div class="section-head"><h2>Models</h2><span id="active">Active: loading…</span></div><select id="model"></select><div class="metrics"><div><small>Quota remaining</small><b id="quota">—</b></div><div><small>Cost ledger</small><b>$0.00 target</b></div></div></section>
-<section><div class="section-head"><h2>Health</h2><button id="refresh">Refresh</button></div><div class="metrics"><div><small>API connectivity</small><b id="api">—</b></div><div><small>Response time</small><b id="latency">—</b></div><div><small>Error rate</small><b id="errors">—</b></div><div><small>Uptime</small><b id="uptime">—</b></div></div><p class="muted">Refresh is manual and rate-limited to 30 seconds.</p></section>
-<section><div class="section-head"><h2>Chat sessions</h2><button id="new-session">+ New</button></div><div id="sessions" class="stack"></div></section>
-<section id="forge-section" class="forge-section">
-    <div class="section-head">
-        <h2>The Forge</h2>
-        <span class="pill">LIVE CODE</span>
-    </div>
-    <div class="forge-container">
-        <div class="forge-meta">
-            <span id="forge-file">No file selected</span>
-            <button id="apply-code" class="apply-btn">APPLY TO SYSTEM</button>
-        </div>
-        <div id="forge-editor" class="forge-editor">
-            <div class="placeholder">Vektor's architectural suggestions will appear here...</div>
-        </div>
-    </div>
-</section>
+            <div class="agent-vitals">
+                <div class="vital"><span class="dot online"></span> Engine: Online</div>
+                <div class="vital"><span class="dot"></span> MCP: <span id="mcp-status">Checking...</span></div>
+                <div class="vital"><span class="dot"></span> Rotation: Active</div>
+            </div>
+        </aside>
 
+        <!-- CENTER PANEL: COLLABORATION ZONE -->
+        <main class="collab-zone">
+            <header class="collab-header">
+                <div class="chat-info">
+                    <span class="agent-name">VektorCode</span>
+                    <span class="agent-status">Master Architect // Active</span>
+                </div>
+                <div class="header-actions">
+                    <button onclick="clearChat()" class="btn-icon" title="Clear Chat"><i class="fas fa-trash"></i></button>
+                    <button onclick="openSettings()" class="btn-icon" title="Settings"><i class="fas fa-cog"></i></button>
+                </div>
+            </header>
 
-<section id="forge-section" class="forge-section">
-    <div class="section-head">
-        <h2>The Forge</h2>
-        <span class="pill">LIVE CODE</span>
-    </div>
-    <div class="forge-container">
-        <div class="forge-meta">
-            <span id="forge-file">No file selected</span>
-            <button id="apply-code" class="apply-btn">APPLY TO SYSTEM</button>
-        </div>
-        <div id="forge-editor" class="forge-editor">
-            <div class="placeholder">Vektor's architectural suggestions will appear here...</div>
-        </div>
-    </div>
-</section>
+            <div id="chat-flow" class="chat-flow">
+                <!-- Messages appear here -->
+            </div>
 
-<section id="chat-section" class="chat-section"><div class="section-head"><h2>Vektor chat</h2><label class="voice-toggle"><input id="speak" type="checkbox" checked> Read replies aloud</label></div><div id="chat-log" class="chat-log"><div class="chat-message assistant"><b>Vektor</b><p>Ready. Ask me anything.</p></div></div><form id="chat-form" class="chat-form"><textarea id="chat-input" rows="2" placeholder="Message Vektor…" aria-label="Message Vektor"></textarea><button id="mic" type="button" aria-label="Start voice input" title="Start voice input">🎙️ Speak</button><button id="send" type="submit">Send</button></form><p id="chat-status" class="muted">Uses the configured server-side LLM.</p></section>
-<section><div class="section-head"><h2>Tools</h2><span id="composio">Composio: disconnected</span></div><p class="muted tool-note">All tools are off until enabled. Enabling only makes a tool available for a later manual tap.</p><div id="tools" class="grid"></div></section>
-<section><div class="section-head"><h2>Receipts</h2><span class="muted">Last 30 actions</span></div><div id="receipts" class="receipts"></div></section></main><dialog id="login"><form method="dialog"><h2>Unlock tools</h2><p class="muted">Enter the session password configured outside the app.</p><input id="password" type="password" autocomplete="current-password" placeholder="Session password"><div class="dialog-actions"><button value="cancel">Cancel</button><button id="login-submit" value="default">Unlock</button></div></form></dialog><div id="toast" role="status"></div><script src="/static/app.js"></script></body></html>
+            <div class="input-area">
+                <div class="input-wrapper">
+                    <button id="tool-toggle" class="btn-tool" title="Toggle Tools"><i class="fas fa-tools"></i></button>
+                    <textarea id="user-input" placeholder="Command the Super Agent... (Cmd+K for palette)" onkeydown="handleInput(event)"></textarea>
+                    <button id="send-btn" onclick="sendMessage()" class="btn-send"><i class="fas fa-paper-plane"></i></button>
+                </div>
+                <div class="input-footer">
+                    <span>VektorFlow AI Systems // Codex-Savant Engine</span>
+                </div>
+            </div>
+        </main>
+
+        <!-- RIGHT PANEL: THE FORGE -->
+        <aside class="forge-panel">
+            <div class="panel-header">
+                <span class="brand">THE FORGE</span>
+                <button onclick="closeForge()" class="btn-close"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="forge-content">
+                <div id="forge-meta" class="forge-meta">No code in forge</div>
+                <pre id="forge-code" class="forge-code"><code>// Code will be synthesized here...</code></pre>
+                <div class="forge-actions">
+                    <button onclick="copyForge()" class="btn-forge"><i class="fas fa-copy"></i> Copy</button>
+                    <button onclick="applyForge()" class="btn-forge btn-apply"><i class="fas fa-magic"></i> Apply to System</button>
+                </div>
+            </div>
+        </aside>
+    </div>
+
+    <!-- COMMAND PALETTE (MODAL) -->
+    <div id="command-palette" class="palette-overlay" style="display:none;">
+        <div class="palette-window">
+            <input type="text" id="palette-search" placeholder="Search actions..." oninput="filterPalette()">
+            <div id="palette-results" class="palette-results">
+                <!-- Results via JS -->
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
