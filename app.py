@@ -23,6 +23,7 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "llama3.2")
 PROVIDERS = [
     ('local', 'Local (Ollama)', 'OLLAMA_BASE_URL', 'local', 'llama3.2'),
     ('groq', 'Groq', 'GROQ_KEYS', 'https://api.groq.com/openai/v1/chat/completions', 'llama-3.1-8b-instant'),
+    ('grok', 'Grok (xAI)', 'GROK_KEYS', 'https://api.x.ai/v1/chat/completions', 'grok-3-mini'),
     ('gemini', 'Gemini', 'GEMINI_KEYS', 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', 'gemini-2.0-flash'),
     ('openrouter', 'OpenRouter', 'OPENROUTER_KEYS', 'https://openrouter.ai/api/v1/chat/completions', 'openrouter/auto'),
     ('meta', 'Meta', 'META_KEYS', 'https://api.llama.com/v1/chat/completions', 'Llama-4-Scout-17B-16E-Instruct-FP8'),
