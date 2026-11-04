@@ -1,12 +1,12 @@
 :root {
     --bg-deep: #050507;
     --bg-panel: rgba(15, 15, 25, 0.7);
-    --accent-primary: #a855f7;
-    --accent-secondary: #3b82f6;
+    --accent-primary: #00e5ff;
+    --accent-secondary: #0ea5e9;
     --text-main: #e2e8f0;
     --text-dim: #94a3b8;
-    --neon-glow: 0 0 15px rgba(168, 85, 247, 0.4);
-    --glass-border: 1px solid rgba(168, 85, 247, 0.2);
+    --neon-glow: 0 0 15px rgba(0, 229, 255, 0.4);
+    --glass-border: 1px solid rgba(0, 229, 255, 0.2);
     --forge-bg: #0a0a0f;
 }
 
@@ -80,7 +80,7 @@ body {
 }
 
 .session-item:hover, .session-item.active {
-    background: rgba(168, 85, 247, 0.1);
+    background: rgba(0, 229, 255, 0.1);
     color: var(--text-main);
     box-shadow: var(--neon-glow);
 }
@@ -280,7 +280,7 @@ body {
     transition: all 0.2s;
 }
 
-.btn-forge:hover { background: rgba(168, 85, 247, 0.2); }
+.btn-forge:hover { background: rgba(0, 229, 255, 0.2); }
 .btn-apply { background: var(--accent-primary); color: white; border: none; }
 
 /* PALETTE */
@@ -328,7 +328,7 @@ body {
     transition: background 0.2s;
 }
 
-.palette-item:hover { background: rgba(168, 85, 247, 0.1); }
+.palette-item:hover { background: rgba(0, 229, 255, 0.1); }
 
 /* ============ MOBILE RESPONSIVE ============ */
 @media (max-width: 900px) {
