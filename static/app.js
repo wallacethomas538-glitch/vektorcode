@@ -128,3 +128,28 @@ window.addEventListener('keydown', (e) => {
 });
 
 init();
+
+function togglePanel(which) {
+    const mind = document.getElementById('mind-panel');
+    const forge = document.getElementById('forge-panel');
+    if (which === 'mind') {
+        mind.classList.toggle('open');
+        forge.classList.remove('open');
+    } else {
+        forge.classList.toggle('open');
+        mind.classList.remove('open');
+    }
+}
+function closeForge() {
+    document.getElementById('forge-panel').classList.remove('open');
+}
+// Close panels when tapping outside on mobile
+document.addEventListener('click', (e) => {
+    if (window.innerWidth > 900) return;
+    const mind = document.getElementById('mind-panel');
+    const forge = document.getElementById('forge-panel');
+    if (!e.target.closest('.mind-panel') && !e.target.closest('.forge-panel') && !e.target.closest('.mobile-bar')) {
+        mind.classList.remove('open');
+        forge.classList.remove('open');
+    }
+});

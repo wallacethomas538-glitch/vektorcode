@@ -9,8 +9,12 @@
 </head>
 <body>
     <div class="nexus-container">
+        <div class="mobile-bar">
+            <button onclick="togglePanel('mind')"><i class="fas fa-bars"></i> Menu</button>
+            <button onclick="togglePanel('forge')"><i class="fas fa-code"></i> Forge</button>
+        </div>
         <!-- LEFT PANEL: THE MIND -->
-        <aside class="mind-panel">
+        <aside class="mind-panel" id="mind-panel">
             <div class="panel-header">
                 <img src="vektor-logo.webp" alt="Vektor Logo" class="logo">
                 <span class="brand">VektorCode <small>v2.0</small></span>
@@ -65,7 +69,7 @@
         </main>
 
         <!-- RIGHT PANEL: THE FORGE -->
-        <aside class="forge-panel">
+        <aside class="forge-panel" id="forge-panel">
             <div class="panel-header">
                 <span class="brand">THE FORGE</span>
                 <button onclick="closeForge()" class="btn-close"><i class="fas fa-times"></i></button>
