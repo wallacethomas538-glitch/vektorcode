@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>VektorCode // Cyber-Command</title>
+    <link rel="icon" href="/static/vektor-logo.webp" type="image/webp">
     <link rel="stylesheet" href="/static/style.css">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 </head>
@@ -13,11 +14,18 @@
             <button onclick="togglePanel('mind')"><i class="fas fa-bars"></i> Menu</button>
             <button onclick="togglePanel('forge')"><i class="fas fa-code"></i> Forge</button>
         </div>
+        <div class="mobile-model-bar">
+            <label for="mobile-provider" class="visually-hidden">Provider</label>
+            <select id="mobile-provider" onchange="changeModel(this.value)" aria-label="Provider"></select>
+            <label for="mobile-model" class="visually-hidden">Free model</label>
+            <select id="mobile-model" onchange="changeModelName(this.value)" aria-label="Free model"></select>
+        </div>
         <!-- LEFT PANEL: THE MIND -->
         <aside class="mind-panel" id="mind-panel">
             <div class="panel-header">
                 <img src="/static/vektor-logo.webp" alt="Vektor Logo" class="logo">
                 <span class="brand">VektorCode <small>v2.0</small></span>
+                <button onclick="closeMind()" class="btn-close panel-close" aria-label="Close menu"><i class="fas fa-times"></i></button>
             </div>
 
             <div class="section-label">SESSIONS</div>
@@ -31,6 +39,10 @@
                 <label for="active-model" class="visually-hidden">Active model</label>
                 <select id="active-model" onchange="changeModel(this.value)">
                     <!-- Models loaded via JS from /api/state -->
+                </select>
+                <label for="active-model-name" class="visually-hidden">Free model within provider</label>
+                <select id="active-model-name" onchange="changeModelName(this.value)" aria-label="Free model within provider">
+                    <!-- Free models for the active provider, loaded via JS -->
                 </select>
             </div>
 
@@ -78,6 +90,7 @@
                     <button id="tool-toggle" class="btn-tool" title="Show skills / tools" aria-label="Show skills and tools" onclick="toggleSkills()"><i class="fas fa-tools"></i></button>
                     <label for="user-input" class="visually-hidden">Message VektorCode</label>
                     <textarea id="user-input" placeholder="Command the Super Agent... (Ctrl+K for palette)" onkeydown="handleInput(event)"></textarea>
+                    <button id="mic-btn" class="btn-tool" title="Speak your message" aria-label="Speak your message" onclick="toggleMic()"><i class="fas fa-microphone"></i></button>
                     <button id="send-btn" onclick="sendMessage()" class="btn-send" aria-label="Send message"><i class="fas fa-paper-plane"></i></button>
                 </div>
                 <div class="input-footer">
@@ -115,11 +128,30 @@
                 <section class="settings-section">
                     <h3>Model</h3>
                     <p>Active model: <b id="settings-model">—</b></p>
-                    <p class="muted">Change it with the model selector in the left panel. Unconfigured providers need their API key set on the server.</p>
+                    <p class="muted">Change it with the model selector (left panel, or the provider/model bar on phones). Unconfigured providers need their API key set on the server.</p>
+                </section>
+                <section class="settings-section">
+                    <h3>Ollama</h3>
+                    <p class="muted">Local Ollama must be reachable from the <b>server</b>, not from your phone's browser. On Render there is no local Ollama — use Groq-hosted Qwen instead.</p>
+                    <label for="ollama-base-url">Ollama base URL</label>
+                    <input type="url" id="ollama-base-url" placeholder="http://localhost:11434" autocomplete="off">
+                    <label for="qwen-api-url">Qwen API URL (DashScope compat)</label>
+                    <input type="url" id="qwen-api-url" placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions" autocomplete="off">
+                    <button class="btn-forge" onclick="saveOllamaSettings()">Save Ollama settings</button>
+                    <span id="ollama-save-status" class="muted" role="status"></span>
+                    <label for="qwen-model-setting" style="margin-top:10px;">Qwen model (local Ollama route)</label>
+                    <select id="qwen-model-setting">
+                        <option value="qwen2.5:7b">qwen2.5:7b</option>
+                        <option value="qwen3:8b">qwen3:8b (local Ollama model)</option>
+                    </select>
+                    <button class="btn-forge" onclick="saveQwenModelSetting()">Use this Qwen model</button>
+                    <span id="qwen-model-status" class="muted" role="status"></span>
                 </section>
                 <section class="settings-section">
                     <h3>Voice</h3>
-                    <label class="voice-toggle"><input type="checkbox" id="speak-toggle-settings"> Read agent replies aloud (Web Speech, output only — no mic input)</label>
+                    <label class="voice-toggle"><input type="checkbox" id="speak-toggle-settings"> Read agent replies aloud (Web Speech output)</label>
+                    <p class="muted">To speak a message, tap the microphone button in the chat box — it transcribes your voice into the message and sends it.</p>
+                    <p id="voice-status" class="muted">Checking voice support…</p>
                 </section>
                 <section class="settings-section">
                     <h3>Account / Login</h3>
@@ -150,6 +182,13 @@
                         <p class="muted">No health data yet — press Refresh health.</p>
                     </div>
                 </section>
+                <section class="settings-section">
+                    <h3>Providers</h3>
+                    <p class="muted">Every provider, the exact API URL the app calls, its key env name, and whether it is configured. URLs come from the backend — this page keeps no second copy.</p>
+                    <div id="providers-table" class="health-table">
+                        <p class="muted">Loading providers…</p>
+                    </div>
+                </section>
             </div>
         </div>
     </div>
@@ -165,6 +204,7 @@
     </div>
 
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <div id="panel-backdrop" class="panel-backdrop" style="display:none;" onclick="closePanels()" aria-hidden="true"></div>
 
     <script src="/static/app.js"></script>
 </body>

@@ -43,8 +43,11 @@ class TestAllowlistContents:
             assert host not in VEKTOR_EGRESS_ALLOWLIST, host
 
     def test_track_a_provider_hosts_present(self):
-        # Chat-path providers added 2026-11-05 (Track A).
-        for host in ("api.x.ai", "api.openai.com", "api.cohere.com",
+        # Chat-path providers added 2026-11-05 (Track A). api.x.ai was
+        # removed with the Grok provider (Wallace's call — Grok is not
+        # free) and must NOT be on the list anymore.
+        assert "api.x.ai" not in VEKTOR_EGRESS_ALLOWLIST
+        for host in ("api.openai.com", "api.cohere.com",
                      "api.mistral.ai", "api.together.xyz",
                      "router.huggingface.co", "dashscope.aliyuncs.com",
                      "api.llama.com"):

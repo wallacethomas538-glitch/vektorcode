@@ -135,6 +135,17 @@ class SQLiteStore:
         finally:
             conn.close()
 
+    def set_session_model(self, session_id, model):
+        """Remember which provider:model a session is using (per-session
+        persistence of the model selection)."""
+        conn = sqlite_connect(self.path)
+        try:
+            conn.execute("UPDATE sessions SET model=? WHERE id=?",
+                         (model, session_id))
+            conn.commit()
+        finally:
+            conn.close()
+
     def add_message(self, session_id, role, content, model=None,
                     provider=None):
         mid = str(uuid.uuid4())
@@ -279,6 +290,14 @@ class SupabaseStore:
              "id": "eq." + quote(session_id, safe=''), "limit": "1"})
         if not rows:
             self.create_session(session_id, title, model)
+
+    def set_session_model(self, session_id, model):
+        """Remember which provider:model a session is using (per-session
+        persistence of the model selection)."""
+        self._request(
+            "PATCH", SESSIONS_TABLE,
+            {"id": "eq." + quote(session_id, safe='')},
+            {"model": model})
 
     def add_message(self, session_id, role, content, model=None,
                     provider=None):

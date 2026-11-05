@@ -20,7 +20,6 @@ from urllib.parse import urlsplit
 VEKTOR_EGRESS_ALLOWLIST = frozenset({
     # --- Free-tier AI providers (Vektor's model cascade) ---
     "api.groq.com",                      # Groq
-    "api.x.ai",                          # Grok (xAI)
     "api.openai.com",                    # OpenAI
     "api.cohere.com",                    # Cohere (OpenAI-compatible endpoint)
     "api.mistral.ai",                    # Mistral

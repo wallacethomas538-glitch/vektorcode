@@ -21,20 +21,58 @@ PORT = int(os.environ.get("PORT", os.environ.get("VEKTORCODE_PORT", "8765")))
 LLM_URL = os.environ.get("LLM_URL", "http://127.0.0.1:11434/v1/chat/completions")
 LLM_MODEL = os.environ.get("LLM_MODEL", "llama3.2")
 
+# Qwen model source: Wallace's fork of QwenLM/Qwen3 (Apache 2.0).
+# The fork is model SOURCE — Render cannot run a 32B model from source, so
+# the app calls hosted Qwen3 (Groq) or local Ollama Qwen instead. Never
+# claim the fork itself is running on Render.
+QWEN_SOURCE = "https://github.com/wallacethomas538-glitch/Qwen3"
+
 PROVIDERS = [
     ('local', 'Local (Ollama)', 'OLLAMA_BASE_URL', 'local', 'llama3.2'),
     ('groq', 'Groq', 'GROQ_KEYS', 'https://api.groq.com/openai/v1/chat/completions', 'llama-3.1-8b-instant'),
-    ('grok', 'Grok (xAI)', 'GROK_KEYS', 'https://api.x.ai/v1/chat/completions', 'grok-3-mini'),
     ('gemini', 'Gemini', 'GEMINI_KEYS', 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', 'gemini-2.0-flash'),
     ('openrouter', 'OpenRouter', 'OPENROUTER_KEYS', 'https://openrouter.ai/api/v1/chat/completions', 'openrouter/auto'),
     ('meta', 'Meta', 'META_KEYS', 'https://api.llama.com/v1/chat/completions', 'Llama-4-Scout-17B-16E-Instruct-FP8'),
     ('openai', 'OpenAI', 'OPENAI_KEYS', 'https://api.openai.com/v1/chat/completions', 'gpt-4o-mini'),
-    ('ollama-qwen', 'Ollama / Qwen', 'QWEN_KEYS', 'local', 'qwen2.5:7b'),
+    ('qwen', 'Qwen', 'GROQ_KEYS', 'https://api.groq.com/openai/v1/chat/completions', 'qwen/qwen3-32b'),
     ('cohere', 'Cohere', 'COHERE_KEYS', 'https://api.cohere.com/compatibility/v1/chat/completions', 'command-r7b-12-2024'),
     ('mistral', 'Mistral', 'MISTRAL_KEYS', 'https://api.mistral.ai/v1/chat/completions', 'mistral-small-latest'),
     ('together', 'Together AI', 'TOGETHER_KEYS', 'https://api.together.xyz/v1/chat/completions', 'meta-llama/Llama-3.3-70B-Instruct-Turbo'),
     ('huggingface', 'HuggingFace', 'HUGGINGFACE_KEYS', 'https://router.huggingface.co/v1/chat/completions', 'Qwen/Qwen2.5-7B-Instruct')
 ]
+
+# Free-tier models ONLY. A model is listed here only if it is genuinely
+# usable without paying (provider free tier / :free variant / local).
+# Paid models are never listed as selectable.
+FREE_MODELS = {
+    'local': ['llama3.2', 'qwen2.5:7b', 'qwen3:8b'],
+    'groq': ['qwen/qwen3-32b', 'llama-3.3-70b-versatile', 'llama-3.1-8b-instant',
+             'openai/gpt-oss-120b', 'openai/gpt-oss-20b',
+             'meta-llama/llama-4-scout-17b-16e-instruct'],
+    'gemini': ['gemini-2.0-flash', 'gemini-2.0-flash-lite', 'gemini-2.5-flash'],
+    'openrouter': ['meta-llama/llama-3.3-70b-instruct:free', 'qwen/qwen3-32b:free',
+                   'deepseek/deepseek-r1:free', 'google/gemma-3-27b-it:free'],
+    'meta': ['Llama-4-Scout-17B-16E-Instruct-FP8', 'Llama-4-Maverick-17B-128E-Instruct-FP8',
+             'Llama-3.3-70B-Instruct'],
+    'openai': [],  # OpenAI's API has no free tier
+    'qwen': ['qwen/qwen3-32b', 'qwen2.5:7b', 'qwen-plus'],
+    'cohere': [],  # Cohere chat has no free tier
+    'mistral': ['mistral-small-latest', 'codestral-latest'],
+    'together': ['meta-llama/Llama-3.3-70B-Instruct-Turbo',
+                 'Qwen/Qwen2.5-7B-Instruct-Turbo', 'deepseek-ai/DeepSeek-R1'],
+    'huggingface': ['Qwen/Qwen2.5-7B-Instruct', 'meta-llama/Llama-3.2-3B-Instruct',
+                    'google/gemma-2-9b-it'],
+}
+FREE_MODEL_NOTES = {
+    'openai': 'OpenAI API has no free tier — a key works, but usage is billed.',
+    'cohere': 'Cohere chat has no free tier.',
+}
+# Which route a Qwen model id takes (Groq-hosted Qwen3, local Ollama, DashScope).
+QWEN_ROUTES = {
+    'qwen/qwen3-32b': 'groq',
+    'qwen2.5:7b': 'ollama',
+    'qwen-plus': 'dashscope',
+}
 
 # Key Rotation State
 KEY_POOLS = {pid: os.environ.get(env, "").split(",") for pid, _, env, _, _ in PROVIDERS}
@@ -52,25 +90,99 @@ def on_render():
     return bool(os.environ.get("RENDER"))
 
 def default_model():
-    # On Render default to the first cloud provider that has its key set,
-    # so chat works instead of pointing at a nonexistent local Ollama.
-    if not on_render():
-        return "local"
-    for pid, _name, env, _url, _model in PROVIDERS:
-        if pid not in ("local", "ollama-qwen") and os.environ.get(env):
-            return pid
-    return "local"
+    # Qwen is the default model, the queen — Groq-hosted Qwen3 first,
+    # local Ollama Qwen as fallback. Chat reports honestly when neither
+    # route is configured instead of silently pointing elsewhere.
+    return "qwen"
 
-def provider_models():
+
+def ollama_base_url(handler=None):
+    """Effective Ollama base URL: saved setting wins over the env var."""
+    saved = ""
+    if handler is not None:
+        try:
+            saved = handler.setting("ollama_base_url", "") or ""
+        except Exception:
+            saved = ""
+    return (saved or os.environ.get("OLLAMA_BASE_URL", "")).strip().rstrip("/")
+
+
+def qwen_api_url(handler=None):
+    """Effective Qwen (DashScope compat) API URL: setting wins over env."""
+    saved = ""
+    if handler is not None:
+        try:
+            saved = handler.setting("qwen_api_url", "") or ""
+        except Exception:
+            saved = ""
+    return (saved or os.environ.get(
+        "QWEN_API_URL",
+        "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions")).strip()
+
+
+def qwen_route(handler=None):
+    """Which Qwen route is available right now: groq | ollama | dashscope | none.
+
+    Groq-hosted Qwen3 first; local Ollama Qwen when Groq keys are absent;
+    DashScope compat when a Qwen key + API URL are set.
+    """
+    if os.environ.get("GROQ_KEYS"):
+        return "groq"
+    if ollama_base_url(handler):
+        return "ollama"
+    if os.environ.get("QWEN_KEYS"):
+        return "dashscope"
+    return "none"
+
+
+def provider_models(handler=None):
     def is_configured(pid, env):
         if bool(os.environ.get(env)):
             return True
         if pid == "local":
-            return not on_render()  # no Ollama on Render
-        if pid == "ollama-qwen":
-            return bool(os.environ.get("OLLAMA_BASE_URL"))
+            return bool(ollama_base_url(handler)) or not on_render()
+        if pid == "qwen":
+            return qwen_route(handler) != "none"
         return False
-    return [{"id":pid,"name":name,"provider":name,"key_env":env,"configured":is_configured(pid, env),"model":model,"quota":"Configured" if is_configured(pid, env) else "TBD","cost":0} for pid,name,env,url,model in PROVIDERS]
+
+    def api_url(pid, url):
+        # The actual URL the app calls for this provider (not a second copy
+        # of the table — derived from the same PROVIDERS entry).
+        if pid == "local":
+            base = ollama_base_url(handler)
+            return (base + "/v1/chat/completions") if base else LLM_URL
+        if pid == "qwen":
+            route = qwen_route(handler)
+            if route == "groq":
+                return "https://api.groq.com/openai/v1/chat/completions"
+            if route == "ollama":
+                return ollama_base_url(handler) + "/v1/chat/completions"
+            if route == "dashscope":
+                return qwen_api_url(handler)
+            return "https://api.groq.com/openai/v1/chat/completions"
+        return url
+
+    out = []
+    for pid, name, env, url, model in PROVIDERS:
+        configured = is_configured(pid, env)
+        entry = {"id": pid, "name": name, "provider": name, "key_env": env,
+                 "configured": configured,
+                 "model": model,
+                 "models": FREE_MODELS.get(pid, []),
+                 "api_url": api_url(pid, url),
+                 "quota": "Configured" if configured else "TBD", "cost": 0}
+        if pid in FREE_MODEL_NOTES:
+            entry["free_note"] = FREE_MODEL_NOTES[pid]
+        if pid == "qwen":
+            entry["description"] = (
+                "Qwen3 — Wallace's fork is the model source: " + QWEN_SOURCE +
+                " (fork of QwenLM/Qwen3, Apache 2.0). The fork itself does not run "
+                "on Render; the app calls hosted Qwen3 via Groq, or local Ollama "
+                "Qwen when Groq keys are absent.")
+            entry["route"] = qwen_route(handler)
+            entry["source"] = QWEN_SOURCE
+        out.append(entry)
+    return out
 
 MODELS = provider_models()
 TOOLS = [
@@ -307,20 +419,61 @@ class Handler(BaseHTTPRequestHandler):
         entry = next((x for x in PROVIDERS if x[0] == selected), PROVIDERS[0])
         pid, provider, key_env, endpoint, model = entry
 
-        if endpoint == "local":
-            endpoint = (os.environ.get("OLLAMA_BASE_URL", LLM_URL).rstrip("/") + "/v1/chat/completions") if pid == "local" or os.environ.get("OLLAMA_BASE_URL") else os.environ.get("QWEN_API_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions")
+        # Specific model within the provider (per-provider free selection).
+        # Request wins, then the saved default, then the provider default.
+        # Anything not on the provider's free list falls back to the
+        # provider default — a paid model can never be selected this way.
+        free_list = FREE_MODELS.get(pid, [])
+        requested = data.get("model_name")
+        if not (isinstance(requested, str) and requested in free_list):
+            requested = self.setting("active_model_name", "") or None
+            if not (isinstance(requested, str) and requested in free_list):
+                requested = None
+        if requested:
+            model = requested
+        elif pid == "local":
+            model = os.environ.get("LLM_MODEL", model)
 
-        if pid != "local" and not os.environ.get(key_env):
+        # Resolve the endpoint. Qwen routes by model: Groq-hosted Qwen3
+        # first, local Ollama Qwen when Groq keys are absent, DashScope
+        # compat as a third route.
+        qwen_route_now = None
+        if pid == "qwen":
+            route = QWEN_ROUTES.get(model, "groq")
+            if route == "groq" and not os.environ.get("GROQ_KEYS"):
+                if ollama_base_url(self):
+                    route, model = "ollama", "qwen2.5:7b"
+                elif os.environ.get("QWEN_KEYS"):
+                    route, model = "dashscope", "qwen-plus"
+                else:
+                    self.send_json({"ok": False, "error": "Qwen is not configured: set GROQ_KEYS for Groq-hosted Qwen3, OLLAMA_BASE_URL for local Ollama Qwen, or QWEN_KEYS for DashScope", "retryable": False}, 400); return
+            if route == "ollama":
+                if not ollama_base_url(self):
+                    self.send_json({"ok": False, "error": "Local Ollama Qwen needs OLLAMA_BASE_URL set", "retryable": False}, 400); return
+                endpoint = ollama_base_url(self) + "/v1/chat/completions"
+            elif route == "dashscope":
+                if not os.environ.get("QWEN_KEYS"):
+                    self.send_json({"ok": False, "error": "DashScope Qwen needs QWEN_KEYS set", "retryable": False}, 400); return
+                endpoint = qwen_api_url(self)
+            qwen_route_now = route
+        elif endpoint == "local":
+            # Local Ollama. (Previously this appended /v1/chat/completions
+            # onto LLM_URL, which already ends with it — a double path.)
+            base = ollama_base_url(self)
+            endpoint = (base + "/v1/chat/completions") if base else LLM_URL
+        elif pid != "local" and not os.environ.get(key_env):
             self.send_json({"ok": False, "error": provider + " is not configured", "retryable": False}, 400); return
-
-        model = os.environ.get("LLM_MODEL", model) if pid == "local" else model
 
         # --- Stateful session: persist the new turn, load capped history ---
         sid = data.get("session_id") or str(uuid.uuid4())
         if not isinstance(sid, str) or not sid.strip():
             sid = str(uuid.uuid4())
         title = next((m.get("content", "") for m in messages if m.get("role") == "user"), "New session")
-        store().ensure_session(sid, str(title)[:80], selected)
+        store().ensure_session(sid, str(title)[:80], f"{pid}:{model}")
+        try:
+            store().set_session_model(sid, f"{pid}:{model}")
+        except Exception:
+            pass  # per-session model is best-effort; chat still works
         self._persist_new_messages(sid, messages)
         history = store().list_messages(sid, limit=HISTORY_LIMIT)
         llm_messages = [{"role": "system", "content": vektor_system_prompt()}] + [
@@ -332,8 +485,13 @@ class Handler(BaseHTTPRequestHandler):
             # (Previously this forced a dummy OLLAMA_API_KEY and the retry loop then
             # sent OLLAMA_BASE_URL itself as a Bearer token via get_next_key.)
             keys = [""]
+        if pid == "qwen" and qwen_route_now == "ollama":
+            keys = [""]  # local Ollama Qwen: no auth header
+        if pid == "qwen" and qwen_route_now == "dashscope":
+            keys = [k for k in os.environ.get("QWEN_KEYS", "").split(",") if k.strip()]
 
-        if pid != "local" and (not keys or (len(keys) == 1 and not keys[0])):
+        needs_keys = pid != "local" and not (pid == "qwen" and qwen_route_now == "ollama")
+        if needs_keys and (not keys or (len(keys) == 1 and not keys[0])):
             self.send_json({"ok": False, "error": "No available keys for " + provider, "retryable": False, "session_id": sid}, 400); return
 
         if data.get("stream"):
@@ -377,7 +535,7 @@ class Handler(BaseHTTPRequestHandler):
         """Streaming chat: SSE tokens, with a full-reply fallback.
 
         Streaming providers (OpenAI-compatible chat/completions with
-        stream:true, incl. local Ollama): groq, grok (xAI), openai,
+        stream:true, incl. local Ollama): groq, openai,
         openrouter, together, mistral, huggingface router, cohere
         (compatibility endpoint), gemini (OpenAI-compat endpoint), meta
         (Llama API), dashscope (Qwen compat mode). If a provider ignores
@@ -528,10 +686,11 @@ class Handler(BaseHTTPRequestHandler):
             sessions = current.list_sessions()
             receipts = current.list_receipts(30)
             enabled = self.setting("tools", []); active = self.setting("active_model", default_model())
+            active_name = self.setting("active_model_name", "") or None
             auth_enabled = bool(os.environ.get("VEKTORCODE_TOOL_PASSWORD"))
             authenticated = require_auth(self)
             mcp = mcp_status()
-            self.send_json({"models":provider_models(), "tools":[{"id":a,"name":b,"description":c,"enabled":a in enabled,"locked":bool(a in RISKY_TOOLS and auth_enabled and not authenticated),"approval_required":a in RISKY_TOOLS} for a,b,c in TOOLS], "active_model":active, "health":self.setting("health", {"providers":[]}), "mcp":{"connected":mcp.get("connected",False),"configured":mcp.get("configured",False),"transport":mcp.get("transport","streamable-http"),"tool_count":mcp.get("tool_count",0),"protocol":mcp.get("protocol"),"error":mcp.get("error"),"capabilities":[x[1] for x in TOOLS]}, "composio":{"connected":mcp.get("connected",False),"mcp_url_set":bool(os.environ.get("COMPOSIO_MCP_URL")),"api_key_set":bool(os.environ.get("COMPOSIO_API_KEY"))}, "storage":current.status(), "meta":{"configured":meta_ready(),"profile":self.setting("meta_profile", None)}, "media":{"provider":"Pollinations","configured":bool(os.environ.get("POLLINATIONS_API_KEY"))}, "auth":{"enabled":auth_enabled,"authenticated":authenticated}, "sessions":sessions, "receipts":receipts, "kill_switch":self.setting("kill_switch", False)}); return
+            self.send_json({"models":provider_models(self), "tools":[{"id":a,"name":b,"description":c,"enabled":a in enabled,"locked":bool(a in RISKY_TOOLS and auth_enabled and not authenticated),"approval_required":a in RISKY_TOOLS} for a,b,c in TOOLS], "active_model":active, "active_model_name":active_name, "qwen_source":QWEN_SOURCE, "ollama_base_url":ollama_base_url(self), "qwen_api_url":qwen_api_url(self), "health":self.setting("health", {"providers":[]}), "mcp":{"connected":mcp.get("connected",False),"configured":mcp.get("configured",False),"transport":mcp.get("transport","streamable-http"),"tool_count":mcp.get("tool_count",0),"protocol":mcp.get("protocol"),"error":mcp.get("error"),"capabilities":[x[1] for x in TOOLS]}, "composio":{"connected":mcp.get("connected",False),"mcp_url_set":bool(os.environ.get("COMPOSIO_MCP_URL")),"api_key_set":bool(os.environ.get("COMPOSIO_API_KEY"))}, "storage":current.status(), "meta":{"configured":meta_ready(),"profile":self.setting("meta_profile", None)}, "media":{"provider":"Pollinations","configured":bool(os.environ.get("POLLINATIONS_API_KEY"))}, "auth":{"enabled":auth_enabled,"authenticated":authenticated}, "sessions":sessions, "receipts":receipts, "kill_switch":self.setting("kill_switch", False)}); return
         if self.path.startswith("/api/session/") and self.path.endswith("/messages"):
             if not require_auth(self): self.send_json({"ok": False, "error": "Authentication required", "retryable": False}, 401); return
             sid = unquote(urlparse(self.path).path[len("/api/session/"):-len("/messages")])
@@ -543,6 +702,10 @@ class Handler(BaseHTTPRequestHandler):
             if ROOT.joinpath("static").resolve() not in target.parents or not target.is_file(): self.send_error(404); return
             raw = target.read_bytes(); mime = "text/html; charset=utf-8" if target.suffix == ".html" else "text/css" if target.suffix == ".css" else "application/javascript"
             self.send_response(200); self.send_header("Content-Type",mime); self.send_header("Content-Length",str(len(raw))); self.end_headers(); self.wfile.write(raw); return
+        if self.path == "/favicon.ico":
+            target = (ROOT / "static" / "vektor-logo.webp").resolve()
+            raw = target.read_bytes()
+            self.send_response(200); self.send_header("Content-Type","image/webp"); self.send_header("Content-Length",str(len(raw))); self.end_headers(); self.wfile.write(raw); return
         self.send_error(404)
     def do_POST(self):
         data = self.body(); path = self.path
@@ -602,7 +765,41 @@ class Handler(BaseHTTPRequestHandler):
             if not require_auth(self): self.send_json({"ok":False,"error":"Authentication required", "retryable":False}, 401); return
             model = data.get("model");
             if model not in {m["id"] for m in MODELS}: self.send_json({"ok":False}, 400); return
-            self.save_setting("active_model", model); receipt("model_selected", {"model":model}); self.send_json({"ok":True}); return
+            # Specific free model within the provider (two-level selection).
+            # A model_name not on the provider's free list is rejected, never
+            # silently swapped to a paid model.
+            model_name = data.get("model_name")
+            free_list = FREE_MODELS.get(model, [])
+            if model_name is not None:
+                if not (isinstance(model_name, str) and model_name in free_list):
+                    self.send_json({"ok":False,"error":"model_name is not a free model for " + model}, 400); return
+                self.save_setting("active_model_name", model_name)
+            else:
+                self.save_setting("active_model_name", "")
+            self.save_setting("active_model", model); receipt("model_selected", {"model":model, "model_name": model_name or ""}); self.send_json({"ok":True}); return
+        if path == "/api/settings":
+            # Persist editable endpoint URLs (Ollama base URL, Qwen API URL).
+            # Saved in settings (DB), which win over env vars at call time.
+            # Keys are NEVER accepted here — only URLs.
+            if not require_auth(self): self.send_json({"ok":False,"error":"Authentication required", "retryable":False}, 401); return
+            saved = {}
+            for key, field in (("ollama_base_url", "ollama_base_url"), ("qwen_api_url", "qwen_api_url")):
+                if field not in data:
+                    continue
+                value = data.get(field)
+                if not isinstance(value, str):
+                    self.send_json({"ok":False,"error":field + " must be a string"}, 400); return
+                value = value.strip()
+                if value:
+                    parsed = urlparse(value)
+                    if parsed.scheme not in ("http", "https") or not parsed.netloc or len(value) > 500:
+                        self.send_json({"ok":False,"error":field + " must be an http(s) URL"}, 400); return
+                    if "@" in parsed.netloc:
+                        self.send_json({"ok":False,"error":field + " must not embed credentials"}, 400); return
+                self.save_setting(key, value)
+                saved[key] = value
+            receipt("settings_saved", {"keys": sorted(saved.keys())})
+            self.send_json({"ok":True, "ollama_base_url": ollama_base_url(self), "qwen_api_url": qwen_api_url(self)}); return
         if path == "/api/tool":
             tool = data.get("tool"); enabled = bool(data.get("enabled"));
             if tool not in {x[0] for x in TOOLS}: self.send_json({"ok":False}, 400); return
@@ -617,7 +814,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"ok":True, "id":data.get("id"), "messages":store().list_messages(data.get("id") or "", limit=HISTORY_LIMIT)}); return
         if path == "/api/session":
             if not require_auth(self): self.send_json({"ok":False,"error":"Authentication required", "retryable":False}, 401); return
-            sid = str(uuid.uuid4()); store().create_session(sid, data.get("title","New session"), data.get("model","local")); receipt("start_session",{"session":sid}); self.send_json({"ok":True,"id":sid}); return
+            sid = str(uuid.uuid4()); store().create_session(sid, data.get("title","New session"), (data.get("model","local") + (":" + data.get("model_name") if isinstance(data.get("model_name"), str) and data.get("model_name") else ""))); receipt("start_session",{"session":sid}); self.send_json({"ok":True,"id":sid}); return
         if path == "/api/session/delete":
             if not require_auth(self): self.send_json({"ok":False,"error":"Authentication required", "retryable":False}, 401); return
             store().delete_session(data.get("id")); receipt("delete_session",data); self.send_json({"ok":True}); return
@@ -627,13 +824,33 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/health":
             results=[]
             for pid,name,key_env,url,model in PROVIDERS:
-                configured = pid == "local" or bool(os.environ.get(key_env)) or (pid == "ollama-qwen" and bool(os.environ.get("OLLAMA_BASE_URL")))
+                if pid == "qwen":
+                    configured = qwen_route(self) != "none"
+                elif pid == "local":
+                    configured = True  # always attemptable; the probe shows reachability
+                else:
+                    configured = bool(os.environ.get(key_env))
                 if not configured: results.append({"id":pid,"provider":name,"status":"tbd","configured":False,"latency_ms":None,"error_rate":"—","uptime":"—"}); continue
-                target = (os.environ.get("OLLAMA_BASE_URL", LLM_URL).rstrip("/") + "/api/tags") if pid == "local" or (pid == "ollama-qwen" and os.environ.get("OLLAMA_BASE_URL")) else os.environ.get("QWEN_API_URL", url) if pid == "ollama-qwen" else url
+                if pid == "local":
+                    base = ollama_base_url(self)
+                    target = (base + "/api/tags") if base else LLM_URL.replace("/v1/chat/completions", "/api/tags")
+                elif pid == "qwen":
+                    route = qwen_route(self)
+                    target = ("https://api.groq.com/openai/v1/chat/completions" if route == "groq"
+                              else (ollama_base_url(self) + "/api/tags") if route == "ollama"
+                              else qwen_api_url(self))
+                else:
+                    target = url
                 started=time.time()
                 try:
-                    headers={"User-Agent":"VektorCode/1.0"}; key=os.environ.get(key_env)
-                    if key and pid not in {"local","ollama-qwen"}: headers["Authorization"]="Bearer "+key
+                    headers={"User-Agent":"VektorCode/1.0"}
+                    if pid == "qwen":
+                        route = qwen_route(self)
+                        key = (os.environ.get("GROQ_KEYS") if route == "groq"
+                               else os.environ.get("QWEN_KEYS") if route == "dashscope" else None)
+                    else:
+                        key = os.environ.get(key_env)
+                    if key and pid != "local": headers["Authorization"]="Bearer "+key.split(",")[0].strip()
                     req=Request(target,headers=headers,method="GET")
                     with urlopen(req,timeout=8): pass
                     results.append({"id":pid,"provider":name,"status":"online","configured":True,"latency_ms":round((time.time()-started)*1000),"error_rate":"0%","uptime":"reachable"})

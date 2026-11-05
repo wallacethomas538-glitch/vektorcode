@@ -16,6 +16,7 @@ body {
     background-color: var(--bg-deep);
     color: var(--text-main);
     height: 100vh;
+    height: 100dvh; /* mobile browsers: exclude URL-bar chrome so 100% heights stay on-screen */
     overflow: hidden;
 }
 
@@ -94,6 +95,7 @@ body {
     border-radius: 6px;
     outline: none;
 }
+.model-selector select + select { margin-top: 8px; }
 
 .agent-vitals {
     margin-top: auto;
@@ -582,6 +584,63 @@ body {
     border: var(--glass-border);
 }
 
+/* Slide-over backdrop (mobile): tap outside a panel to close it */
+.panel-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    z-index: 850;
+}
+.panel-close { margin-left: auto; }
+
+/* Mobile model bar: provider + free-model selects reachable without the
+   left panel (phones are single-column; the mind panel is a slide-over). */
+.mobile-model-bar {
+    display: none;
+    gap: 8px;
+    padding: 10px 15px;
+    border-bottom: var(--glass-border);
+    background: var(--bg-panel);
+}
+.mobile-model-bar select {
+    flex: 1;
+    min-width: 0;
+    background: var(--bg-deep);
+    color: var(--text-main);
+    border: var(--glass-border);
+    padding: 9px 8px;
+    border-radius: 8px;
+    outline: none;
+    font-size: 0.85rem;
+}
+
+/* Mic button: red pulse while listening */
+#mic-btn.listening {
+    color: #ef4444;
+    animation: mic-pulse 1s ease-in-out infinite;
+}
+#mic-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+@keyframes mic-pulse {
+    0%, 100% { transform: scale(1); }
+    50% { transform: scale(1.25); }
+}
+
+/* Settings: URL / select inputs share the password-input look */
+.settings-section input[type="url"],
+.settings-section select {
+    width: 100%;
+    background: var(--bg-deep);
+    color: var(--text-main);
+    border: var(--glass-border);
+    border-radius: 6px;
+    padding: 9px 10px;
+    margin-bottom: 8px;
+    font-size: 0.9rem;
+}
+
 /* Toast */
 .toast {
     display: none;
@@ -601,11 +660,35 @@ body {
 }
 
 /* ============ MOBILE RESPONSIVE ============ */
+/* Root cause of the phone keyboard bug: the container stayed a grid with
+   grid-template-rows: 1fr while .collab-zone had min-height: 100vh. The
+   mobile-bar + a 100vh-tall chat zone stacked to ~200vh, pushing the
+   composer below the fold — and body{overflow:hidden} made it unreachable.
+   Fix: flex column that exactly fills the viewport; chat scrolls internally. */
 @media (max-width: 900px) {
     .nexus-container {
-        grid-template-columns: 1fr;
-        grid-template-rows: 1fr;
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
+        height: 100dvh;
     }
+    .mobile-bar {
+        flex: 0 0 auto;
+    }
+    .collab-zone {
+        flex: 1 1 auto;
+        min-height: 0;
+        min-width: 0;
+    }
+    .chat-flow { padding: 15px; min-height: 0; }
+    .input-area {
+        flex: 0 0 auto;
+        padding: 12px 15px calc(20px + env(safe-area-inset-bottom, 0px));
+    }
+    /* 16px stops iOS/Android auto-zoom on focus, which shoves the composer off-screen */
+    #user-input { font-size: 16px; }
+    .message { max-width: 95%; font-size: 0.9rem; padding: 12px 15px; }
+    .palette-window { width: 92%; }
     .mind-panel, .forge-panel {
         position: fixed;
         top: 0;
@@ -628,17 +711,16 @@ body {
         border-left: var(--glass-border);
     }
     .forge-panel.open { transform: translateX(0); }
-    .collab-zone { min-height: 100vh; }
-    .chat-flow { padding: 15px; }
-    .input-area { padding: 12px 15px 20px; }
-    .message { max-width: 95%; font-size: 0.9rem; padding: 12px 15px; }
-    .palette-window { width: 92%; }
     .mobile-bar {
         display: flex !important;
         gap: 10px;
         padding: 10px 15px;
         border-bottom: var(--glass-border);
         background: var(--bg-panel);
+    }
+    .mobile-model-bar {
+        display: flex !important;
+        flex: 0 0 auto;
     }
     .mobile-bar button {
         flex: 1;

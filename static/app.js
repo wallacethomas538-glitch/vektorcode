@@ -80,10 +80,34 @@ function renderModels() {
         `<option value="${esc(m.id)}" ${m.id === state.active_model ? 'selected' : ''}>` +
         `${esc(m.name)}${m.configured ? '' : ' — key needed'}</option>`
     ).join('');
-    $('agent-status-model').textContent =
-        (state.models.find((m) => m.id === state.active_model) || {}).name || state.active_model;
-    $('settings-model').textContent =
-        (state.models.find((m) => m.id === state.active_model) || {}).name || state.active_model;
+    renderModelNameSelect($('active-model-name'));
+    renderModelNameSelect($('mobile-model'));
+    const mp = $('mobile-provider');
+    if (mp) {
+        mp.innerHTML = select.innerHTML;
+        mp.value = state.active_model;
+    }
+    const active = state.models.find((m) => m.id === state.active_model) || {};
+    const modelLabel = active.name || state.active_model;
+    const modelName = state.active_model_name || active.model || '';
+    $('agent-status-model').textContent = modelLabel + (modelName ? ' · ' + modelName : '');
+    $('settings-model').textContent = modelLabel + (modelName ? ' (' + modelName + ')' : '');
+}
+
+function renderModelNameSelect(select) {
+    if (!select) return;
+    const active = state.models.find((m) => m.id === state.active_model) || {};
+    const models = active.models || [];
+    const current = state.active_model_name || active.model || '';
+    if (!models.length) {
+        select.innerHTML = `<option value="">${esc(active.free_note || 'No free models for this provider')}</option>`;
+        select.disabled = true;
+        return;
+    }
+    select.disabled = false;
+    select.innerHTML = models.map((name) =>
+        `<option value="${esc(name)}" ${name === current ? 'selected' : ''}>${esc(name)}</option>`
+    ).join('');
 }
 
 function renderSessions() {
@@ -183,8 +207,27 @@ async function changeModel(val) {
     await refreshState();
 }
 
+async function changeModelName(val) {
+    if (!val) return;
+    const res = await api('/api/model', { model: state.active_model, model_name: val }, 'POST');
+    if (!res || res.ok === false) {
+        toast('Model change failed: ' + ((res && res.error) || 'server error'));
+        await refreshState();
+        return;
+    }
+    await refreshState();
+}
+
+function currentModelName() {
+    const sel = $('active-model-name');
+    return sel && !sel.disabled && sel.value ? sel.value : null;
+}
+
 async function newSession() {
-    const res = await api('/api/session', { title: 'New session', model: $('active-model').value }, 'POST');
+    const body = { title: 'New session', model: $('active-model').value };
+    const mn = currentModelName();
+    if (mn) body.model_name = mn;
+    const res = await api('/api/session', body, 'POST');
     if (!res || !res.ok || !res.id) {
         toast('Could not create session: ' + ((res && res.error) || 'server error'));
         return;
@@ -204,6 +247,20 @@ function setCurrentSession(id) {
 async function resumeSession(id) {
     setCurrentSession(id);
     clearChatView();
+    // Restore this session's stored provider:model selection (sessions
+    // store "provider:model", older ones store just the provider id).
+    const sess = (state.sessions || []).find((x) => x.id === id);
+    if (sess && sess.model) {
+        const parts = String(sess.model).split(':');
+        const pid = parts[0];
+        const mname = parts.slice(1).join(':');
+        const entry = (state.models || []).find((m) => m.id === pid);
+        if (entry) {
+            state.active_model = pid;
+            state.active_model_name = mname || entry.model || '';
+            renderModels();
+        }
+    }
     // Preferred: real history from the backend (GET /api/session/<id>/messages).
     // Fallback: POST /api/session/resume, which also returns the messages.
     // Last resort: resume without history and say so honestly.
@@ -375,7 +432,10 @@ function speak(text) {
 
 async function ensureSession() {
     if (currentSessionId) return currentSessionId;
-    const res = await api('/api/session', { title: 'New session', model: $('active-model').value }, 'POST');
+    const body = { title: 'New session', model: $('active-model').value };
+    const mn = currentModelName();
+    if (mn) body.model_name = mn;
+    const res = await api('/api/session', body, 'POST');
     if (res && res.ok && res.id) {
         setCurrentSession(res.id);
         await refreshState(); // pick up the new session so it shows in the list at once
@@ -410,6 +470,8 @@ async function sendChat(text, isRetry) {
         model: $('active-model').value,
         stream: true
     };
+    const modelName = $('active-model-name') && $('active-model-name').value;
+    if (modelName) payload.model_name = modelName;
     if (sessionId) payload.session_id = sessionId;
 
     let res;
@@ -568,8 +630,26 @@ function closeSettings() {
 
 function renderSettingsBits() {
     if (!state) return;
+    const active = state.models.find((m) => m.id === state.active_model) || {};
     $('settings-model').textContent =
-        (state.models.find((m) => m.id === state.active_model) || {}).name || state.active_model;
+        (active.name || state.active_model) + ((state.active_model_name || active.model) ? ' (' + (state.active_model_name || active.model) + ')' : '');
+    // Ollama + Qwen endpoint fields (effective values: saved setting wins over env).
+    const ollamaInput = $('ollama-base-url');
+    if (ollamaInput && document.activeElement !== ollamaInput) ollamaInput.value = state.ollama_base_url || '';
+    const qwenInput = $('qwen-api-url');
+    if (qwenInput && document.activeElement !== qwenInput) qwenInput.value = state.qwen_api_url || '';
+    // Providers table: every provider with its real API URL, key env, status.
+    const pt = $('providers-table');
+    if (pt) {
+        pt.innerHTML = '<table class="health-grid"><thead><tr><th>Provider</th><th>API URL</th><th>Key env</th><th>Status</th></tr></thead><tbody>' +
+            state.models.map((m) =>
+                '<tr><td>' + esc(m.name) + (m.id === 'qwen' && m.source ? '<br><small><a href="' + esc(m.source) + '" target="_blank" rel="noopener">Qwen3 fork (model source)</a></small>' : '') + '</td>' +
+                '<td style="word-break:break-all;">' + esc(m.api_url || '—') + '</td>' +
+                '<td>' + esc(m.key_env || '—') + '</td>' +
+                '<td>' + (m.configured ? 'Configured' : 'Not configured') + '</td></tr>'
+            ).join('') + '</tbody></table>' +
+            '<p class="muted">Qwen routes: Groq-hosted Qwen3 first, local Ollama Qwen when Groq keys are absent, DashScope compat third. The fork itself does not run on Render.</p>';
+    }
     $('login-status').textContent = !state.auth.enabled
         ? 'Auth is not configured on this server — tools are open, no login needed.'
         : state.auth.authenticated
@@ -648,6 +728,113 @@ function renderHealthTable(health) {
             `<td>${esc(p.status)}</td><td>${p.latency_ms == null ? '—' : p.latency_ms + ' ms'}</td>` +
             `<td>${esc(p.uptime || p.error_rate || '—')}</td></tr>`
         ).join('') + '</tbody></table>';
+}
+
+async function saveOllamaSettings() {
+    const status = $('ollama-save-status');
+    const body = {};
+    const base = $('ollama-base-url').value.trim();
+    const qwenUrl = $('qwen-api-url').value.trim();
+    body.ollama_base_url = base;
+    body.qwen_api_url = qwenUrl;
+    const res = await api('/api/settings', body, 'POST');
+    if (!res || res.ok === false) {
+        if (status) status.textContent = 'Save failed: ' + ((res && res.error) || 'server error');
+        toast('Ollama settings save failed');
+        return;
+    }
+    if (status) status.textContent = 'Saved. Ollama base URL and Qwen API URL are now in effect.';
+    await refreshState();
+}
+
+async function saveQwenModelSetting() {
+    const status = $('qwen-model-status');
+    const model = $('qwen-model-setting').value;
+    const res = await api('/api/model', { model: 'qwen', model_name: model }, 'POST');
+    if (!res || res.ok === false) {
+        if (status) status.textContent = 'Failed: ' + ((res && res.error) || 'server error');
+        return;
+    }
+    if (status) status.textContent = 'Qwen model set to ' + model + ' (local Ollama route).';
+    await refreshState();
+}
+
+/* ---------- voice chat: mic input + spoken replies ---------- */
+
+let recog = null;
+let listening = false;
+
+function speechRecognitionCtor() {
+    return window.SpeechRecognition || window.webkitSpeechRecognition || null;
+}
+
+function initMic() {
+    const btn = $('mic-btn');
+    if (!btn) return;
+    const Ctor = speechRecognitionCtor();
+    if (!Ctor) {
+        btn.disabled = true;
+        btn.title = 'Speech recognition is not supported in this browser — type your message instead.';
+        btn.setAttribute('aria-disabled', 'true');
+        return;
+    }
+    if (!window.isSecureContext) {
+        btn.disabled = true;
+        btn.title = 'Speech recognition needs a secure page (HTTPS) — type your message instead.';
+        btn.setAttribute('aria-disabled', 'true');
+        return;
+    }
+    btn.disabled = false;
+    btn.title = 'Speak your message';
+}
+
+function toggleMic() {
+    const Ctor = speechRecognitionCtor();
+    if (!Ctor || !window.isSecureContext) {
+        toast('Speech recognition is not available here — type your message instead.');
+        return;
+    }
+    if (listening) {
+        try { recog.stop(); } catch (_) {}
+        return;
+    }
+    recog = new Ctor();
+    recog.lang = 'en-US';
+    recog.interimResults = true;
+    recog.continuous = false;
+    let finalText = '';
+    recog.onresult = (e) => {
+        let interim = '';
+        for (let i = e.resultIndex; i < e.results.length; i++) {
+            const r = e.results[i];
+            if (r.isFinal) finalText += r[0].transcript;
+            else interim += r[0].transcript;
+        }
+        $('user-input').value = (finalText + interim).trim();
+    };
+    recog.onerror = (e) => {
+        listening = false;
+        $('mic-btn').classList.remove('listening');
+        toast('Microphone failed: ' + (e.error || 'unknown error') + ' — type your message instead.');
+    };
+    recog.onend = () => {
+        listening = false;
+        $('mic-btn').classList.remove('listening');
+        const input = $('user-input');
+        if (finalText.trim()) {
+            input.value = finalText.trim();
+            sendMessage(); // transcribed speech is sent as a chat message
+        }
+    };
+    try {
+        recog.start();
+        listening = true;
+        $('mic-btn').classList.add('listening');
+        toast('Listening… speak now.');
+    } catch (err) {
+        listening = false;
+        toast('Could not start the microphone: ' + err.message);
+    }
 }
 
 async function refreshHealth() {
@@ -786,14 +973,25 @@ function initVoice() {
     $('speak-toggle-settings').checked = on;
     $('speak-toggle').addEventListener('change', (e) => setSpeak(e.target.checked));
     $('speak-toggle-settings').addEventListener('change', (e) => setSpeak(e.target.checked));
+    const voiceStatus = $('voice-status');
     if (!('speechSynthesis' in window)) {
         document.querySelectorAll('.voice-toggle').forEach((el) => {
             el.title = 'Voice output is not supported in this browser.';
         });
+        if (voiceStatus) voiceStatus.textContent = 'Voice output is not supported in this browser — replies will show as text only.';
+    } else if (voiceStatus) {
+        voiceStatus.textContent = 'Voice output ready — replies are read aloud when the Voice toggle is on.';
     }
+    initMic();
 }
 
 /* ---------- mobile drawers (PR #11 pattern, kept) ---------- */
+
+function syncBackdrop() {
+    const anyOpen = document.getElementById('mind-panel').classList.contains('open')
+        || document.getElementById('forge-panel').classList.contains('open');
+    document.getElementById('panel-backdrop').style.display = (anyOpen && window.innerWidth <= 900) ? 'block' : 'none';
+}
 
 function togglePanel(which) {
     const mind = document.getElementById('mind-panel');
@@ -805,10 +1003,23 @@ function togglePanel(which) {
         forge.classList.toggle('open');
         mind.classList.remove('open');
     }
+    syncBackdrop();
+}
+
+function closeMind() {
+    document.getElementById('mind-panel').classList.remove('open');
+    syncBackdrop();
 }
 
 function closeForge() {
     document.getElementById('forge-panel').classList.remove('open');
+    syncBackdrop();
+}
+
+function closePanels() {
+    document.getElementById('mind-panel').classList.remove('open');
+    document.getElementById('forge-panel').classList.remove('open');
+    syncBackdrop();
 }
 
 // Close panels when tapping outside on mobile
@@ -819,6 +1030,7 @@ document.addEventListener('click', (e) => {
     if (!e.target.closest('.mind-panel') && !e.target.closest('.forge-panel') && !e.target.closest('.mobile-bar')) {
         mind.classList.remove('open');
         forge.classList.remove('open');
+        syncBackdrop();
     }
 });
 
