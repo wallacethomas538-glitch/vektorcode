@@ -603,3 +603,14 @@ entirely from VektorCode:
   app.py) still mention OpenAI in comments — not user-visible, left alone.
 - Still needs Wallace (unchanged): GROQ_KEYS in Render, VEKTORCODE_SESSION_SECRET,
   optional `vektor_messages` DDL.
+
+### Follow-up fix — stale saved active model (same push)
+- Live check after the first Phase 6 deploy showed the saved `active_model`
+  on the server was still `openai` (saved before the removal). `/api/state`
+  reported it verbatim, which left the model picker pointing at a provider
+  that no longer exists. Fixed with `resolve_model_id()`: a saved or
+  requested id that names no current provider falls back to the default
+  (Qwen); a stale `active_model_name` is cleared the same way. Chat already
+  fell back safely; `/api/state` now does too. New test
+  `test_stale_saved_model_falls_back_to_qwen`; suite 82/82. Verified live
+  locally: `/api/model` rejects `openai`/`cohere` with 400.

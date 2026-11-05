@@ -88,6 +88,25 @@ def default_model():
     return "qwen"
 
 
+def resolve_model_id(handler=None, candidate=None):
+    """Validated provider id: a candidate (request) wins if it names a real
+    provider, else the saved active model, else the default (Qwen). A saved
+    id that no longer exists — e.g. a removed paid provider like OpenAI —
+    falls back to Qwen instead of pointing at nothing."""
+    ids = {p[0] for p in PROVIDERS}
+    if isinstance(candidate, str) and candidate in ids:
+        return candidate
+    saved = ""
+    if handler is not None:
+        try:
+            saved = handler.setting("active_model", "") or ""
+        except Exception:
+            saved = ""
+    if saved in ids:
+        return saved
+    return default_model()
+
+
 def ollama_base_url(handler=None):
     """Effective Ollama base URL: saved setting wins over the env var."""
     saved = ""
@@ -405,7 +424,7 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(messages, list) or not messages or any(not isinstance(x, dict) for x in messages):
             self.send_json({"ok": False, "error": "messages must be a non-empty list", "retryable": False}, 400); return
 
-        selected = data.get("model") or self.setting("active_model", default_model())
+        selected = resolve_model_id(self, data.get("model"))
         entry = next((x for x in PROVIDERS if x[0] == selected), PROVIDERS[0])
         pid, provider, key_env, endpoint, model = entry
 
@@ -675,8 +694,10 @@ class Handler(BaseHTTPRequestHandler):
             current = store()
             sessions = current.list_sessions()
             receipts = current.list_receipts(30)
-            enabled = self.setting("tools", []); active = self.setting("active_model", default_model())
+            enabled = self.setting("tools", []); active = resolve_model_id(self)
             active_name = self.setting("active_model_name", "") or None
+            if active_name not in FREE_MODELS.get(active, []):
+                active_name = None
             auth_enabled = bool(os.environ.get("VEKTORCODE_TOOL_PASSWORD"))
             authenticated = require_auth(self)
             mcp = mcp_status()

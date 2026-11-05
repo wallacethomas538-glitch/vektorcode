@@ -182,6 +182,22 @@ def test_state_exposes_models_and_api_urls():
     assert "free_note" not in by_id["groq"]
 
 
+def test_stale_saved_model_falls_back_to_qwen():
+    # A saved active_model pointing at a removed provider (e.g. OpenAI,
+    # saved before the free-tier-only cleanup) must resolve to Qwen, not
+    # report a provider that no longer exists.
+    h = make_handler("POST", "/api/model", {"model": "qwen"})
+    h.save_setting("active_model", "openai")
+    h.save_setting("active_model_name", "gpt-4o-mini")
+    state = get_state()
+    assert state["active_model"] == "qwen"
+    assert state["active_model_name"] is None
+    # resolve_model_id: stale saved id, no candidate -> default.
+    assert app.resolve_model_id(h) == "qwen"
+    assert app.resolve_model_id(h, "openai") == "qwen"
+    assert app.resolve_model_id(h, "groq") == "groq"
+
+
 # ---------------------------------------------------------------------------
 # /api/model: two-level selection
 # ---------------------------------------------------------------------------
