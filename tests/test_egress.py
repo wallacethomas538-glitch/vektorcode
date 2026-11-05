@@ -35,20 +35,26 @@ class TestAllowlistContents:
     def test_unverified_providers_not_present(self):
         # DEEPSEEK/NVIDIA/etc endpoints are unverified — must NOT be here
         # until Wallace approves each exact hostname. NOTE: api.mistral.ai
-        # and api.cohere.com WERE added 2026-11-05 (Track A) because the
-        # chat path calls those providers; api.cohere.ai (a different host)
-        # stays off the list.
+        # was added 2026-11-05 (Track A) because the chat path calls that
+        # provider. api.openai.com and api.cohere.com were REMOVED
+        # 2026-11-05 — OpenAI and Cohere have no free tier, so their
+        # providers were removed from VektorCode entirely (free-tier only).
+        # api.cohere.ai (a different host) stays off the list.
         for host in ("api.deepseek.com", "api.cohere.ai",
+                     "api.openai.com", "api.cohere.com",
                      "api.nvidia.com", "api.sambanova.ai"):
             assert host not in VEKTOR_EGRESS_ALLOWLIST, host
 
     def test_track_a_provider_hosts_present(self):
         # Chat-path providers added 2026-11-05 (Track A). api.x.ai was
         # removed with the Grok provider (Wallace's call — Grok is not
-        # free) and must NOT be on the list anymore.
+        # free) and must NOT be on the list anymore. Same for
+        # api.openai.com / api.cohere.com (removed 2026-11-05 — no free
+        # tier, providers removed entirely).
         assert "api.x.ai" not in VEKTOR_EGRESS_ALLOWLIST
-        for host in ("api.openai.com", "api.cohere.com",
-                     "api.mistral.ai", "api.together.xyz",
+        assert "api.openai.com" not in VEKTOR_EGRESS_ALLOWLIST
+        assert "api.cohere.com" not in VEKTOR_EGRESS_ALLOWLIST
+        for host in ("api.mistral.ai", "api.together.xyz",
                      "router.huggingface.co", "dashscope.aliyuncs.com",
                      "api.llama.com"):
             assert host in VEKTOR_EGRESS_ALLOWLIST, host

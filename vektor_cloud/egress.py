@@ -20,8 +20,6 @@ from urllib.parse import urlsplit
 VEKTOR_EGRESS_ALLOWLIST = frozenset({
     # --- Free-tier AI providers (Vektor's model cascade) ---
     "api.groq.com",                      # Groq
-    "api.openai.com",                    # OpenAI
-    "api.cohere.com",                    # Cohere (OpenAI-compatible endpoint)
     "api.mistral.ai",                    # Mistral
     "api.together.xyz",                  # Together AI
     "router.huggingface.co",             # HuggingFace Inference router
@@ -46,11 +44,13 @@ VEKTOR_EGRESS_ALLOWLIST = frozenset({
     "localhost",
     "127.0.0.1",
 })
-# NOTE: api.mistral.ai and api.cohere.com were added 2026-11-05 (Track A)
-# because VektorCode's chat path calls those providers' OpenAI-compatible
-# endpoints. api.deepseek.com and other cascade candidates remain unverified
-# and NOT on this list — verify the exact API hostname first, then add it
-# here with a code change.
+# NOTE: api.mistral.ai was added 2026-11-05 (Track A) because VektorCode's
+# chat path calls that provider's OpenAI-compatible endpoint. api.openai.com
+# and api.cohere.com were removed 2026-11-05 — OpenAI and Cohere have no
+# free tier, so their providers were removed from VektorCode entirely
+# (Wallace: free-tier models only). api.deepseek.com and other cascade
+# candidates remain unverified and NOT on this list — verify the exact API
+# hostname first, then add it here with a code change.
 
 
 class EgressBlocked(Exception):

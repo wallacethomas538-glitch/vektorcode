@@ -100,7 +100,7 @@ function renderModelNameSelect(select) {
     const models = active.models || [];
     const current = state.active_model_name || active.model || '';
     if (!models.length) {
-        select.innerHTML = `<option value="">${esc(active.free_note || 'No free models for this provider')}</option>`;
+        select.innerHTML = `<option value="">No free models for this provider</option>`;
         select.disabled = true;
         return;
     }

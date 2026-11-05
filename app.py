@@ -33,9 +33,7 @@ PROVIDERS = [
     ('gemini', 'Gemini', 'GEMINI_KEYS', 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', 'gemini-2.0-flash'),
     ('openrouter', 'OpenRouter', 'OPENROUTER_KEYS', 'https://openrouter.ai/api/v1/chat/completions', 'openrouter/auto'),
     ('meta', 'Meta', 'META_KEYS', 'https://api.llama.com/v1/chat/completions', 'Llama-4-Scout-17B-16E-Instruct-FP8'),
-    ('openai', 'OpenAI', 'OPENAI_KEYS', 'https://api.openai.com/v1/chat/completions', 'gpt-4o-mini'),
     ('qwen', 'Qwen', 'GROQ_KEYS', 'https://api.groq.com/openai/v1/chat/completions', 'qwen/qwen3-32b'),
-    ('cohere', 'Cohere', 'COHERE_KEYS', 'https://api.cohere.com/compatibility/v1/chat/completions', 'command-r7b-12-2024'),
     ('mistral', 'Mistral', 'MISTRAL_KEYS', 'https://api.mistral.ai/v1/chat/completions', 'mistral-small-latest'),
     ('together', 'Together AI', 'TOGETHER_KEYS', 'https://api.together.xyz/v1/chat/completions', 'meta-llama/Llama-3.3-70B-Instruct-Turbo'),
     ('huggingface', 'HuggingFace', 'HUGGINGFACE_KEYS', 'https://router.huggingface.co/v1/chat/completions', 'Qwen/Qwen2.5-7B-Instruct')
@@ -54,18 +52,12 @@ FREE_MODELS = {
                    'deepseek/deepseek-r1:free', 'google/gemma-3-27b-it:free'],
     'meta': ['Llama-4-Scout-17B-16E-Instruct-FP8', 'Llama-4-Maverick-17B-128E-Instruct-FP8',
              'Llama-3.3-70B-Instruct'],
-    'openai': [],  # OpenAI's API has no free tier
     'qwen': ['qwen/qwen3-32b', 'qwen2.5:7b', 'qwen-plus'],
-    'cohere': [],  # Cohere chat has no free tier
     'mistral': ['mistral-small-latest', 'codestral-latest'],
     'together': ['meta-llama/Llama-3.3-70B-Instruct-Turbo',
                  'Qwen/Qwen2.5-7B-Instruct-Turbo', 'deepseek-ai/DeepSeek-R1'],
     'huggingface': ['Qwen/Qwen2.5-7B-Instruct', 'meta-llama/Llama-3.2-3B-Instruct',
                     'google/gemma-2-9b-it'],
-}
-FREE_MODEL_NOTES = {
-    'openai': 'OpenAI API has no free tier — a key works, but usage is billed.',
-    'cohere': 'Cohere chat has no free tier.',
 }
 # Which route a Qwen model id takes (Groq-hosted Qwen3, local Ollama, DashScope).
 QWEN_ROUTES = {
@@ -171,8 +163,6 @@ def provider_models(handler=None):
                  "models": FREE_MODELS.get(pid, []),
                  "api_url": api_url(pid, url),
                  "quota": "Configured" if configured else "TBD", "cost": 0}
-        if pid in FREE_MODEL_NOTES:
-            entry["free_note"] = FREE_MODEL_NOTES[pid]
         if pid == "qwen":
             entry["description"] = (
                 "Qwen3 — Wallace's fork is the model source: " + QWEN_SOURCE +
@@ -535,9 +525,9 @@ class Handler(BaseHTTPRequestHandler):
         """Streaming chat: SSE tokens, with a full-reply fallback.
 
         Streaming providers (OpenAI-compatible chat/completions with
-        stream:true, incl. local Ollama): groq, openai,
-        openrouter, together, mistral, huggingface router, cohere
-        (compatibility endpoint), gemini (OpenAI-compat endpoint), meta
+        stream:true, incl. local Ollama): groq,
+        openrouter, together, mistral, huggingface router,
+        gemini (OpenAI-compat endpoint), meta
         (Llama API), dashscope (Qwen compat mode). If a provider ignores
         stream:true and returns plain JSON, the reply is emitted as a
         single delta + done instead of failing. Tool calls cannot be

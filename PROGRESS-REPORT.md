@@ -573,3 +573,33 @@ Branch: `mobile-qwen-grok` (pushed to origin/main — Wallace approved the repai
 1. **GROQ_KEYS in Render** — Qwen's primary route. Without it, chat honestly reports "not configured" (Ollama fallback only works if the server can reach an Ollama).
 2. **VEKTORCODE_SESSION_SECRET in Render** — so logins survive restarts (unchanged from Phase 4).
 3. Run the `vektor_messages` DDL in Supabase if he wants Supabase-backed history (unchanged).
+
+## Phase 6 — Free-tier-only cleanup (2026-11-05, Wallace's order)
+
+Wallace saw "OpenAI does not have a free tier" in the UI and ordered everything
+free-tier only. OpenAI and Cohere (both paid-only, no free tier) removed
+entirely from VektorCode:
+
+- `app.py`: OpenAI + Cohere tuples removed from `PROVIDERS`; their empty
+  `FREE_MODELS` entries removed; `FREE_MODEL_NOTES` dict deleted entirely
+  (no provider carries a "no free tier" note anymore); streaming-providers
+  docstring updated. Remaining providers (9): local, groq, gemini, openrouter,
+  meta, qwen (default, Groq qwen/qwen3-32b), mistral, together, huggingface —
+  every one has at least one genuinely free model.
+- `static/app.js`: dead `free_note` fallback in the model-name dropdown
+  removed (backend never sends it now).
+- `vektor_cloud/egress.py`: `api.openai.com` and `api.cohere.com` removed
+  from the egress allowlist (nothing calls them anymore); note updated.
+- Tests updated (expectations changed, none deleted): `test_qwen_models.py`
+  now asserts openai/cohere are absent from `FREE_MODELS`, `PROVIDERS`, and
+  `/api/state`, and no `free_note` appears anywhere; `test_egress.py` asserts
+  both hosts are off the allowlist.
+- Local verification: `/api/state` lists 9 free-tier providers, no OpenAI,
+  no Cohere, no `free_note`, every provider has free models, active model
+  still `qwen`. Full suite **81/81 passed**.
+- Note: `OPENAI_KEYS` / `COHERE_KEYS` left in Render env (harmless — the app
+  no longer reads them); Wallace can delete them. Dead files
+  `vektor_cloud/free_cascade.py` / `free_providers.py` (never imported by
+  app.py) still mention OpenAI in comments — not user-visible, left alone.
+- Still needs Wallace (unchanged): GROQ_KEYS in Render, VEKTORCODE_SESSION_SECRET,
+  optional `vektor_messages` DDL.

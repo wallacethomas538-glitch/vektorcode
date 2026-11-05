@@ -157,8 +157,11 @@ def test_free_model_lists_only_free_models():
     assert "llama-3.3-70b-versatile" in FREE_MODELS["groq"]
     assert "gemini-2.0-flash-lite" in FREE_MODELS["gemini"]
     assert all(m.endswith(":free") for m in FREE_MODELS["openrouter"])
-    assert FREE_MODELS["openai"] == []  # no free tier
-    assert FREE_MODELS["cohere"] == []  # no free tier
+    # Paid-only providers are gone entirely — free-tier only (Wallace 2026-11-05).
+    assert "openai" not in FREE_MODELS
+    assert "cohere" not in FREE_MODELS
+    assert "openai" not in {p[0] for p in PROVIDERS}
+    assert "cohere" not in {p[0] for p in PROVIDERS}
     # No paid flagship models anywhere in the free lists.
     paid = {"gpt-4o", "gpt-4.1", "claude-sonnet-4-5", "grok-3-mini",
             "grok-4", "gemini-2.5-pro"}
@@ -173,7 +176,10 @@ def test_state_exposes_models_and_api_urls():
     assert by_id["groq"]["models"] == FREE_MODELS["groq"]
     assert by_id["groq"]["key_env"] == "GROQ_KEYS"
     assert by_id["gemini"]["api_url"].startswith("https://generativelanguage.googleapis.com/")
-    assert by_id["openai"]["free_note"]  # honest: no free tier
+    # Paid-only providers are gone from /api/state entirely.
+    assert "openai" not in by_id
+    assert "cohere" not in by_id
+    assert "free_note" not in by_id["groq"]
 
 
 # ---------------------------------------------------------------------------
