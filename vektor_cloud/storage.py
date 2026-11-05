@@ -19,6 +19,7 @@ from urllib.request import Request, urlopen
 SETTINGS_TABLE = "vektor_settings"
 SESSIONS_TABLE = "vektor_sessions"
 RECEIPTS_TABLE = "vektor_receipts"
+MESSAGES_TABLE = "vektor_messages"
 
 _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS receipts (id TEXT PRIMARY KEY, action TEXT,"
@@ -28,6 +29,11 @@ _SCHEMA = (
     " updated REAL)",
     "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,"
     " value TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY,"
+    " session_id TEXT, role TEXT, content TEXT, model TEXT, provider TEXT,"
+    " created REAL)",
+    "CREATE INDEX IF NOT EXISTS messages_session_idx"
+    " ON messages (session_id, created)",
 )
 
 
@@ -117,6 +123,48 @@ class SQLiteStore:
         finally:
             conn.close()
 
+    def ensure_session(self, session_id, title, model):
+        """Create the session only if it does not already exist."""
+        now = time.time()
+        conn = sqlite_connect(self.path)
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO sessions VALUES (?,?,?,?,?,?,?,?)",
+                (session_id, title, model, 0, 0, 1, now, now))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def add_message(self, session_id, role, content, model=None,
+                    provider=None):
+        mid = str(uuid.uuid4())
+        conn = sqlite_connect(self.path)
+        try:
+            conn.execute(
+                "INSERT INTO messages VALUES (?,?,?,?,?,?,?)",
+                (mid, session_id, role, content, model, provider,
+                 time.time()))
+            conn.execute(
+                "UPDATE sessions SET updated=? WHERE id=?",
+                (time.time(), session_id))
+            conn.commit()
+        finally:
+            conn.close()
+        return mid
+
+    def list_messages(self, session_id, limit=20):
+        """Last `limit` messages of a session, oldest first."""
+        conn = sqlite_connect(self.path)
+        try:
+            rows = conn.execute(
+                "SELECT * FROM (SELECT * FROM messages WHERE session_id=?"
+                " ORDER BY created DESC, rowid DESC LIMIT ?)"
+                " ORDER BY created ASC, rowid ASC",
+                (session_id, limit)).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            conn.close()
+
     def resume_session(self, session_id):
         conn = sqlite_connect(self.path)
         try:
@@ -131,6 +179,8 @@ class SQLiteStore:
     def delete_session(self, session_id):
         conn = sqlite_connect(self.path)
         try:
+            conn.execute("DELETE FROM messages WHERE session_id=?",
+                         (session_id,))
             conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
             conn.commit()
         finally:
@@ -222,6 +272,33 @@ class SupabaseStore:
               "created": now, "updated": now}],
             "return=minimal")
 
+    def ensure_session(self, session_id, title, model):
+        rows = self._request(
+            "GET", SESSIONS_TABLE,
+            {"select": "id",
+             "id": "eq." + quote(session_id, safe=''), "limit": "1"})
+        if not rows:
+            self.create_session(session_id, title, model)
+
+    def add_message(self, session_id, role, content, model=None,
+                    provider=None):
+        mid = str(uuid.uuid4())
+        self._request(
+            "POST", MESSAGES_TABLE, None,
+            [{"id": mid, "session_id": session_id, "role": role,
+              "content": content, "model": model, "provider": provider,
+              "created": time.time()}],
+            "return=minimal")
+        return mid
+
+    def list_messages(self, session_id, limit=20):
+        rows = self._request(
+            "GET", MESSAGES_TABLE,
+            {"select": "*",
+             "session_id": "eq." + quote(session_id, safe=''),
+             "order": "created.desc", "limit": str(limit)})
+        return list(reversed(rows or []))
+
     def resume_session(self, session_id):
         self._request(
             "PATCH", SESSIONS_TABLE, {"active": "eq.true"},
@@ -232,6 +309,10 @@ class SupabaseStore:
             {"active": True, "updated": time.time()}, "return=minimal")
 
     def delete_session(self, session_id):
+        self._request(
+            "DELETE", MESSAGES_TABLE,
+            {"session_id": "eq." + quote(session_id, safe='')},
+            None, "return=minimal")
         self._request(
             "DELETE", SESSIONS_TABLE,
             {"id": "eq." + quote(session_id, safe='')},
@@ -289,6 +370,17 @@ class DashboardStore:
 
     def create_session(self, session_id, title, model):
         return self._call("create_session", session_id, title, model)
+
+    def ensure_session(self, session_id, title, model):
+        return self._call("ensure_session", session_id, title, model)
+
+    def add_message(self, session_id, role, content, model=None,
+                    provider=None):
+        return self._call("add_message", session_id, role, content,
+                          model, provider)
+
+    def list_messages(self, session_id, limit=20):
+        return self._call("list_messages", session_id, limit)
 
     def resume_session(self, session_id):
         return self._call("resume_session", session_id)

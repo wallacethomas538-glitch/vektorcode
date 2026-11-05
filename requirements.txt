@@ -1,3 +1,15 @@
-fastapi
-pydantic
-uvicorn
+# VektorCode runtime dependencies.
+#
+# The live app (app.py / main.py) is stdlib-only (http.server) — it needs
+# NO third-party packages. This file intentionally lists none, so
+# `pip install -r requirements.txt` (Render's buildCommand) installs
+# nothing and cannot break on an unpinned or unused dependency.
+#
+# Previously listed here, now REMOVED (2026-11-05, track-b cleanup):
+#   fastapi, pydantic, uvicorn — unpinned and imported by nothing in the
+#   repo (grep: no fastapi/pydantic/uvicorn import anywhere).
+#
+# Dev-only: verify_all.py is a local smoke script (NOT run on Render) and
+# needs requests, which is NOT in this file. Install it separately when
+# running that script:
+#   pip install requests==2.34.2

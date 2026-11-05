@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>VektorCode // Cyber-Command</title>
-    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="/static/style.css">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 </head>
 <body>
@@ -16,26 +16,40 @@
         <!-- LEFT PANEL: THE MIND -->
         <aside class="mind-panel" id="mind-panel">
             <div class="panel-header">
-                <img src="vektor-logo.webp" alt="Vektor Logo" class="logo">
+                <img src="/static/vektor-logo.webp" alt="Vektor Logo" class="logo">
                 <span class="brand">VektorCode <small>v2.0</small></span>
             </div>
-            
+
             <div class="section-label">SESSIONS</div>
+            <button id="new-session-btn" class="btn-mini" onclick="newSession()">+ New session</button>
             <div id="session-list" class="session-list">
-                <!-- Sessions loaded via JS -->
+                <!-- Sessions loaded via JS from /api/state -->
             </div>
-            
+
             <div class="section-label">THE BRAIN</div>
             <div class="model-selector">
+                <label for="active-model" class="visually-hidden">Active model</label>
                 <select id="active-model" onchange="changeModel(this.value)">
-                    <!-- Models loaded via JS -->
+                    <!-- Models loaded via JS from /api/state -->
                 </select>
             </div>
 
-            <div class="agent-vitals">
-                <div class="vital"><span class="dot online"></span> Engine: Online</div>
-                <div class="vital"><span class="dot"></span> MCP: <span id="mcp-status">Checking...</span></div>
-                <div class="vital"><span class="dot"></span> Rotation: Active</div>
+            <div class="section-label" id="skills-label">SKILLS / TOOLS</div>
+            <div id="skill-list" class="skill-list" aria-labelledby="skills-label">
+                <!-- Tools loaded via JS from /api/state -->
+            </div>
+            <p class="panel-note">Only Composio MCP is wired to execute. The other tools are registered labels, not executable — see Settings for detail.</p>
+
+            <div class="section-label">ACTIVITY</div>
+            <div id="activity-feed" class="activity-feed">
+                <!-- Receipts loaded via JS from /api/state (last 30) -->
+            </div>
+
+            <div class="agent-vitals" id="agent-vitals">
+                <div class="vital"><span class="dot" id="vital-api-dot"></span> API: <span id="vital-api">Checking...</span></div>
+                <div class="vital"><span class="dot" id="vital-mcp-dot"></span> MCP: <span id="vital-mcp">Checking...</span></div>
+                <div class="vital"><span class="dot" id="vital-kill-dot"></span> Kill switch: <span id="vital-kill">Checking...</span></div>
+                <div class="vital"><span class="dot" id="vital-auth-dot"></span> Auth: <span id="vital-auth">Checking...</span></div>
             </div>
         </aside>
 
@@ -44,11 +58,14 @@
             <header class="collab-header">
                 <div class="chat-info">
                     <span class="agent-name">VektorCode</span>
-                    <span class="agent-status">Master Architect // Active</span>
+                    <span class="agent-status">Master Architect // <span id="agent-status-model">Active</span></span>
                 </div>
                 <div class="header-actions">
-                    <button onclick="clearChat()" class="btn-icon" title="Clear Chat"><i class="fas fa-trash"></i></button>
-                    <button onclick="openSettings()" class="btn-icon" title="Settings"><i class="fas fa-cog"></i></button>
+                    <label class="voice-toggle" title="Read agent replies aloud (Web Speech, output only)">
+                        <input type="checkbox" id="speak-toggle"> Voice
+                    </label>
+                    <button onclick="clearChat()" class="btn-icon" title="Clear Chat" aria-label="Clear chat"><i class="fas fa-trash"></i></button>
+                    <button onclick="openSettings()" class="btn-icon" title="Settings" aria-label="Open settings"><i class="fas fa-cog"></i></button>
                 </div>
             </header>
 
@@ -58,9 +75,10 @@
 
             <div class="input-area">
                 <div class="input-wrapper">
-                    <button id="tool-toggle" class="btn-tool" title="Toggle Tools"><i class="fas fa-tools"></i></button>
-                    <textarea id="user-input" placeholder="Command the Super Agent... (Cmd+K for palette)" onkeydown="handleInput(event)"></textarea>
-                    <button id="send-btn" onclick="sendMessage()" class="btn-send"><i class="fas fa-paper-plane"></i></button>
+                    <button id="tool-toggle" class="btn-tool" title="Show skills / tools" aria-label="Show skills and tools" onclick="toggleSkills()"><i class="fas fa-tools"></i></button>
+                    <label for="user-input" class="visually-hidden">Message VektorCode</label>
+                    <textarea id="user-input" placeholder="Command the Super Agent... (Ctrl+K for palette)" onkeydown="handleInput(event)"></textarea>
+                    <button id="send-btn" onclick="sendMessage()" class="btn-send" aria-label="Send message"><i class="fas fa-paper-plane"></i></button>
                 </div>
                 <div class="input-footer">
                     <span>VektorFlow AI Systems // Codex-Savant Engine</span>
@@ -72,29 +90,82 @@
         <aside class="forge-panel" id="forge-panel">
             <div class="panel-header">
                 <span class="brand">THE FORGE</span>
-                <button onclick="closeForge()" class="btn-close"><i class="fas fa-times"></i></button>
+                <button onclick="closeForge()" class="btn-close" aria-label="Close forge"><i class="fas fa-times"></i></button>
             </div>
             <div class="forge-content">
                 <div id="forge-meta" class="forge-meta">No code in forge</div>
                 <pre id="forge-code" class="forge-code"><code>// Code will be synthesized here...</code></pre>
                 <div class="forge-actions">
                     <button onclick="copyForge()" class="btn-forge"><i class="fas fa-copy"></i> Copy</button>
-                    <button onclick="applyForge()" class="btn-forge btn-apply"><i class="fas fa-magic"></i> Apply to System</button>
+                    <button class="btn-forge btn-apply" disabled title="No /api/apply endpoint exists on the backend"><i class="fas fa-magic"></i> Apply to System</button>
                 </div>
+                <p class="panel-note">Apply is not available — the backend has no /api/apply endpoint. Copy the code and apply it manually.</p>
             </div>
         </aside>
     </div>
 
-    <!-- COMMAND PALETTE (MODAL) -->
-    <div id="command-palette" class="palette-overlay" style="display:none;">
-        <div class="palette-window">
-            <input type="text" id="palette-search" placeholder="Search actions..." oninput="filterPalette()">
-            <div id="palette-results" class="palette-results">
-                <!-- Results via JS -->
+    <!-- SETTINGS MODAL -->
+    <div id="settings-modal" class="modal-overlay" style="display:none;" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+        <div class="modal-window">
+            <div class="modal-header">
+                <h2 id="settings-title">Settings</h2>
+                <button onclick="closeSettings()" class="btn-close" aria-label="Close settings"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="modal-body">
+                <section class="settings-section">
+                    <h3>Model</h3>
+                    <p>Active model: <b id="settings-model">—</b></p>
+                    <p class="muted">Change it with the model selector in the left panel. Unconfigured providers need their API key set on the server.</p>
+                </section>
+                <section class="settings-section">
+                    <h3>Voice</h3>
+                    <label class="voice-toggle"><input type="checkbox" id="speak-toggle-settings"> Read agent replies aloud (Web Speech, output only — no mic input)</label>
+                </section>
+                <section class="settings-section">
+                    <h3>Account / Login</h3>
+                    <p id="login-status" class="muted">Checking…</p>
+                    <form id="login-form" onsubmit="submitLogin(event)">
+                        <label for="login-password">Session password</label>
+                        <input type="password" id="login-password" autocomplete="current-password" placeholder="Session password">
+                        <button type="submit" class="btn-forge">Unlock</button>
+                        <span id="login-error" class="error-text" role="alert"></span>
+                    </form>
+                    <p class="muted">Login unlocks auth-gated tools (POST /api/login sets the session cookie). The password is never shown or stored by this page.</p>
+                </section>
+                <section class="settings-section">
+                    <h3>Kill switch</h3>
+                    <p>Status: <b id="kill-status">—</b></p>
+                    <button id="kill-btn" class="btn-danger" onclick="activateKill()">Activate kill switch</button>
+                    <p class="muted">Kill switch stops chat (server returns 423). It cannot be undone from this UI — there is no backend endpoint to clear it.</p>
+                </section>
+                <section class="settings-section">
+                    <h3>Meta account</h3>
+                    <p id="meta-status" class="muted">Checking…</p>
+                    <button id="meta-connect-btn" class="btn-forge" onclick="location.href='/api/meta/login'">Connect Meta</button>
+                </section>
+                <section class="settings-section">
+                    <h3>Health</h3>
+                    <p>Service: <b id="health-service">—</b> <button class="btn-mini" onclick="refreshHealth()">Refresh health</button></p>
+                    <div id="health-table" class="health-table">
+                        <p class="muted">No health data yet — press Refresh health.</p>
+                    </div>
+                </section>
             </div>
         </div>
     </div>
 
-    <script src="app.js"></script>
+    <!-- COMMAND PALETTE (MODAL) -->
+    <div id="command-palette" class="palette-overlay" style="display:none;" role="dialog" aria-modal="true" aria-label="Command palette">
+        <div class="palette-window">
+            <input type="text" id="palette-search" placeholder="Search actions, sessions, models, tools..." oninput="filterPalette()" aria-label="Search actions">
+            <div id="palette-results" class="palette-results">
+                <!-- Results via JS, populated from real sessions/models/tools -->
+            </div>
+        </div>
+    </div>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+    <script src="/static/app.js"></script>
 </body>
 </html>

@@ -94,13 +94,27 @@ def security_scan(host: str, checks=("tls", "headers", "exposed_paths", "ports")
     Returns the scan report dict. Raises TargetNotAuthorized for
     non-allowlisted hosts — the allowlist cannot be bypassed.
     """
-    from vektor_cloud.fangs import FangsRunner
+    from vektor_cloud.vektorbot_fangs import FangsRunner
     runner = FangsRunner()
     return runner.run(host, checks=checks)
 
 
 def scan_file(path: str) -> dict:
-    """Scan a file with the antivirus engine. Quarantines on hit, never deletes."""
-    from vektor_cloud.antivirus import Antivirus
+    """Scan a single file with the antivirus engine.
+
+    Antivirus.scan() only accepts directories, so a file path is scanned
+    via its parent directory and findings are filtered to that file.
+    Returns the scan report for that file only. Reports findings;
+    quarantine is the caller's job via Antivirus.quarantine — nothing
+    here deletes anything.
+    """
+    from pathlib import Path
+    from vektor_cloud.vektorbot_antivirus import Antivirus
+    target = Path(path)
     av = Antivirus()
-    return av.scan(path)
+    if target.is_file():
+        report = av.scan(target.parent)
+        report["findings"] = [f for f in report["findings"]
+                              if f["path"] == str(target)]
+        return report
+    return av.scan(target)

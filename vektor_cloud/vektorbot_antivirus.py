@@ -171,7 +171,7 @@ class Antivirus:
         if engine not in ("auto", "clamav", "builtin"):
             raise ValueError(f"unknown engine: {engine!r}")
         if engine in ("auto", "clamav"):
-            from .clamav_engine import ClamAVEngine
+            from .vektorbot_clamav_engine import ClamAVEngine
             clamav = ClamAVEngine()
             if clamav.available():
                 return clamav.scan(target)

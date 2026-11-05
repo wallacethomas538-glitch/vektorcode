@@ -33,10 +33,22 @@ class TestAllowlistContents:
         assert "127.0.0.1" in VEKTOR_EGRESS_ALLOWLIST
 
     def test_unverified_providers_not_present(self):
-        # MISTRAL/NVIDIA/COHERE/etc endpoints are unverified — must NOT be here
-        # until Wallace approves each exact hostname.
-        for host in ("api.mistral.ai", "api.cohere.ai", "api.deepseek.com"):
+        # DEEPSEEK/NVIDIA/etc endpoints are unverified — must NOT be here
+        # until Wallace approves each exact hostname. NOTE: api.mistral.ai
+        # and api.cohere.com WERE added 2026-11-05 (Track A) because the
+        # chat path calls those providers; api.cohere.ai (a different host)
+        # stays off the list.
+        for host in ("api.deepseek.com", "api.cohere.ai",
+                     "api.nvidia.com", "api.sambanova.ai"):
             assert host not in VEKTOR_EGRESS_ALLOWLIST, host
+
+    def test_track_a_provider_hosts_present(self):
+        # Chat-path providers added 2026-11-05 (Track A).
+        for host in ("api.x.ai", "api.openai.com", "api.cohere.com",
+                     "api.mistral.ai", "api.together.xyz",
+                     "router.huggingface.co", "dashscope.aliyuncs.com",
+                     "api.llama.com"):
+            assert host in VEKTOR_EGRESS_ALLOWLIST, host
 
 
 class TestGuardHost:

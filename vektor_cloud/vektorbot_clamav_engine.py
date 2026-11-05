@@ -22,7 +22,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from .antivirus import sha256_of
+from .vektorbot_antivirus import sha256_of
 
 # Seconds allowed per clamscan run before we call it stuck and stage it.
 CLAMSCAN_TIMEOUT = 300

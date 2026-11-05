@@ -18,8 +18,12 @@ def image_url(prompt: str, width: int = 1024, height: int = 1024) -> str:
     guard_url(url)  # raises EgressBlocked if not allowlisted
     return url
 def text_url(provider: str) -> str:
+    import os
     from vektor_cloud.egress import guard_url
+    ollama_base = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
     url = {
+        # Local Llama via Ollama on the phone (Termux). No key, localhost only.
+        "OLLAMA": f"{ollama_base}/v1/chat/completions",
         "GROQ": "https://api.groq.com/openai/v1/chat/completions",
         "OPENROUTER": "https://openrouter.ai/api/v1/chat/completions",
         "GEMINI": "https://generativelanguage.googleapis.com/v1beta/models",

@@ -28,6 +28,20 @@ create table if not exists vektor_receipts (
     created double precision not null
 );
 
+-- Chat history (Track A, 2026-11-05): one row per user/assistant message.
+create table if not exists vektor_messages (
+    id text primary key,
+    session_id text not null references vektor_sessions(id) on delete cascade,
+    role text not null,
+    content text not null,
+    model text,
+    provider text,
+    created double precision not null
+);
+
+create index if not exists vektor_messages_session_idx
+    on vektor_messages (session_id, created);
+
 create index if not exists vektor_sessions_updated_idx
     on vektor_sessions (updated desc);
 create index if not exists vektor_receipts_created_idx
