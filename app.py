@@ -619,6 +619,7 @@ class Handler(BaseHTTPRequestHandler):
         started = time.time()
         last_error = "All providers failed"
         last_status = 502
+        attempt_errors = []
         for pid, provider, model, endpoint, keys, rotate in candidates:
             for attempt in range(len(keys)):
                 key = keys[attempt] if not rotate else get_next_key(pid)
@@ -645,15 +646,17 @@ class Handler(BaseHTTPRequestHandler):
                     if e.code in ROTATABLE_HTTP_CODES:
                         last_error = llm_http_error_detail(e)
                         last_status = 429 if e.code == 429 else 502
+                        attempt_errors.append({"provider": provider, "model": model, "error": last_error})
                         continue
                     self.send_json({"ok": False, "error": llm_http_error_detail(e), "retryable": True, "session_id": sid}, 502); return
                 except (URLError, TimeoutError) as exc:
                     last_error = "LLM unavailable: " + str(exc)[:240]
                     last_status = 502
+                    attempt_errors.append({"provider": provider, "model": model, "error": last_error})
                     continue
                 except Exception as exc:
                     self.send_json({"ok": False, "error": "LLM unavailable: " + str(exc)[:240], "retryable": True, "session_id": sid}, 502); return
-        self.send_json({"ok": False, "error": last_error, "retryable": True, "session_id": sid}, last_status)
+        self.send_json({"ok": False, "error": last_error, "retryable": True, "session_id": sid, "attempts": attempt_errors}, last_status)
 
     def _chat_stream(self, sid, candidates, llm_messages):
         """Streaming chat: SSE tokens, with a full-reply fallback.
@@ -675,6 +678,7 @@ class Handler(BaseHTTPRequestHandler):
         started = time.time()
         last_error = "All providers failed"
         last_status = 502
+        attempt_errors = []
         for pid, provider, model, endpoint, keys, rotate in candidates:
             for attempt in range(len(keys)):
                 key = keys[attempt] if not rotate else get_next_key(pid)
@@ -693,11 +697,13 @@ class Handler(BaseHTTPRequestHandler):
                 if e.code in ROTATABLE_HTTP_CODES:
                     last_error = llm_http_error_detail(e)
                     last_status = 429 if e.code == 429 else 502
+                    attempt_errors.append({"provider": provider, "model": model, "error": last_error})
                     continue
                 self.send_json({"ok": False, "error": llm_http_error_detail(e), "retryable": True, "session_id": sid}, 502); return
             except (URLError, TimeoutError) as exc:
                 last_error = "LLM unavailable: " + str(exc)[:240]
                 last_status = 502
+                attempt_errors.append({"provider": provider, "model": model, "error": last_error})
                 continue
             except Exception as exc:
                 self.send_json({"ok": False, "error": "LLM unavailable: " + str(exc)[:240], "retryable": True, "session_id": sid}, 502); return
@@ -764,7 +770,7 @@ class Handler(BaseHTTPRequestHandler):
             except (HTTPError, URLError, TimeoutError, ValueError, EgressBlocked) as exc:
                 self._sse({"type": "error", "ok": False, "error": "Stream failed: " + str(exc)[:200], "retryable": True, "session_id": sid})
                 return
-        self.send_json({"ok": False, "error": last_error, "retryable": True, "session_id": sid}, last_status)
+        self.send_json({"ok": False, "error": last_error, "retryable": True, "session_id": sid, "attempts": attempt_errors}, last_status)
 
     def web_search(self, data):
         query = data.get("query", "")

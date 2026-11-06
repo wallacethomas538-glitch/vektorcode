@@ -254,6 +254,43 @@ def test_provider_error_body_is_included_in_detail():
         HTTPError("https://x.test/", 503, "Service Unavailable", {}, None))
 
 
+def test_all_provider_attempts_listed_in_failure(monkeypatch):
+    # When every provider fails, the response lists each attempt with
+    # its own error — one test run diagnoses all keys at once instead
+    # of only showing the last provider's error.
+    monkeypatch.setenv("GROQ_KEYS", "k-groq-dead")
+    monkeypatch.setenv("OPENROUTER_KEYS", "k-or-dead")
+    set_pool(monkeypatch, "groq", ["k-groq-dead"])
+    set_pool(monkeypatch, "openrouter", ["k-or-dead"])
+    set_pool(monkeypatch, "qwen", ["k-groq-dead"])
+
+    def fake_urlopen(req, timeout=120):
+        if "api.groq.com" in req.full_url:
+            raise http_error(req.full_url, 503, "Service Unavailable")
+        if "openrouter.ai" in req.full_url:
+            raise http_error(req.full_url, 403, "Forbidden")
+        if "127.0.0.1:11434" in req.full_url:
+            raise URLError("connection refused")
+        raise http_error(req.full_url, 503, "Service Unavailable")
+
+    monkeypatch.setattr(app, "urlopen", fake_urlopen)
+    h = make_handler("POST", "/api/chat", {
+        "messages": [{"role": "user", "content": "hi"}], "model": "groq"})
+    h.do_POST()
+
+    assert h._status == 502
+    out = response_json(h)
+    assert out["ok"] is False
+    attempts = out["attempts"]
+    # Groq, OpenRouter, Qwen-via-Groq, then Local (unreachable, always
+    # configured off-Render). Meta/Together/Gemini unconfigured: skipped.
+    assert [a["provider"] for a in attempts] == [
+        "Groq", "OpenRouter", "Qwen", "Local (Ollama)"]
+    assert "503" in attempts[0]["error"]
+    assert "403" in attempts[1]["error"]
+    assert attempts[0]["model"] == FREE_MODELS["groq"][0]
+
+
 # ---------------------------------------------------------------------------
 # Live model IDs only: retired Groq/Gemini ids must be gone (2026-11-06).
 # Groq retired qwen/qwen3-32b (2026-07-17) and llama-3.1-8b-instant +
