@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VektorCode Live Voice (experiment)</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #0b1220; color: #e6edf3; margin: 0; padding: 16px; }
+  h1 { font-size: 20px; margin: 8px 0 4px; }
+  .muted { color: #8b949e; font-size: 14px; }
+  #state { font-size: 22px; font-weight: 700; margin: 18px 0; padding: 14px; border-radius: 12px; background: #161b22; text-align: center; }
+  #state.listening { background: #0d3320; }
+  #state.speaking { background: #3a2a00; }
+  #state.error { background: #4a1212; }
+  button { width: 100%; padding: 18px; font-size: 20px; border: 0; border-radius: 12px; margin: 8px 0; }
+  #start-btn { background: #1f6feb; color: #fff; }
+  #stop-btn { background: #6e1111; color: #fff; }
+  #log { background: #161b22; border-radius: 12px; padding: 12px; min-height: 160px; max-height: 50vh; overflow-y: auto; white-space: pre-wrap; font-size: 15px; }
+  .warn { color: #f0b429; }
+</style>
+</head>
+<body>
+<h1>VektorCode Live Voice</h1>
+<p class="muted">Experiment only — isolated clone. Continuous hands-free voice:
+speak, pause, interrupt. The agent answers out loud. Nothing here
+touches production.</p>
+<div id="state">Not connected</div>
+<button id="start-btn" type="button">Start voice conversation</button>
+<button id="stop-btn" type="button" disabled>Stop</button>
+<p id="dispatch-note" class="muted"></p>
+<div id="log" aria-live="polite"></div>
+<div id="remote-audio"></div>
+<script src="https://cdn.jsdelivr.net/npm/livekit-client@2.15.0/dist/livekit-client.umd.min.js"></script>
+<script src="/static/voice-live.js"></script>
+</body>
+</html>

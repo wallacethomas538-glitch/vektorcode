@@ -156,7 +156,11 @@ def test_free_model_lists_only_free_models():
     assert "qwen/qwen3.8-27b" in FREE_MODELS["groq"]
     assert "openai/gpt-oss-120b" in FREE_MODELS["groq"]
     assert "gemini-3.8-flash" in FREE_MODELS["gemini"]
-    assert all(m.endswith(":free") for m in FREE_MODELS["openrouter"])
+    # OpenRouter entries are :free variants — except Crouton Alpha
+    # (stealth/crouton-alpha), which is free by $0 preview pricing
+    # rather than a :free suffix (Nov 3 2026).
+    assert all(m.endswith(":free") or m == "stealth/crouton-alpha"
+               for m in FREE_MODELS["openrouter"])
     # Paid-only providers are gone entirely — free-tier only (Wallace 2026-11-05).
     assert "openai" not in FREE_MODELS
     assert "cohere" not in FREE_MODELS

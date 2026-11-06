@@ -6,10 +6,10 @@ Other free image routes (later, on Wallace approval): Cloudflare Workers AI FLUX
 """
 TEXT_PROVIDERS = ["GROQ", "GEMINI", "OPENROUTER", "MISTRAL", "NVIDIA", "CLOUDFLARE", "COHERE", "ZAI", "SAMBANOVA", "POLLINATIONS", "QWEN"]
 IMAGE_PROVIDERS = ["POLLINATIONS"]
-# Qwen models: served free via Groq (qwen3-32b) and locally via Ollama.
+# Qwen models: served free via Groq (qwen3.8-27b) and locally via Ollama.
 # Fork: QwenLM/Qwen3 (Apache 2.0) — Wallace's fork pending (GitHub connector
 # lacks fork permission; he forks manually).
-QWEN_GROQ_MODEL = "qwen/qwen3-32b"
+QWEN_GROQ_MODEL = "qwen/qwen3.8-27b"
 QWEN_OLLAMA_MODEL = "qwen2.5:7b"
 def image_url(prompt: str, width: int = 1024, height: int = 1024) -> str:
     from urllib.parse import quote
