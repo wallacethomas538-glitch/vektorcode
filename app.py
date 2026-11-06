@@ -48,7 +48,8 @@ FREE_MODELS = {
     'gemini': ['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3.5-flash-lite',
                'gemini-2.5-flash'],
     'openrouter': ['meta-llama/llama-3.3-70b-instruct:free', 'qwen/qwen3-32b:free',
-                   'deepseek/deepseek-r1:free', 'google/gemma-3-27b-it:free'],
+                   'deepseek/deepseek-r1:free', 'google/gemma-3-27b-it:free',
+                   'stealth/crouton-alpha'],
     'meta': ['Llama-4-Scout-17B-16E-Instruct-FP8', 'Llama-4-Maverick-17B-128E-Instruct-FP8',
              'Llama-3.3-70B-Instruct'],
     'qwen': ['qwen/qwen3.8-27b', 'qwen2.5:7b', 'qwen-plus'],
@@ -570,7 +571,14 @@ class Handler(BaseHTTPRequestHandler):
             pass  # per-session model is best-effort; chat still works
         self._persist_new_messages(sid, messages)
         history = store().list_messages(sid, limit=HISTORY_LIMIT)
-        llm_messages = [{"role": "system", "content": vektor_system_prompt()}] + [
+        system_prompt = vektor_system_prompt()
+        if data.get("voice"):
+            # Spoken style for voice turns: short, plain, no markdown.
+            # The flag is not persisted in history.
+            system_prompt += ("\n\nYou are speaking aloud to Wallace: keep replies "
+                              "short (1-3 sentences), plain words, no markdown, "
+                              "no lists unless he asks for one.")
+        llm_messages = [{"role": "system", "content": system_prompt}] + [
             {"role": m["role"], "content": m["content"]} for m in history]
 
         keys = [k for k in KEY_POOLS.get(pid, []) if k.strip()]
@@ -692,94 +700,144 @@ class Handler(BaseHTTPRequestHandler):
                 key = keys[attempt] if not rotate else get_next_key(pid)
                 headers = {"Content-Type": "application/json", "Accept": "text/event-stream",
                            "User-Agent": LLM_USER_AGENT}
-            if key:
-                headers["Authorization"] = "Bearer " + key
-            payload = json.dumps({"model": model, "messages": llm_messages, "stream": True}).encode()
-            try:
-                guard_url(endpoint)  # egress guard on the chat path
-            except EgressBlocked as exc:
-                self.send_json({"ok": False, "error": "Egress blocked: " + str(exc)[:200], "retryable": False, "session_id": sid}, 502); return
-            try:
-                req = Request(endpoint, data=payload, headers=headers, method="POST")
-                response = urlopen(req, timeout=30)
-            except HTTPError as e:
-                if e.code in ROTATABLE_HTTP_CODES:
-                    last_error = llm_http_error_detail(e)
-                    last_status = 429 if e.code == 429 else 502
+                if key:
+                    headers["Authorization"] = "Bearer " + key
+                payload = json.dumps({"model": model, "messages": llm_messages, "stream": True}).encode()
+                try:
+                    guard_url(endpoint)  # egress guard on the chat path
+                except EgressBlocked as exc:
+                    self.send_json({"ok": False, "error": "Egress blocked: " + str(exc)[:200], "retryable": False, "session_id": sid}, 502); return
+                try:
+                    req = Request(endpoint, data=payload, headers=headers, method="POST")
+                    response = urlopen(req, timeout=30)
+                except HTTPError as e:
+                    if e.code in ROTATABLE_HTTP_CODES:
+                        last_error = llm_http_error_detail(e)
+                        last_status = 429 if e.code == 429 else 502
+                        attempt_errors.append({"provider": provider, "model": model, "error": last_error})
+                        continue
+                    self.send_json({"ok": False, "error": llm_http_error_detail(e), "retryable": True, "session_id": sid}, 502); return
+                except (URLError, TimeoutError) as exc:
+                    last_error = "LLM unavailable: " + str(exc)[:240]
+                    last_status = 502
                     attempt_errors.append({"provider": provider, "model": model, "error": last_error})
                     continue
-                self.send_json({"ok": False, "error": llm_http_error_detail(e), "retryable": True, "session_id": sid}, 502); return
-            except (URLError, TimeoutError) as exc:
-                last_error = "LLM unavailable: " + str(exc)[:240]
-                last_status = 502
-                attempt_errors.append({"provider": provider, "model": model, "error": last_error})
-                continue
-            except Exception as exc:
-                self.send_json({"ok": False, "error": "LLM unavailable: " + str(exc)[:240], "retryable": True, "session_id": sid}, 502); return
+                except Exception as exc:
+                    self.send_json({"ok": False, "error": "LLM unavailable: " + str(exc)[:240], "retryable": True, "session_id": sid}, 502); return
 
-            # Provider answered — commit to SSE from here on.
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("X-Accel-Buffering", "no")
-            self.end_headers()
-            try:
-                with response:
-                    ctype = response.headers.get("Content-Type", "")
-                    if "text/event-stream" not in ctype:
-                        # Fallback: provider returned a complete JSON reply.
-                        result = json.loads(response.read())
-                        message, tools_used = self._resolve_tools(result, endpoint, headers, model, llm_messages)
-                        if isinstance(message, str) and message.strip():
-                            self._sse({"type": "delta", "content": message})
-                            self._finish_stream(sid, provider, model, message, tools_used, started)
-                        else:
+                # Provider answered — commit to SSE from here on.
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+                try:
+                    with response:
+                        ctype = response.headers.get("Content-Type", "")
+                        if "text/event-stream" not in ctype:
+                            # Fallback: provider returned a complete JSON reply.
+                            result = json.loads(response.read())
+                            message, tools_used = self._resolve_tools(result, endpoint, headers, model, llm_messages)
+                            if isinstance(message, str) and message.strip():
+                                self._sse({"type": "delta", "content": message})
+                                self._finish_stream(sid, provider, model, message, tools_used, started)
+                            else:
+                                self._sse({"type": "error", "ok": False, "error": "Provider returned an empty reply", "retryable": True, "session_id": sid})
+                            return
+                        pieces, tool_calls_seen = [], False
+                        for raw in response:
+                            line = raw.decode("utf-8", "replace").strip()
+                            if not line.startswith("data:"):
+                                continue
+                            chunk_text = line[5:].strip()
+                            if chunk_text == "[DONE]":
+                                break
+                            try:
+                                chunk = json.loads(chunk_text)
+                            except ValueError:
+                                continue
+                            choice = (chunk.get("choices") or [{}])[0]
+                            delta = choice.get("delta", {}) or {}
+                            piece = delta.get("content") or ""
+                            if piece:
+                                pieces.append(piece)
+                                self._sse({"type": "delta", "content": piece})
+                            if delta.get("tool_calls") or choice.get("finish_reason") == "tool_calls":
+                                tool_calls_seen = True
+                        if tool_calls_seen:
+                            # Redo the turn non-streaming to get complete
+                            # tool calls, run them, emit the final message.
+                            follow_payload = json.dumps({"model": model, "messages": llm_messages, "stream": False}).encode()
+                            req = Request(endpoint, data=follow_payload, headers=headers, method="POST")
+                            with urlopen(req, timeout=120) as follow_resp:
+                                result = json.loads(follow_resp.read())
+                            message, tools_used = self._resolve_tools(result, endpoint, headers, model, llm_messages)
+                            if isinstance(message, str) and message.strip():
+                                self._sse({"type": "delta", "content": message})
+                                self._finish_stream(sid, provider, model, message, tools_used, started)
+                            else:
+                                self._sse({"type": "error", "ok": False, "error": "Provider returned an empty reply", "retryable": True, "session_id": sid})
+                            return
+                        message = "".join(pieces)
+                        if not message.strip():
                             self._sse({"type": "error", "ok": False, "error": "Provider returned an empty reply", "retryable": True, "session_id": sid})
+                            return
+                        self._finish_stream(sid, provider, model, message, [], started)
                         return
-                    pieces, tool_calls_seen = [], False
-                    for raw in response:
-                        line = raw.decode("utf-8", "replace").strip()
-                        if not line.startswith("data:"):
-                            continue
-                        chunk_text = line[5:].strip()
-                        if chunk_text == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(chunk_text)
-                        except ValueError:
-                            continue
-                        choice = (chunk.get("choices") or [{}])[0]
-                        delta = choice.get("delta", {}) or {}
-                        piece = delta.get("content") or ""
-                        if piece:
-                            pieces.append(piece)
-                            self._sse({"type": "delta", "content": piece})
-                        if delta.get("tool_calls") or choice.get("finish_reason") == "tool_calls":
-                            tool_calls_seen = True
-                    if tool_calls_seen:
-                        # Redo the turn non-streaming to get complete
-                        # tool calls, run them, emit the final message.
-                        follow_payload = json.dumps({"model": model, "messages": llm_messages, "stream": False}).encode()
-                        req = Request(endpoint, data=follow_payload, headers=headers, method="POST")
-                        with urlopen(req, timeout=120) as follow_resp:
-                            result = json.loads(follow_resp.read())
-                        message, tools_used = self._resolve_tools(result, endpoint, headers, model, llm_messages)
-                        if isinstance(message, str) and message.strip():
-                            self._sse({"type": "delta", "content": message})
-                            self._finish_stream(sid, provider, model, message, tools_used, started)
-                        else:
-                            self._sse({"type": "error", "ok": False, "error": "Provider returned an empty reply", "retryable": True, "session_id": sid})
-                        return
-                    message = "".join(pieces)
-                    if not message.strip():
-                        self._sse({"type": "error", "ok": False, "error": "Provider returned an empty reply", "retryable": True, "session_id": sid})
-                        return
-                    self._finish_stream(sid, provider, model, message, [], started)
+                except (HTTPError, URLError, TimeoutError, ValueError, EgressBlocked) as exc:
+                    self._sse({"type": "error", "ok": False, "error": "Stream failed: " + str(exc)[:200], "retryable": True, "session_id": sid})
                     return
-            except (HTTPError, URLError, TimeoutError, ValueError, EgressBlocked) as exc:
-                self._sse({"type": "error", "ok": False, "error": "Stream failed: " + str(exc)[:200], "retryable": True, "session_id": sid})
-                return
         self.send_json({"ok": False, "error": last_error, "retryable": True, "session_id": sid, "attempts": attempt_errors}, last_status)
+
+    def voice_token(self, data):
+        """Mint a LiveKit room token for a voice call and dispatch the
+        voice worker into the room. Clone-only experiment endpoint.
+
+        Requires auth (same as /api/chat). 503 when LiveKit is not
+        configured — the JWT secret is never in the response, and the
+        token is minted server-side only. The agent dispatch is
+        best-effort: when no worker is running, the token is still
+        returned with agent_dispatch="failed: ..." so the phone page
+        can say so instead of failing silently.
+        """
+        if not require_auth(self):
+            self.send_json({"ok": False, "error": "Authentication required", "retryable": False}, 401); return
+        try:
+            from voice_agent.config import VoiceConfig
+        except ImportError:
+            self.send_json({"ok": False, "error": "Voice experiment is not installed", "retryable": False}, 503); return
+        cfg = VoiceConfig.from_env()
+        if not cfg.is_livekit_configured():
+            self.send_json({"ok": False, "error": "Live voice is not configured: set LIVEKIT_URL, LIVEKIT_API_KEY and LIVEKIT_API_SECRET on the server", "retryable": False, "missing": cfg.missing()}, 503); return
+        room = data.get("room")
+        if not isinstance(room, str) or not room.strip() or len(room) > 80:
+            room = cfg.room_name + "-" + uuid.uuid4().hex[:8]
+        room = "".join(c if c.isalnum() or c in "-_" else "-" for c in room.strip())[:80]
+        try:
+            from livekit import api as lk_api
+            token = lk_api.AccessToken(cfg.livekit_api_key, cfg.livekit_api_secret)
+            token.with_identity("wallace-" + uuid.uuid4().hex[:8]).with_name("Wallace")
+            token.with_grants(lk_api.VideoGrants(room=room, can_publish=True, can_subscribe=True))
+            jwt = token.to_jwt()
+        except Exception as exc:
+            self.send_json({"ok": False, "error": "Could not mint a voice token: " + str(exc)[:160], "retryable": False}, 502); return
+        dispatch = "not attempted"
+        try:
+            import asyncio
+            async def _dispatch():
+                lk = lk_api.LiveKitAPI(url=cfg.livekit_url, api_key=cfg.livekit_api_key, api_secret=cfg.livekit_api_secret)
+                try:
+                    await lk.agent_dispatch.create_dispatch(
+                        lk_api.CreateAgentDispatchRequest(room=room, agent_name="vektorcode-voice"))
+                    return "ok"
+                finally:
+                    await lk.aclose()
+            dispatch = asyncio.run(_dispatch())
+        except Exception as exc:
+            dispatch = "failed: " + str(exc)[:160]
+        self.send_json({"ok": True, "token": jwt, "room": room,
+                        "url": cfg.livekit_url, "agent_dispatch": dispatch,
+                        "session_id": "voice-" + room})
 
     def web_search(self, data):
         query = data.get("query", "")
@@ -844,6 +902,12 @@ class Handler(BaseHTTPRequestHandler):
             authenticated = require_auth(self)
             mcp = mcp_status()
             self.send_json({"models":provider_models(self), "tools":[{"id":a,"name":b,"description":c,"enabled":a in enabled,"locked":bool(a in RISKY_TOOLS and auth_enabled and not authenticated),"approval_required":a in RISKY_TOOLS} for a,b,c in TOOLS], "active_model":active, "active_model_name":active_name, "qwen_source":QWEN_SOURCE, "ollama_base_url":ollama_base_url(self), "qwen_api_url":qwen_api_url(self), "health":self.setting("health", {"providers":[]}), "mcp":{"connected":mcp.get("connected",False),"configured":mcp.get("configured",False),"transport":mcp.get("transport","streamable-http"),"tool_count":mcp.get("tool_count",0),"protocol":mcp.get("protocol"),"error":mcp.get("error"),"capabilities":[x[1] for x in TOOLS]}, "composio":{"connected":mcp.get("connected",False),"mcp_url_set":bool(os.environ.get("COMPOSIO_MCP_URL")),"api_key_set":bool(os.environ.get("COMPOSIO_API_KEY"))}, "storage":current.status(), "meta":{"configured":meta_ready(),"profile":self.setting("meta_profile", None)}, "media":{"provider":"Pollinations","configured":bool(os.environ.get("POLLINATIONS_API_KEY"))}, "auth":{"enabled":auth_enabled,"authenticated":authenticated}, "sessions":sessions, "receipts":receipts, "kill_switch":self.setting("kill_switch", False)}); return
+        if self.path == "/api/voice/status":
+            try:
+                from voice_agent.config import VoiceConfig
+                self.send_json({"ok": True, "voice": VoiceConfig.from_env().public_status()}); return
+            except ImportError:
+                self.send_json({"ok": True, "voice": {"livekit_configured": False, "missing": ["voice_agent"]}}); return
         if self.path.startswith("/api/session/") and self.path.endswith("/messages"):
             if not require_auth(self): self.send_json({"ok": False, "error": "Authentication required", "retryable": False}, 401); return
             sid = unquote(urlparse(self.path).path[len("/api/session/"):-len("/messages")])
@@ -875,6 +939,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/chat":
             if not require_auth(self): self.send_json({"ok": False, "error": "Authentication required", "retryable": False}, 401); return
             self.chat(data); return
+        if path == "/api/voice/token":
+            self.voice_token(data); return
         if path == "/api/web-search": self.web_search(data); return
         if path == "/api/media":
             kind, prompt = data.get("kind"), data.get("prompt", "")

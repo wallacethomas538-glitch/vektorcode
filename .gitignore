@@ -3,7 +3,9 @@ __pycache__/
 *.db
 *.log
 .venv/
+.venv-voice/
 venv/
 env/
 .env
 .DS_Store
+voice_agent/models/

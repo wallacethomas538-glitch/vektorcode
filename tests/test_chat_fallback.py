@@ -355,6 +355,33 @@ def test_gemini_free_models_contain_no_retired_2_0_models():
                                      "gemini-2.5-flash"]
 
 
+def test_openrouter_free_list_includes_crouton_alpha():
+    # Crouton Alpha (stealth/crouton-alpha), released Nov 3 2026: free
+    # ($0 in/out, preview), 1M context, built for coding/agentic/tool-use.
+    # Added as an extra free option; the existing entries stay put.
+    # Unit-test only — no live OpenRouter call is made here.
+    assert "stealth/crouton-alpha" in FREE_MODELS["openrouter"]
+    for existing in ("meta-llama/llama-3.3-70b-instruct:free",
+                     "qwen/qwen3-32b:free", "deepseek/deepseek-r1:free",
+                     "google/gemma-3-27b-it:free"):
+        assert existing in FREE_MODELS["openrouter"]
+
+
+def test_free_cascade_chat_models_use_live_ids():
+    # The agent_api.py/CLI cascade (NOT the /api/chat path) still pointed
+    # at retired ids: Groq llama-3.3-70b-versatile, Gemini gemini-2.0-flash,
+    # Qwen qwen/qwen3-32b. They now use the same live free ids as app.py.
+    from vektor_cloud.free_cascade import _CHAT_MODELS
+    from vektor_cloud.free_providers import QWEN_GROQ_MODEL, qwen_model
+    retired = {"qwen/qwen3-32b", "llama-3.3-70b-versatile",
+               "llama-3.1-8b-instant", "gemini-2.0-flash"}
+    assert not (retired & {m for m in _CHAT_MODELS.values() if m})
+    assert _CHAT_MODELS["GROQ"] == "qwen/qwen3.8-27b"
+    assert _CHAT_MODELS["GEMINI"] == "gemini-3.8-flash"
+    assert QWEN_GROQ_MODEL == "qwen/qwen3.8-27b"
+    assert qwen_model("groq") == "qwen/qwen3.8-27b"
+
+
 @pytest.fixture(autouse=True)
 def tmp_db(tmp_path, monkeypatch):
     old_db = app.DB
@@ -556,3 +583,33 @@ def test_stream_fallback_groq_403_to_openrouter(monkeypatch):
     assert '"provider": "OpenRouter"' in body
     assert [urlparse(c.full_url).netloc for c in calls] == [
         "api.groq.com", "openrouter.ai"]
+
+
+def test_stream_rotates_keys_within_provider_before_moving_on(monkeypatch):
+    # Streaming had the same bug _chat_once already fixed: the request
+    # block sat OUTSIDE the key loop, so streaming only ever tried the
+    # LAST key per provider. Groq has two keys: first dead, second good.
+    # Streaming must try the second key before ever leaving Groq.
+    monkeypatch.setenv("GROQ_KEYS", "k-dead,k-good")
+    set_pool(monkeypatch, "groq", ["k-dead", "k-good"])
+
+    calls = []
+
+    def fake_urlopen(req, timeout=120):
+        calls.append(req)
+        if req.headers.get("Authorization") == "Bearer k-dead":
+            raise http_403(req.full_url)
+        return FakeResponse(llm_reply("from groq key 2"))
+
+    monkeypatch.setattr(app, "urlopen", fake_urlopen)
+    h = make_handler("POST", "/api/chat", {
+        "messages": [{"role": "user", "content": "hi"}],
+        "model": "groq", "stream": True})
+    h.do_POST()
+
+    assert h._status == 200
+    body = h.wfile.getvalue().decode()
+    assert "from groq key 2" in body
+    assert '"provider": "Groq"' in body
+    assert len(calls) == 2
+    assert all("api.groq.com" in c.full_url for c in calls)

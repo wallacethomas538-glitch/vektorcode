@@ -83,9 +83,9 @@ from urllib.parse import quote
 
 _CHAT_MODELS = {
     "OLLAMA": None,  # model from OLLAMA_MODEL env, default llama3.2
-    "GROQ": "llama-3.3-70b-versatile",
+    "GROQ": "qwen/qwen3.8-27b",
     "OPENROUTER": "meta-llama/llama-3.3-70b-instruct:free",
-    "GEMINI": "gemini-2.0-flash",
+    "GEMINI": "gemini-3.8-flash",
     "POLLINATIONS": None,  # keyless GET
 }
 # Local (Termux): phone Llama first, then the free cloud fallback.
