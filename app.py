@@ -59,13 +59,32 @@ FREE_MODELS = {
                     'google/gemma-2-9b-it'],
 }
 # Cross-provider fallback order for chat: when the selected provider's
-# call fails with 400/401/403/404/429 (or the provider is unreachable),
+# call fails with a rotatable status (or the provider is unreachable),
 # try the next configured provider in this order until one answers.
 # 400/404 count as rotatable: a retired model id answers 404 on Groq
 # and 400 on Gemini, and the next provider may still be alive.
-# Free-tier models only — fallback never selects a paid model.
+# 5xx counts too: a 503 must rotate, one overloaded provider must never
+# kill the whole chain. Free-tier models only — fallback never selects
+# a paid model.
 FALLBACK_ORDER = ['groq', 'openrouter', 'meta', 'together', 'qwen',
                   'gemini', 'mistral', 'huggingface', 'local']
+# HTTP statuses worth rotating on: bad or retired model (400/404),
+# auth/rate-limit (401/403/429), server-side trouble (500/502/503/504).
+ROTATABLE_HTTP_CODES = (400, 401, 403, 404, 429, 500, 502, 503, 504)
+
+def llm_http_error_detail(e):
+    """One-line provider error including the response body (truncated).
+
+    The body is the diagnosis: 'model overloaded' vs 'no provider' vs
+    'invalid key' can share one bare status code. Never more than 200
+    chars of it, and never any key material (bodies carry none).
+    """
+    try:
+        body = e.read().decode("utf-8", "replace").strip()[:200]
+    except Exception:
+        body = ""
+    text = "LLM error: " + str(e)[:240]
+    return text + (" | " + body if body else "")
 # Which route a Qwen model id takes (Groq-hosted Qwen3, local Ollama, DashScope).
 QWEN_ROUTES = {
     'qwen/qwen3.8-27b': 'groq',
@@ -564,9 +583,10 @@ class Handler(BaseHTTPRequestHandler):
 
         # Cross-provider fallback: the selected provider first, then every
         # other configured provider in FALLBACK_ORDER, each with its first
-        # free-tier model. A 400/401/403/404/429 (or an unreachable provider)
-        # moves to the next candidate; the first good reply wins and reports who
-        # answered. Free-tier only — fallback never uses a paid model.
+        # free-tier model. A rotatable status (400/401/403/404/429/500/502/
+        # 503/504) or an unreachable provider moves to the next candidate;
+        # the first good reply wins and reports who answered. Free-tier
+        # only — fallback never uses a paid model.
         rotate = not (pid == "local" or (pid == "qwen" and qwen_route_now in ("ollama", "dashscope")))
         candidates = [(pid, provider, model, endpoint, keys, rotate)]
         for fpid in FALLBACK_ORDER:
@@ -589,7 +609,7 @@ class Handler(BaseHTTPRequestHandler):
         """Non-streaming chat: try each candidate provider in order.
 
         Within a provider, rotate through its key pool on
-        400/401/403/404/429; when the pool is exhausted, move to the next
+        400/401/403/404/429/500/502/503/504; when the pool is exhausted, move to the next
         configured provider. An unreachable provider (URLError/timeout)
         moves on the same way. The first provider that returns a good
         reply wins; its provider id and model are reported so the UI shows
@@ -609,7 +629,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     guard_url(endpoint)  # egress guard on the chat path
                     req = Request(endpoint, data=payload, headers=headers, method="POST")
-                    with urlopen(req, timeout=120) as response:
+                    with urlopen(req, timeout=30) as response:
                         result = json.loads(response.read())
                     message, tools_used = self._resolve_tools(result, endpoint, headers, model, llm_messages)
                     if not isinstance(message, str) or not message.strip():
@@ -622,11 +642,11 @@ class Handler(BaseHTTPRequestHandler):
                 except EgressBlocked as exc:
                     self.send_json({"ok": False, "error": "Egress blocked: " + str(exc)[:200], "retryable": False, "session_id": sid}, 502); return
                 except HTTPError as e:
-                    if e.code in (400, 401, 403, 404, 429):
-                        last_error = "LLM error: " + str(e)[:240]
+                    if e.code in ROTATABLE_HTTP_CODES:
+                        last_error = llm_http_error_detail(e)
                         last_status = 429 if e.code == 429 else 502
                         continue
-                    self.send_json({"ok": False, "error": "LLM error: " + str(e)[:240], "retryable": True, "session_id": sid}, 502); return
+                    self.send_json({"ok": False, "error": llm_http_error_detail(e), "retryable": True, "session_id": sid}, 502); return
                 except (URLError, TimeoutError) as exc:
                     last_error = "LLM unavailable: " + str(exc)[:240]
                     last_status = 502
@@ -668,13 +688,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": "Egress blocked: " + str(exc)[:200], "retryable": False, "session_id": sid}, 502); return
             try:
                 req = Request(endpoint, data=payload, headers=headers, method="POST")
-                response = urlopen(req, timeout=120)
+                response = urlopen(req, timeout=30)
             except HTTPError as e:
-                if e.code in (400, 401, 403, 404, 429):
-                    last_error = "LLM error: " + str(e)[:240]
+                if e.code in ROTATABLE_HTTP_CODES:
+                    last_error = llm_http_error_detail(e)
                     last_status = 429 if e.code == 429 else 502
                     continue
-                self.send_json({"ok": False, "error": "LLM error: " + str(e)[:240], "retryable": True, "session_id": sid}, 502); return
+                self.send_json({"ok": False, "error": llm_http_error_detail(e), "retryable": True, "session_id": sid}, 502); return
             except (URLError, TimeoutError) as exc:
                 last_error = "LLM unavailable: " + str(exc)[:240]
                 last_status = 502

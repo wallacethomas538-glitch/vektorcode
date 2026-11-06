@@ -1,11 +1,14 @@
 """Cross-provider fallback for /api/chat.
 
 Wallace 2026-11-06: "LLM should rotate until a good key is approved."
-When the selected provider's call fails with 400/401/403/404/429 (or the
-provider is unreachable), chat tries the next configured provider in
-FALLBACK_ORDER until one answers. Free-tier models only. 400/404 rotate
-too: a retired model id answers 404 on Groq and 400 on Gemini, and the
-next provider may still be alive.
+When the selected provider's call fails with a rotatable status
+(400/401/403/404/429/500/502/503/504) or the provider is unreachable,
+chat tries the next configured provider in FALLBACK_ORDER until one
+answers. Free-tier models only. 400/404 rotate too: a retired model id
+answers 404 on Groq and 400 on Gemini, and the next provider may still
+be alive. 503 rotates too: one overloaded provider must never kill the
+whole chain (found live 2026-11-06 — every provider 503'd and the chain
+aborted on the first one).
 
 Uses the same bare-Handler harness as test_qwen_models (no socket).
 """
@@ -174,6 +177,81 @@ def test_stream_fallback_rotates_on_404_to_next_provider(monkeypatch):
     assert '"provider": "OpenRouter"' in body
     assert [urlparse(c.full_url).netloc for c in calls] == [
         "api.groq.com", "openrouter.ai"]
+
+
+# ---------------------------------------------------------------------------
+# 503 rotates too: one overloaded provider must never kill the chain.
+# Found live 2026-11-06 — Groq, Gemini, OpenRouter, Meta and Together all
+# answered 503 and the old code aborted on the first one.
+# ---------------------------------------------------------------------------
+
+def test_fallback_rotates_on_503_to_next_provider(monkeypatch):
+    monkeypatch.setenv("GROQ_KEYS", "k-groq-busy")
+    monkeypatch.setenv("OPENROUTER_KEYS", "k-or-good")
+    set_pool(monkeypatch, "groq", ["k-groq-busy"])
+    set_pool(monkeypatch, "openrouter", ["k-or-good"])
+
+    calls = []
+
+    def fake_urlopen(req, timeout=120):
+        calls.append(req)
+        if "api.groq.com" in req.full_url:
+            raise http_error(req.full_url, 503, "Service Unavailable")
+        return FakeResponse(llm_reply("from openrouter"))
+
+    monkeypatch.setattr(app, "urlopen", fake_urlopen)
+    h = make_handler("POST", "/api/chat", {
+        "messages": [{"role": "user", "content": "hi"}], "model": "groq"})
+    h.do_POST()
+
+    assert h._status == 200
+    out = response_json(h)
+    assert out["ok"] is True
+    assert out["provider"] == "OpenRouter"
+    assert [urlparse(c.full_url).netloc for c in calls] == [
+        "api.groq.com", "openrouter.ai"]
+
+
+def test_stream_fallback_rotates_on_503_to_next_provider(monkeypatch):
+    monkeypatch.setenv("GROQ_KEYS", "k-groq-busy")
+    monkeypatch.setenv("OPENROUTER_KEYS", "k-or-good")
+    set_pool(monkeypatch, "groq", ["k-groq-busy"])
+    set_pool(monkeypatch, "openrouter", ["k-or-good"])
+
+    calls = []
+
+    def fake_urlopen(req, timeout=120):
+        calls.append(req)
+        if "api.groq.com" in req.full_url:
+            raise http_error(req.full_url, 503, "Service Unavailable")
+        return FakeResponse(llm_reply("streamed ok"))
+
+    monkeypatch.setattr(app, "urlopen", fake_urlopen)
+    h = make_handler("POST", "/api/chat", {
+        "messages": [{"role": "user", "content": "hi"}],
+        "model": "groq", "stream": True})
+    h.do_POST()
+
+    assert h._status == 200
+    body = h.wfile.getvalue().decode()
+    assert "streamed ok" in body
+    assert '"provider": "OpenRouter"' in body
+    assert [urlparse(c.full_url).netloc for c in calls] == [
+        "api.groq.com", "openrouter.ai"]
+
+
+def test_provider_error_body_is_included_in_detail():
+    # The body is the diagnosis ('model overloaded' vs 'no provider'),
+    # so the error string must carry it, truncated.
+    fp = io.BytesIO(b'{"error": {"message": "model overloaded, try again"}}')
+    err = HTTPError("https://api.groq.com/openai/v1/chat/completions",
+                    503, "Service Unavailable", {}, fp)
+    detail = app.llm_http_error_detail(err)
+    assert "503" in detail
+    assert "model overloaded" in detail
+    # A body-less error (fp None) must not crash the helper.
+    assert "503" in app.llm_http_error_detail(
+        HTTPError("https://x.test/", 503, "Service Unavailable", {}, None))
 
 
 # ---------------------------------------------------------------------------
