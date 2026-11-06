@@ -291,6 +291,42 @@ def test_all_provider_attempts_listed_in_failure(monkeypatch):
     assert attempts[0]["model"] == FREE_MODELS["groq"][0]
 
 
+def test_keys_are_stripped_before_use(monkeypatch):
+    # Keys pasted into Render with spaces/newlines around them (e.g.
+    # "key1, key2, " or a trailing newline) used to be sent verbatim:
+    # "Bearer  sk-..." reads as a missing auth header to OpenRouter,
+    # and Google rejects the padded key as invalid. Pools strip.
+    set_pool(monkeypatch, "groq", ["  gsk-padded  ", "", "gsk-clean"])
+    assert app.get_next_key("groq") == "gsk-padded"
+    assert app.get_next_key("groq") == "gsk-clean"
+    keys, _ = app._provider_keys(None, "groq")
+    assert keys == ["gsk-padded", "gsk-clean"]
+
+
+def test_chat_requests_send_a_browser_user_agent(monkeypatch):
+    # Groq and Together sit behind Cloudflare, which rejects the
+    # default Python-urllib user agent with 403 / error code 1010.
+    # Every LLM request must carry a browser user agent instead.
+    set_pool(monkeypatch, "groq", ["k-groq"])
+    monkeypatch.setenv("GROQ_KEYS", "k-groq")
+    seen = {}
+
+    def fake_urlopen(req, timeout=120):
+        seen["ua"] = req.get_header("User-agent")
+        seen["auth"] = req.get_header("Authorization")
+        return FakeResponse({"choices": [{"message": {"content": "hello"}}]})
+
+    monkeypatch.setattr(app, "urlopen", fake_urlopen)
+    h = make_handler("POST", "/api/chat", {
+        "messages": [{"role": "user", "content": "hi"}], "model": "groq"})
+    h.do_POST()
+
+    assert response_json(h)["ok"] is True
+    assert seen["ua"] and "Mozilla" in seen["ua"]
+    assert "Python-urllib" not in seen["ua"]
+    assert seen["auth"] == "Bearer k-groq"
+
+
 # ---------------------------------------------------------------------------
 # Live model IDs only: retired Groq/Gemini ids must be gone (2026-11-06).
 # Groq retired qwen/qwen3-32b (2026-07-17) and llama-3.1-8b-instant +

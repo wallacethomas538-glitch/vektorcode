@@ -93,11 +93,18 @@ QWEN_ROUTES = {
 }
 
 # Key Rotation State
-KEY_POOLS = {pid: os.environ.get(env, "").split(",") for pid, _, env, _, _ in PROVIDERS}
+# LLM providers sit behind Cloudflare, which rejects the default
+# Python-urllib user agent with 403 / error code 1010 ("bad browser").
+# Send a plain browser user agent on every LLM request instead.
+LLM_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/120.0.0.0 Safari/537.36")
+
+KEY_POOLS = {pid: [k.strip() for k in os.environ.get(env, "").split(",") if k.strip()] for pid, _, env, _, _ in PROVIDERS}
 KEY_INDEX = {pid: 0 for pid in KEY_POOLS}
 
 def get_next_key(pid):
-    keys = [k for k in KEY_POOLS.get(pid, []) if k.strip()]
+    keys = [k.strip() for k in KEY_POOLS.get(pid, []) if k.strip()]
     if not keys: return None
     key = keys[KEY_INDEX[pid]]
     KEY_INDEX[pid] = (KEY_INDEX[pid] + 1) % len(keys)
@@ -221,7 +228,7 @@ def _provider_keys(handler, pid):
             return [""], False
         if route == "dashscope":
             return [k for k in os.environ.get("QWEN_KEYS", "").split(",") if k.strip()], False
-    return [k for k in KEY_POOLS.get(pid, []) if k.strip()], True
+    return [k.strip() for k in KEY_POOLS.get(pid, []) if k.strip()], True
 
 
 def provider_models(handler=None):
@@ -623,7 +630,8 @@ class Handler(BaseHTTPRequestHandler):
         for pid, provider, model, endpoint, keys, rotate in candidates:
             for attempt in range(len(keys)):
                 key = keys[attempt] if not rotate else get_next_key(pid)
-                headers = {"Content-Type": "application/json"}
+                headers = {"Content-Type": "application/json",
+                           "User-Agent": LLM_USER_AGENT}
                 if key:
                     headers["Authorization"] = "Bearer " + key
                 payload = json.dumps({"model": model, "messages": llm_messages, "stream": False}).encode()
@@ -682,7 +690,8 @@ class Handler(BaseHTTPRequestHandler):
         for pid, provider, model, endpoint, keys, rotate in candidates:
             for attempt in range(len(keys)):
                 key = keys[attempt] if not rotate else get_next_key(pid)
-                headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
+                headers = {"Content-Type": "application/json", "Accept": "text/event-stream",
+                           "User-Agent": LLM_USER_AGENT}
             if key:
                 headers["Authorization"] = "Bearer " + key
             payload = json.dumps({"model": model, "messages": llm_messages, "stream": True}).encode()
