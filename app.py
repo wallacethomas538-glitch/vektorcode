@@ -59,6 +59,12 @@ FREE_MODELS = {
     'huggingface': ['Qwen/Qwen2.5-7B-Instruct', 'meta-llama/Llama-3.2-3B-Instruct',
                     'google/gemma-2-9b-it'],
 }
+# Cross-provider fallback order for chat: when the selected provider's
+# call fails with 401/403/429 (or the provider is unreachable), try the
+# next configured provider in this order until one answers. Free-tier
+# models only — fallback never selects a paid model.
+FALLBACK_ORDER = ['groq', 'openrouter', 'meta', 'together', 'qwen',
+                  'gemini', 'mistral', 'huggingface', 'local']
 # Which route a Qwen model id takes (Groq-hosted Qwen3, local Ollama, DashScope).
 QWEN_ROUTES = {
     'qwen/qwen3-32b': 'groq',
@@ -144,6 +150,58 @@ def qwen_route(handler=None):
     if os.environ.get("QWEN_KEYS"):
         return "dashscope"
     return "none"
+
+
+def _provider_configured(handler, pid):
+    """Configured check matching provider_models(): a key env var set, or
+    the local/qwen specials (Ollama URL set, or any Qwen route)."""
+    entry = next((x for x in PROVIDERS if x[0] == pid), None)
+    if entry is None:
+        return False
+    if os.environ.get(entry[2]):
+        return True
+    if pid == "local":
+        return bool(ollama_base_url(handler)) or not on_render()
+    if pid == "qwen":
+        return qwen_route(handler) != "none"
+    return False
+
+
+def _provider_endpoint(handler, pid):
+    """Chat endpoint for a provider: Qwen routes, local Ollama base,
+    otherwise the PROVIDERS table URL."""
+    entry = next((x for x in PROVIDERS if x[0] == pid), None)
+    url = entry[3]
+    if pid == "local":
+        base = ollama_base_url(handler)
+        return (base + "/v1/chat/completions") if base else LLM_URL
+    if pid == "qwen":
+        route = qwen_route(handler)
+        if route == "ollama":
+            return ollama_base_url(handler) + "/v1/chat/completions"
+        if route == "dashscope":
+            return qwen_api_url(handler)
+        return "https://api.groq.com/openai/v1/chat/completions"
+    return url
+
+
+def _provider_keys(handler, pid):
+    """(keys, rotate) for a provider's chat calls.
+
+    Local and Ollama-routed Qwen need no key. DashScope Qwen uses
+    QWEN_KEYS directly — never the Groq pool (the old code sent the
+    Groq key to DashScope via get_next_key). Every other provider
+    rotates its plural _KEYS pool.
+    """
+    if pid == "local":
+        return [""], False
+    if pid == "qwen":
+        route = qwen_route(handler)
+        if route == "ollama":
+            return [""], False
+        if route == "dashscope":
+            return [k for k in os.environ.get("QWEN_KEYS", "").split(",") if k.strip()], False
+    return [k for k in KEY_POOLS.get(pid, []) if k.strip()], True
 
 
 def provider_models(handler=None):
@@ -503,45 +561,83 @@ class Handler(BaseHTTPRequestHandler):
         if needs_keys and (not keys or (len(keys) == 1 and not keys[0])):
             self.send_json({"ok": False, "error": "No available keys for " + provider, "retryable": False, "session_id": sid}, 400); return
 
+        # Cross-provider fallback: the selected provider first, then every
+        # other configured provider in FALLBACK_ORDER, each with its first
+        # free-tier model. A 401/403/429 (or an unreachable provider) moves
+        # to the next candidate; the first good reply wins and reports who
+        # answered. Free-tier only — fallback never uses a paid model.
+        rotate = not (pid == "local" or (pid == "qwen" and qwen_route_now in ("ollama", "dashscope")))
+        candidates = [(pid, provider, model, endpoint, keys, rotate)]
+        for fpid in FALLBACK_ORDER:
+            if fpid == pid or not _provider_configured(self, fpid):
+                continue
+            fentry = next(x for x in PROVIDERS if x[0] == fpid)
+            fmodel = (FREE_MODELS.get(fpid) or [fentry[4]])[0]
+            fkeys, frotate = _provider_keys(self, fpid)
+            if not fkeys:
+                continue
+            candidates.append((fpid, fentry[1], fmodel,
+                               _provider_endpoint(self, fpid), fkeys, frotate))
+
         if data.get("stream"):
-            self._chat_stream(sid, pid, provider, model, endpoint, keys, llm_messages)
+            self._chat_stream(sid, candidates, llm_messages)
             return
-        self._chat_once(sid, pid, provider, model, endpoint, keys, llm_messages)
+        self._chat_once(sid, candidates, llm_messages)
 
-    def _chat_once(self, sid, pid, provider, model, endpoint, keys, llm_messages):
-        """Non-streaming chat: one provider call (+ tool round-trip)."""
+    def _chat_once(self, sid, candidates, llm_messages):
+        """Non-streaming chat: try each candidate provider in order.
+
+        Within a provider, rotate through its key pool on 401/403/429;
+        when the pool is exhausted, move to the next configured provider.
+        An unreachable provider (URLError/timeout) moves on the same way.
+        The first provider that returns a good reply wins; its provider id
+        and model are reported so the UI shows who answered. If every
+        candidate fails, the last provider's error is returned.
+        """
         started = time.time()
-        for attempt in range(len(keys)):
-            key = keys[attempt] if pid == "local" else get_next_key(pid)
-            headers = {"Content-Type": "application/json"}
-            if key:
-                headers["Authorization"] = "Bearer " + key
-            payload = json.dumps({"model": model, "messages": llm_messages, "stream": False}).encode()
-            try:
-                guard_url(endpoint)  # egress guard on the chat path
-                req = Request(endpoint, data=payload, headers=headers, method="POST")
-                with urlopen(req, timeout=120) as response:
-                    result = json.loads(response.read())
-                message, tools_used = self._resolve_tools(result, endpoint, headers, model, llm_messages)
-                if not isinstance(message, str) or not message.strip():
+        last_error = "All providers failed"
+        last_status = 502
+        for pid, provider, model, endpoint, keys, rotate in candidates:
+            for attempt in range(len(keys)):
+                key = keys[attempt] if not rotate else get_next_key(pid)
+                headers = {"Content-Type": "application/json"}
+                if key:
+                    headers["Authorization"] = "Bearer " + key
+                payload = json.dumps({"model": model, "messages": llm_messages, "stream": False}).encode()
+                try:
+                    guard_url(endpoint)  # egress guard on the chat path
+                    req = Request(endpoint, data=payload, headers=headers, method="POST")
+                    with urlopen(req, timeout=120) as response:
+                        result = json.loads(response.read())
+                    message, tools_used = self._resolve_tools(result, endpoint, headers, model, llm_messages)
+                    if not isinstance(message, str) or not message.strip():
+                        continue
+                    latency = round((time.time() - started) * 1000)
+                    store().add_message(sid, "assistant", message, model, provider)
+                    receipt("vektor_chat", {"provider": provider, "model": model, "latency_ms": latency, "attempt": attempt + 1})
+                    self.send_json({"ok": True, "message": message, "model": model, "provider": provider, "latency_ms": latency, "session_id": sid, "tools_used": tools_used})
+                    return
+                except EgressBlocked as exc:
+                    self.send_json({"ok": False, "error": "Egress blocked: " + str(exc)[:200], "retryable": False, "session_id": sid}, 502); return
+                except HTTPError as e:
+                    if e.code in (401, 403, 429):
+                        last_error = "LLM error: " + str(e)[:240]
+                        last_status = 429 if e.code == 429 else 502
+                        continue
+                    self.send_json({"ok": False, "error": "LLM error: " + str(e)[:240], "retryable": True, "session_id": sid}, 502); return
+                except (URLError, TimeoutError) as exc:
+                    last_error = "LLM unavailable: " + str(exc)[:240]
+                    last_status = 502
                     continue
-                latency = round((time.time() - started) * 1000)
-                store().add_message(sid, "assistant", message, model, provider)
-                receipt("vektor_chat", {"provider": provider, "model": model, "latency_ms": latency, "attempt": attempt + 1})
-                self.send_json({"ok": True, "message": message, "model": model, "provider": provider, "latency_ms": latency, "session_id": sid, "tools_used": tools_used})
-                return
-            except EgressBlocked as exc:
-                self.send_json({"ok": False, "error": "Egress blocked: " + str(exc)[:200], "retryable": False, "session_id": sid}, 502); return
-            except HTTPError as e:
-                if e.code == 429:
-                    continue
-                self.send_json({"ok": False, "error": "LLM error: " + str(e)[:240], "retryable": True, "session_id": sid}, 502); return
-            except Exception as exc:
-                self.send_json({"ok": False, "error": "LLM unavailable: " + str(exc)[:240], "retryable": True, "session_id": sid}, 502); return
-        self.send_json({"ok": False, "error": "All keys in pool exhausted (Rate Limited)", "retryable": True, "session_id": sid}, 429)
+                except Exception as exc:
+                    self.send_json({"ok": False, "error": "LLM unavailable: " + str(exc)[:240], "retryable": True, "session_id": sid}, 502); return
+        self.send_json({"ok": False, "error": last_error, "retryable": True, "session_id": sid}, last_status)
 
-    def _chat_stream(self, sid, pid, provider, model, endpoint, keys, llm_messages):
+    def _chat_stream(self, sid, candidates, llm_messages):
         """Streaming chat: SSE tokens, with a full-reply fallback.
+
+        Tries each candidate provider in order (same fallback as
+        _chat_once); commits to SSE only once a provider answers.
 
         Streaming providers (OpenAI-compatible chat/completions with
         stream:true, incl. local Ollama): groq,
@@ -555,9 +651,12 @@ class Handler(BaseHTTPRequestHandler):
         as a single delta event.
         """
         started = time.time()
-        for attempt in range(len(keys)):
-            key = keys[attempt] if pid == "local" else get_next_key(pid)
-            headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
+        last_error = "All providers failed"
+        last_status = 502
+        for pid, provider, model, endpoint, keys, rotate in candidates:
+            for attempt in range(len(keys)):
+                key = keys[attempt] if not rotate else get_next_key(pid)
+                headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
             if key:
                 headers["Authorization"] = "Bearer " + key
             payload = json.dumps({"model": model, "messages": llm_messages, "stream": True}).encode()
@@ -569,9 +668,15 @@ class Handler(BaseHTTPRequestHandler):
                 req = Request(endpoint, data=payload, headers=headers, method="POST")
                 response = urlopen(req, timeout=120)
             except HTTPError as e:
-                if e.code == 429:
+                if e.code in (401, 403, 429):
+                    last_error = "LLM error: " + str(e)[:240]
+                    last_status = 429 if e.code == 429 else 502
                     continue
                 self.send_json({"ok": False, "error": "LLM error: " + str(e)[:240], "retryable": True, "session_id": sid}, 502); return
+            except (URLError, TimeoutError) as exc:
+                last_error = "LLM unavailable: " + str(exc)[:240]
+                last_status = 502
+                continue
             except Exception as exc:
                 self.send_json({"ok": False, "error": "LLM unavailable: " + str(exc)[:240], "retryable": True, "session_id": sid}, 502); return
 
@@ -637,7 +742,7 @@ class Handler(BaseHTTPRequestHandler):
             except (HTTPError, URLError, TimeoutError, ValueError, EgressBlocked) as exc:
                 self._sse({"type": "error", "ok": False, "error": "Stream failed: " + str(exc)[:200], "retryable": True, "session_id": sid})
                 return
-        self.send_json({"ok": False, "error": "All keys in pool exhausted (Rate Limited)", "retryable": True, "session_id": sid}, 429)
+        self.send_json({"ok": False, "error": last_error, "retryable": True, "session_id": sid}, last_status)
 
     def web_search(self, data):
         query = data.get("query", "")
