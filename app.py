@@ -29,11 +29,11 @@ QWEN_SOURCE = "https://github.com/wallacethomas538-glitch/Qwen3"
 
 PROVIDERS = [
     ('local', 'Local (Ollama)', 'OLLAMA_BASE_URL', 'local', 'llama3.2'),
-    ('groq', 'Groq', 'GROQ_KEYS', 'https://api.groq.com/openai/v1/chat/completions', 'llama-3.1-8b-instant'),
-    ('gemini', 'Gemini', 'GEMINI_KEYS', 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', 'gemini-2.0-flash'),
+    ('groq', 'Groq', 'GROQ_KEYS', 'https://api.groq.com/openai/v1/chat/completions', 'qwen/qwen3.8-27b'),
+    ('gemini', 'Gemini', 'GEMINI_KEYS', 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', 'gemini-3.8-flash'),
     ('openrouter', 'OpenRouter', 'OPENROUTER_KEYS', 'https://openrouter.ai/api/v1/chat/completions', 'openrouter/auto'),
     ('meta', 'Meta', 'META_KEYS', 'https://api.llama.com/v1/chat/completions', 'Llama-4-Scout-17B-16E-Instruct-FP8'),
-    ('qwen', 'Qwen', 'GROQ_KEYS', 'https://api.groq.com/openai/v1/chat/completions', 'qwen/qwen3-32b'),
+    ('qwen', 'Qwen', 'GROQ_KEYS', 'https://api.groq.com/openai/v1/chat/completions', 'qwen/qwen3.8-27b'),
     ('mistral', 'Mistral', 'MISTRAL_KEYS', 'https://api.mistral.ai/v1/chat/completions', 'mistral-small-latest'),
     ('together', 'Together AI', 'TOGETHER_KEYS', 'https://api.together.xyz/v1/chat/completions', 'meta-llama/Llama-3.3-70B-Instruct-Turbo'),
     ('huggingface', 'HuggingFace', 'HUGGINGFACE_KEYS', 'https://router.huggingface.co/v1/chat/completions', 'Qwen/Qwen2.5-7B-Instruct')
@@ -44,15 +44,14 @@ PROVIDERS = [
 # Paid models are never listed as selectable.
 FREE_MODELS = {
     'local': ['llama3.2', 'qwen2.5:7b', 'qwen3:8b'],
-    'groq': ['qwen/qwen3-32b', 'llama-3.3-70b-versatile', 'llama-3.1-8b-instant',
-             'openai/gpt-oss-120b', 'openai/gpt-oss-20b',
-             'meta-llama/llama-4-scout-17b-16e-instruct'],
-    'gemini': ['gemini-2.0-flash', 'gemini-2.0-flash-lite', 'gemini-2.5-flash'],
+    'groq': ['qwen/qwen3.8-27b', 'openai/gpt-oss-120b', 'openai/gpt-oss-20b'],
+    'gemini': ['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3.5-flash-lite',
+               'gemini-2.5-flash'],
     'openrouter': ['meta-llama/llama-3.3-70b-instruct:free', 'qwen/qwen3-32b:free',
                    'deepseek/deepseek-r1:free', 'google/gemma-3-27b-it:free'],
     'meta': ['Llama-4-Scout-17B-16E-Instruct-FP8', 'Llama-4-Maverick-17B-128E-Instruct-FP8',
              'Llama-3.3-70B-Instruct'],
-    'qwen': ['qwen/qwen3-32b', 'qwen2.5:7b', 'qwen-plus'],
+    'qwen': ['qwen/qwen3.8-27b', 'qwen2.5:7b', 'qwen-plus'],
     'mistral': ['mistral-small-latest', 'codestral-latest'],
     'together': ['meta-llama/Llama-3.3-70B-Instruct-Turbo',
                  'Qwen/Qwen2.5-7B-Instruct-Turbo', 'deepseek-ai/DeepSeek-R1'],
@@ -60,14 +59,16 @@ FREE_MODELS = {
                     'google/gemma-2-9b-it'],
 }
 # Cross-provider fallback order for chat: when the selected provider's
-# call fails with 401/403/429 (or the provider is unreachable), try the
-# next configured provider in this order until one answers. Free-tier
-# models only — fallback never selects a paid model.
+# call fails with 400/401/403/404/429 (or the provider is unreachable),
+# try the next configured provider in this order until one answers.
+# 400/404 count as rotatable: a retired model id answers 404 on Groq
+# and 400 on Gemini, and the next provider may still be alive.
+# Free-tier models only — fallback never selects a paid model.
 FALLBACK_ORDER = ['groq', 'openrouter', 'meta', 'together', 'qwen',
                   'gemini', 'mistral', 'huggingface', 'local']
 # Which route a Qwen model id takes (Groq-hosted Qwen3, local Ollama, DashScope).
 QWEN_ROUTES = {
-    'qwen/qwen3-32b': 'groq',
+    'qwen/qwen3.8-27b': 'groq',
     'qwen2.5:7b': 'ollama',
     'qwen-plus': 'dashscope',
 }
@@ -563,8 +564,8 @@ class Handler(BaseHTTPRequestHandler):
 
         # Cross-provider fallback: the selected provider first, then every
         # other configured provider in FALLBACK_ORDER, each with its first
-        # free-tier model. A 401/403/429 (or an unreachable provider) moves
-        # to the next candidate; the first good reply wins and reports who
+        # free-tier model. A 400/401/403/404/429 (or an unreachable provider)
+        # moves to the next candidate; the first good reply wins and reports who
         # answered. Free-tier only — fallback never uses a paid model.
         rotate = not (pid == "local" or (pid == "qwen" and qwen_route_now in ("ollama", "dashscope")))
         candidates = [(pid, provider, model, endpoint, keys, rotate)]
@@ -587,12 +588,13 @@ class Handler(BaseHTTPRequestHandler):
     def _chat_once(self, sid, candidates, llm_messages):
         """Non-streaming chat: try each candidate provider in order.
 
-        Within a provider, rotate through its key pool on 401/403/429;
-        when the pool is exhausted, move to the next configured provider.
-        An unreachable provider (URLError/timeout) moves on the same way.
-        The first provider that returns a good reply wins; its provider id
-        and model are reported so the UI shows who answered. If every
-        candidate fails, the last provider's error is returned.
+        Within a provider, rotate through its key pool on
+        400/401/403/404/429; when the pool is exhausted, move to the next
+        configured provider. An unreachable provider (URLError/timeout)
+        moves on the same way. The first provider that returns a good
+        reply wins; its provider id and model are reported so the UI shows
+        who answered. If every candidate fails, the last provider's error
+        is returned.
         """
         started = time.time()
         last_error = "All providers failed"
@@ -620,7 +622,7 @@ class Handler(BaseHTTPRequestHandler):
                 except EgressBlocked as exc:
                     self.send_json({"ok": False, "error": "Egress blocked: " + str(exc)[:200], "retryable": False, "session_id": sid}, 502); return
                 except HTTPError as e:
-                    if e.code in (401, 403, 429):
+                    if e.code in (400, 401, 403, 404, 429):
                         last_error = "LLM error: " + str(e)[:240]
                         last_status = 429 if e.code == 429 else 502
                         continue
@@ -668,7 +670,7 @@ class Handler(BaseHTTPRequestHandler):
                 req = Request(endpoint, data=payload, headers=headers, method="POST")
                 response = urlopen(req, timeout=120)
             except HTTPError as e:
-                if e.code in (401, 403, 429):
+                if e.code in (400, 401, 403, 404, 429):
                     last_error = "LLM error: " + str(e)[:240]
                     last_status = 429 if e.code == 429 else 502
                     continue

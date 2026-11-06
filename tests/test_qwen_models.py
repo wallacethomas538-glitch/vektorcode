@@ -136,7 +136,7 @@ def test_qwen_is_default_model():
     assert state["active_model"] == "qwen"
     assert state["qwen_source"] == QWEN_SOURCE
     qwen = next(m for m in state["models"] if m["id"] == "qwen")
-    assert qwen["model"] == "qwen/qwen3-32b"
+    assert qwen["model"] == "qwen/qwen3.8-27b"
     assert QWEN_SOURCE in qwen["description"]
     assert "does not run on Render" in qwen["description"]
 
@@ -153,9 +153,9 @@ def test_qwen_unconfigured_reports_route_none_honestly():
 # ---------------------------------------------------------------------------
 
 def test_free_model_lists_only_free_models():
-    assert "qwen/qwen3-32b" in FREE_MODELS["groq"]
-    assert "llama-3.3-70b-versatile" in FREE_MODELS["groq"]
-    assert "gemini-2.0-flash-lite" in FREE_MODELS["gemini"]
+    assert "qwen/qwen3.8-27b" in FREE_MODELS["groq"]
+    assert "openai/gpt-oss-120b" in FREE_MODELS["groq"]
+    assert "gemini-3.8-flash" in FREE_MODELS["gemini"]
     assert all(m.endswith(":free") for m in FREE_MODELS["openrouter"])
     # Paid-only providers are gone entirely — free-tier only (Wallace 2026-11-05).
     assert "openai" not in FREE_MODELS
@@ -204,13 +204,13 @@ def test_stale_saved_model_falls_back_to_qwen():
 
 def test_model_select_valid_free_model_persists():
     h = make_handler("POST", "/api/model",
-                     {"model": "groq", "model_name": "llama-3.3-70b-versatile"})
+                     {"model": "groq", "model_name": "openai/gpt-oss-120b"})
     h.do_POST()
     assert h._status == 200
     assert response_json(h)["ok"] is True
     state = get_state()
     assert state["active_model"] == "groq"
-    assert state["active_model_name"] == "llama-3.3-70b-versatile"
+    assert state["active_model_name"] == "openai/gpt-oss-120b"
 
 
 def test_model_select_paid_or_unknown_model_rejected():
@@ -227,7 +227,7 @@ def test_model_select_paid_or_unknown_model_rejected():
 
 def test_model_select_clears_model_name_when_omitted():
     h = make_handler("POST", "/api/model",
-                     {"model": "groq", "model_name": "llama-3.3-70b-versatile"})
+                     {"model": "groq", "model_name": "openai/gpt-oss-120b"})
     h.do_POST()
     assert h._status == 200
     h = make_handler("POST", "/api/model", {"model": "qwen"})
@@ -294,12 +294,12 @@ def test_qwen_chat_groq_route_reaches_real_groq_attempt(monkeypatch):
     assert h._status == 200
     out = response_json(h)
     assert out["ok"] is True
-    assert out["model"] == "qwen/qwen3-32b"
+    assert out["model"] == "qwen/qwen3.8-27b"
     assert len(calls) == 1
     assert calls[0].full_url == "https://api.groq.com/openai/v1/chat/completions"
     assert calls[0].headers["Authorization"] == "Bearer k1"
     sent = json.loads(calls[0].data.decode())
-    assert sent["model"] == "qwen/qwen3-32b"
+    assert sent["model"] == "qwen/qwen3.8-27b"
 
 
 def test_qwen_chat_falls_back_to_ollama_without_groq_keys(monkeypatch):
@@ -345,7 +345,7 @@ def test_chat_persists_provider_model_per_session(monkeypatch):
     sid = response_json(h)["session_id"]
     sessions = get_state()["sessions"]
     mine = next(s for s in sessions if s["id"] == sid)
-    assert mine["model"] == "qwen:qwen/qwen3-32b"
+    assert mine["model"] == "qwen:qwen/qwen3.8-27b"
 
 
 def test_groq_model_switch_changes_model_sent(monkeypatch):
@@ -354,10 +354,10 @@ def test_groq_model_switch_changes_model_sent(monkeypatch):
     monkeypatch.setitem(app.KEY_INDEX, "groq", 0)
     h, calls = do_chat(monkeypatch, {
         "messages": [{"role": "user", "content": "hi"}],
-        "model": "groq", "model_name": "llama-3.3-70b-versatile"})
+        "model": "groq", "model_name": "openai/gpt-oss-120b"})
     assert h._status == 200
     sent = json.loads(calls[0].data.decode())
-    assert sent["model"] == "llama-3.3-70b-versatile"
+    assert sent["model"] == "openai/gpt-oss-120b"
 
 
 def test_local_chat_no_longer_double_paths_llm_url(monkeypatch):

@@ -1,9 +1,11 @@
 """Cross-provider fallback for /api/chat.
 
 Wallace 2026-11-06: "LLM should rotate until a good key is approved."
-When the selected provider's call fails with 401/403/429 (or the
+When the selected provider's call fails with 400/401/403/404/429 (or the
 provider is unreachable), chat tries the next configured provider in
-FALLBACK_ORDER until one answers. Free-tier models only.
+FALLBACK_ORDER until one answers. Free-tier models only. 400/404 rotate
+too: a retired model id answers 404 on Groq and 400 on Gemini, and the
+next provider may still be alive.
 
 Uses the same bare-Handler harness as test_qwen_models (no socket).
 """
@@ -15,7 +17,7 @@ from urllib.parse import urlparse
 import pytest
 
 import app
-from app import FALLBACK_ORDER, FREE_MODELS
+from app import FALLBACK_ORDER, FREE_MODELS, QWEN_ROUTES
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +81,127 @@ def llm_reply(text="hello back"):
 
 def http_403(url):
     return HTTPError(url, 403, "Forbidden", {}, None)
+
+
+def http_error(url, code, msg):
+    return HTTPError(url, code, msg, {}, None)
+
+
+# ---------------------------------------------------------------------------
+# 400/404 rotate too: a retired model id answers 404 on Groq, 400 on
+# Gemini — the chain must move to the next provider, not abort.
+# ---------------------------------------------------------------------------
+
+def test_fallback_rotates_on_404_to_next_provider(monkeypatch):
+    monkeypatch.setenv("GROQ_KEYS", "k-groq-dead")
+    monkeypatch.setenv("OPENROUTER_KEYS", "k-or-good")
+    set_pool(monkeypatch, "groq", ["k-groq-dead"])
+    set_pool(monkeypatch, "openrouter", ["k-or-good"])
+
+    calls = []
+
+    def fake_urlopen(req, timeout=120):
+        calls.append(req)
+        if "api.groq.com" in req.full_url:
+            raise http_error(req.full_url, 404, "Not Found")
+        return FakeResponse(llm_reply("from openrouter"))
+
+    monkeypatch.setattr(app, "urlopen", fake_urlopen)
+    h = make_handler("POST", "/api/chat", {
+        "messages": [{"role": "user", "content": "hi"}], "model": "groq"})
+    h.do_POST()
+
+    assert h._status == 200
+    out = response_json(h)
+    assert out["ok"] is True
+    assert out["provider"] == "OpenRouter"
+    assert out["message"] == "from openrouter"
+    assert [urlparse(c.full_url).netloc for c in calls] == [
+        "api.groq.com", "openrouter.ai"]
+
+
+def test_fallback_rotates_on_400_to_next_provider(monkeypatch):
+    monkeypatch.setenv("GEMINI_KEYS", "k-gemini-dead")
+    monkeypatch.setenv("OPENROUTER_KEYS", "k-or-good")
+    set_pool(monkeypatch, "gemini", ["k-gemini-dead"])
+    set_pool(monkeypatch, "openrouter", ["k-or-good"])
+
+    calls = []
+
+    def fake_urlopen(req, timeout=120):
+        calls.append(req)
+        if "generativelanguage.googleapis.com" in req.full_url:
+            raise http_error(req.full_url, 400, "Bad Request")
+        return FakeResponse(llm_reply("from openrouter"))
+
+    monkeypatch.setattr(app, "urlopen", fake_urlopen)
+    h = make_handler("POST", "/api/chat", {
+        "messages": [{"role": "user", "content": "hi"}], "model": "gemini"})
+    h.do_POST()
+
+    assert h._status == 200
+    out = response_json(h)
+    assert out["ok"] is True
+    assert out["provider"] == "OpenRouter"
+    assert out["message"] == "from openrouter"
+    assert [urlparse(c.full_url).netloc for c in calls] == [
+        "generativelanguage.googleapis.com", "openrouter.ai"]
+
+
+def test_stream_fallback_rotates_on_404_to_next_provider(monkeypatch):
+    monkeypatch.setenv("GROQ_KEYS", "k-groq-dead")
+    monkeypatch.setenv("OPENROUTER_KEYS", "k-or-good")
+    set_pool(monkeypatch, "groq", ["k-groq-dead"])
+    set_pool(monkeypatch, "openrouter", ["k-or-good"])
+
+    calls = []
+
+    def fake_urlopen(req, timeout=120):
+        calls.append(req)
+        if "api.groq.com" in req.full_url:
+            raise http_error(req.full_url, 404, "Not Found")
+        return FakeResponse(llm_reply("streamed ok"))
+
+    monkeypatch.setattr(app, "urlopen", fake_urlopen)
+    h = make_handler("POST", "/api/chat", {
+        "messages": [{"role": "user", "content": "hi"}],
+        "model": "groq", "stream": True})
+    h.do_POST()
+
+    assert h._status == 200
+    body = h.wfile.getvalue().decode()
+    assert "streamed ok" in body
+    assert '"provider": "OpenRouter"' in body
+    assert [urlparse(c.full_url).netloc for c in calls] == [
+        "api.groq.com", "openrouter.ai"]
+
+
+# ---------------------------------------------------------------------------
+# Live model IDs only: retired Groq/Gemini ids must be gone (2026-11-06).
+# Groq retired qwen/qwen3-32b (2026-07-17) and llama-3.1-8b-instant +
+# llama-3.3-70b-versatile (2026-08-16); Google dropped gemini-2.0-*.
+# ---------------------------------------------------------------------------
+
+def test_groq_free_models_contain_only_live_ids():
+    retired = {"qwen/qwen3-32b", "llama-3.3-70b-versatile",
+               "llama-3.1-8b-instant",
+               "meta-llama/llama-4-scout-17b-16e-instruct"}
+    assert not (retired & set(FREE_MODELS["groq"]))
+    assert FREE_MODELS["groq"] == ["qwen/qwen3.8-27b",
+                                    "openai/gpt-oss-120b",
+                                    "openai/gpt-oss-20b"]
+    # Qwen still the default, just the live id; routes to Groq.
+    assert FREE_MODELS["qwen"][0] == "qwen/qwen3.8-27b"
+    assert QWEN_ROUTES.get("qwen/qwen3.8-27b") == "groq"
+    assert "qwen/qwen3-32b" not in QWEN_ROUTES
+
+
+def test_gemini_free_models_contain_no_retired_2_0_models():
+    assert not any(m.startswith("gemini-2.0")
+                   for m in FREE_MODELS["gemini"])
+    assert FREE_MODELS["gemini"] == ["gemini-3.8-flash", "gemini-3.6-flash",
+                                     "gemini-3.5-flash-lite",
+                                     "gemini-2.5-flash"]
 
 
 @pytest.fixture(autouse=True)
