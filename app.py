@@ -312,6 +312,11 @@ def read_context_file(path, limit=24000):
 
 def vektor_system_prompt():
     soul = read_context_file(VEKTOR_ROOT / "SOUL.md")
+    # VektorCode's own soul.md ships in the repo root, so it deploys with
+    # the code and loads on Render too. It is the primary identity source:
+    # it states VektorCode was created by Wallace Thomas. Without it the
+    # live chat answers that it has no information about its creator.
+    code_soul = read_context_file(ROOT / "soul.md")
     memories = []
     memory_dir = VEKTOR_STATE / "memories"
     for name in ("USER.md", "MEMORY.md"):
@@ -319,6 +324,8 @@ def vektor_system_prompt():
         if content:
             memories.append(f"## {name}\n{content}")
     parts = ["You are Vektor, the VektorCode assistant. Follow the shared Vektor identity and memory below."]
+    if code_soul:
+        parts.append(f"# VektorCode identity (soul.md)\n{code_soul}")
     if soul:
         parts.append(f"# Shared identity (SOUL.md)\n{soul}")
     if memories:

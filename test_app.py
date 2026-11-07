@@ -23,6 +23,15 @@ class DashboardTest(unittest.TestCase):
             self.assertIn('identity', prompt); self.assertIn('memory', prompt)
         app.VEKTOR_ROOT, app.VEKTOR_STATE = old_root, old_state
 
+    def test_code_soul_in_system_prompt(self):
+        # VektorCode's own soul.md (repo root) must reach the chat prompt:
+        # it states VektorCode was created by Wallace Thomas. Without it,
+        # the live chat answered that it had no information about its
+        # creator (verified live 2026-11-06).
+        prompt = app.vektor_system_prompt()
+        self.assertIn('created by Wallace Thomas', prompt)
+        self.assertIn('VektorCode identity (soul.md)', prompt)
+
     def test_append_shared_file(self):
         with tempfile.TemporaryDirectory() as d:
             target = Path(d) / 'memory.md'
