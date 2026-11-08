@@ -20,6 +20,18 @@ SETTINGS_TABLE = "vektor_settings"
 SESSIONS_TABLE = "vektor_sessions"
 RECEIPTS_TABLE = "vektor_receipts"
 MESSAGES_TABLE = "vektor_messages"
+MEMORY_TABLE = "vektor_memory"
+
+# Cross-session memory kinds. Same four kinds as vektor_cloud/memory.py
+# (fact / preference / decision / lesson). The web backend stores them in
+# the DB (SQLite mirror + Supabase), never in files — files are ephemeral
+# on Render and lost on redeploy.
+MEMORY_KINDS = ("fact", "preference", "decision", "lesson")
+
+# Session expiry: sessions whose `updated` is strictly older than this are
+# purged on read (list_sessions) and by POST /api/session/expired.
+# Wallace's order 2026-11-07: 3 days.
+SESSION_TTL_SECONDS = 3 * 24 * 3600
 
 _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS receipts (id TEXT PRIMARY KEY, action TEXT,"
@@ -34,6 +46,8 @@ _SCHEMA = (
     " created REAL)",
     "CREATE INDEX IF NOT EXISTS messages_session_idx"
     " ON messages (session_id, created)",
+    "CREATE TABLE IF NOT EXISTS memory (kind TEXT, key TEXT, value TEXT,"
+    " updated_at REAL, PRIMARY KEY(kind, key))",
 )
 
 
@@ -57,6 +71,19 @@ def sqlite_connect(path):
         conn.execute(statement)
     conn.commit()
     return conn
+
+
+def validate_memory(kind, key, value):
+    """Validate a memory row. Raises ValueError on bad input.
+    Returns (kind, key, value) with the key stripped."""
+    if kind not in MEMORY_KINDS:
+        raise ValueError(
+            f"kind must be one of {', '.join(MEMORY_KINDS)}")
+    if not isinstance(key, str) or not 1 <= len(key.strip()) <= 120:
+        raise ValueError("key must be 1-120 characters")
+    if not isinstance(value, str) or not 1 <= len(value) <= 12000:
+        raise ValueError("value must be 1-12000 characters")
+    return kind, key.strip(), value
 
 
 class SQLiteStore:
@@ -194,6 +221,66 @@ class SQLiteStore:
                          (session_id,))
             conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
             conn.commit()
+        finally:
+            conn.close()
+
+    def delete_expired_sessions(self, cutoff):
+        """Delete sessions with updated strictly older than `cutoff`, plus
+        their messages. Receipts, settings and memory are preserved.
+        Returns the number of sessions deleted."""
+        conn = sqlite_connect(self.path)
+        try:
+            conn.execute(
+                "DELETE FROM messages WHERE session_id IN"
+                " (SELECT id FROM sessions WHERE updated < ?)", (cutoff,))
+            cur = conn.execute(
+                "DELETE FROM sessions WHERE updated < ?", (cutoff,))
+            conn.commit()
+            return cur.rowcount
+        finally:
+            conn.close()
+
+    def memory_list(self):
+        """All memories, most-recent-first."""
+        conn = sqlite_connect(self.path)
+        try:
+            return [dict(row) for row in conn.execute(
+                "SELECT kind, key, value, updated_at FROM memory"
+                " ORDER BY updated_at DESC")]
+        finally:
+            conn.close()
+
+    def memory_get(self, kind, key):
+        conn = sqlite_connect(self.path)
+        try:
+            row = conn.execute(
+                "SELECT kind, key, value, updated_at FROM memory"
+                " WHERE kind=? AND key=?", (kind, key)).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def memory_save(self, kind, key, value):
+        kind, key, value = validate_memory(kind, key, value)
+        now = time.time()
+        conn = sqlite_connect(self.path)
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO memory VALUES (?,?,?,?)",
+                (kind, key, value, now))
+            conn.commit()
+        finally:
+            conn.close()
+        return {"kind": kind, "key": key, "value": value,
+                "updated_at": now}
+
+    def memory_delete(self, kind, key):
+        conn = sqlite_connect(self.path)
+        try:
+            cur = conn.execute(
+                "DELETE FROM memory WHERE kind=? AND key=?", (kind, key))
+            conn.commit()
+            return cur.rowcount > 0
         finally:
             conn.close()
 
@@ -337,6 +424,58 @@ class SupabaseStore:
             {"id": "eq." + quote(session_id, safe='')},
             None, "return=minimal")
 
+    def delete_expired_sessions(self, cutoff):
+        """Delete sessions with updated strictly older than `cutoff`.
+        Messages cascade via the FK in supabase/schema.sql. Receipts,
+        settings and memory are preserved. Returns the number deleted."""
+        rows = self._request(
+            "GET", SESSIONS_TABLE,
+            {"select": "id", "updated": f"lt.{cutoff}"})
+        count = len(rows or [])
+        if not count:
+            return 0
+        self._request(
+            "DELETE", SESSIONS_TABLE,
+            {"updated": f"lt.{cutoff}"}, None, "return=minimal")
+        return count
+
+    def memory_list(self):
+        """All memories, most-recent-first."""
+        return self._request(
+            "GET", MEMORY_TABLE,
+            {"select": "kind,key,value,updated_at",
+             "order": "updated_at.desc"}) or []
+
+    def memory_get(self, kind, key):
+        rows = self._request(
+            "GET", MEMORY_TABLE,
+            {"select": "kind,key,value,updated_at",
+             "kind": "eq." + quote(kind, safe=''),
+             "key": "eq." + quote(key, safe=''), "limit": "1"})
+        return rows[0] if rows else None
+
+    def memory_save(self, kind, key, value):
+        kind, key, value = validate_memory(kind, key, value)
+        now = time.time()
+        self._request(
+            "POST", MEMORY_TABLE,
+            {"on_conflict": "kind,key"},
+            [{"kind": kind, "key": key, "value": value,
+              "updated_at": now}],
+            "resolution=merge-duplicates,return=minimal")
+        return {"kind": kind, "key": key, "value": value,
+                "updated_at": now}
+
+    def memory_delete(self, kind, key):
+        # PostgREST DELETE returns no row count here; True means the
+        # request succeeded.
+        self._request(
+            "DELETE", MEMORY_TABLE,
+            {"kind": "eq." + quote(kind, safe=''),
+             "key": "eq." + quote(key, safe='')},
+            None, "return=minimal")
+        return True
+
 
 class DashboardStore:
     """Supabase first, SQLite fallback. Failed remotes back off for 60s."""
@@ -385,7 +524,29 @@ class DashboardStore:
         return self._call("list_receipts", limit)
 
     def list_sessions(self):
+        # Purge-on-read: sessions older than 3 days are deleted before the
+        # list is served. A failed purge never blocks the listing.
+        try:
+            self.delete_expired_sessions(
+                time.time() - SESSION_TTL_SECONDS)
+        except Exception as exc:
+            self.last_error = str(exc)[:240]
         return self._call("list_sessions")
+
+    def delete_expired_sessions(self, cutoff):
+        return self._call("delete_expired_sessions", cutoff)
+
+    def memory_list(self):
+        return self._call("memory_list")
+
+    def memory_get(self, kind, key):
+        return self._call("memory_get", kind, key)
+
+    def memory_save(self, kind, key, value):
+        return self._call("memory_save", kind, key, value)
+
+    def memory_delete(self, kind, key):
+        return self._call("memory_delete", kind, key)
 
     def create_session(self, session_id, title, model):
         return self._call("create_session", session_id, title, model)

@@ -34,6 +34,13 @@ VEKTOR_EGRESS_ALLOWLIST = frozenset({
     # --- Composio MCP (1000+ app integrations) ---
     "connect.composio.dev",
 
+    # --- Option B web access (2026-11-07, Wallace's order): read-only
+    # web search + fetch. No other web hosts are allowlisted. ---
+    "github.com",                       # GitHub repos/pages (read)
+    "raw.githubusercontent.com",        # Raw file contents (read)
+    "api.github.com",                   # GitHub API (read)
+    "html.duckduckgo.com",              # DuckDuckGo HTML search scrape
+
     # --- Wallace's own sites ---
     "gojojoes.com",
     "vektormind-2-0.onrender.com",

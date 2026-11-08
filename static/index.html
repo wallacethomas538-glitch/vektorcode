@@ -57,6 +57,23 @@
                 <!-- Receipts loaded via JS from /api/state (last 30) -->
             </div>
 
+            <div class="section-label">MEMORY</div>
+            <div id="memory-list" class="memory-list">
+                <!-- Durable memories loaded via JS from /api/memory -->
+            </div>
+            <div class="memory-form">
+                <select id="memory-kind" aria-label="Memory kind">
+                    <option value="fact">fact</option>
+                    <option value="preference">preference</option>
+                    <option value="decision">decision</option>
+                    <option value="lesson">lesson</option>
+                </select>
+                <input id="memory-key" type="text" placeholder="Key" maxlength="120" aria-label="Memory key">
+                <input id="memory-value" type="text" placeholder="What should VektorCode remember?" maxlength="12000" aria-label="Memory value">
+                <button class="btn-mini" onclick="saveMemory()">Save memory</button>
+            </div>
+            <p class="panel-note">Memories are stored in the database and read at the start of every chat. Only you can add or delete them — the model never writes memory silently.</p>
+
             <div class="agent-vitals" id="agent-vitals">
                 <div class="vital"><span class="dot" id="vital-api-dot"></span> API: <span id="vital-api">Checking...</span></div>
                 <div class="vital"><span class="dot" id="vital-mcp-dot"></span> MCP: <span id="vital-mcp">Checking...</span></div>
