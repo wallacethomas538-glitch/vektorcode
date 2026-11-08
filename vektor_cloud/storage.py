@@ -9,11 +9,12 @@ Expected Supabase tables are in supabase/schema.sql.
 """
 import json
 import os
+import re
 import sqlite3
 import time
 import uuid
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 SETTINGS_TABLE = "vektor_settings"
@@ -21,6 +22,18 @@ SESSIONS_TABLE = "vektor_sessions"
 RECEIPTS_TABLE = "vektor_receipts"
 MESSAGES_TABLE = "vektor_messages"
 MEMORY_TABLE = "vektor_memory"
+MCP_SERVERS_TABLE = "vektor_mcp_servers"
+MCP_HOSTS_TABLE = "vektor_mcp_hosts"
+
+# MCP registry validation. Same transport/auth vocab as
+# vektor_cloud/mcp_client.py. The registry stores env var NAMES only —
+# never a secret value.
+MCP_TRANSPORTS = ("streamable-http", "sse")
+MCP_AUTH_KINDS = ("none", "bearer", "api-key", "header")
+_MCP_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+_MCP_HOST_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$")
+_MCP_ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+_MCP_HEADER_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 
 # Cross-session memory kinds. Same four kinds as vektor_cloud/memory.py
 # (fact / preference / decision / lesson). The web backend stores them in
@@ -48,6 +61,13 @@ _SCHEMA = (
     " ON messages (session_id, created)",
     "CREATE TABLE IF NOT EXISTS memory (kind TEXT, key TEXT, value TEXT,"
     " updated_at REAL, PRIMARY KEY(kind, key))",
+    "CREATE TABLE IF NOT EXISTS mcp_servers (id TEXT PRIMARY KEY,"
+    " name TEXT, url TEXT NOT NULL, transport TEXT NOT NULL,"
+    " auth_kind TEXT NOT NULL, auth_header TEXT, auth_env TEXT,"
+    " enabled INTEGER NOT NULL, expose_to_model INTEGER NOT NULL,"
+    " updated_at REAL)",
+    "CREATE TABLE IF NOT EXISTS mcp_hosts (host TEXT PRIMARY KEY,"
+    " added_by TEXT, created REAL)",
 )
 
 
@@ -84,6 +104,83 @@ def validate_memory(kind, key, value):
     if not isinstance(value, str) or not 1 <= len(value) <= 12000:
         raise ValueError("value must be 1-12000 characters")
     return kind, key.strip(), value
+
+
+def validate_mcp_server(data):
+    """Validate an MCP registry row. Raises ValueError on bad input.
+
+    Returns a normalized dict (no secret — only the env var NAME).
+    Shape only is validated here: the egress allowlist is checked at
+    call time, after the server's host has been added to
+    vektor_mcp_hosts by mcp_server_save.
+    """
+    if not isinstance(data, dict):
+        raise ValueError("server must be an object")
+    server_id = str(data.get("id") or "").strip()
+    if not _MCP_ID_RE.match(server_id):
+        raise ValueError(
+            "id must be a lowercase slug (letters, digits, -, _),"
+            " starting with a letter, max 32 characters")
+    name = str(data.get("name") or server_id).strip()
+    if not 1 <= len(name) <= 80:
+        raise ValueError("name must be 1-80 characters")
+    url = str(data.get("url") or "").strip()
+    if not 1 <= len(url) <= 2000:
+        raise ValueError("url must be 1-2000 characters")
+    parsed = urlsplit(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("url must start with http:// or https://")
+    host = (parsed.hostname or "").lower()
+    loopback = host in ("localhost", "127.0.0.1", "::1")
+    if parsed.scheme == "http" and not loopback:
+        raise ValueError("url must use https (plain http is loopback-only)")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("url must not contain credentials")
+    if parsed.fragment:
+        raise ValueError("url must not contain a fragment")
+    if parsed.port not in (None, 443) and not loopback:
+        raise ValueError("url must use port 443 (or none)")
+    transport = str(data.get("transport") or "streamable-http").strip()
+    if transport not in MCP_TRANSPORTS:
+        raise ValueError(
+            f"transport must be one of {', '.join(MCP_TRANSPORTS)}")
+    auth_kind = str(data.get("auth_kind") or "none").strip()
+    if auth_kind not in MCP_AUTH_KINDS:
+        raise ValueError(
+            f"auth_kind must be one of {', '.join(MCP_AUTH_KINDS)}")
+    auth_header = str(data.get("auth_header") or "").strip()
+    if auth_header and not _MCP_HEADER_RE.match(auth_header):
+        raise ValueError("auth_header must be a valid header name")
+    auth_env = str(data.get("auth_env") or "").strip()
+    if auth_env and not _MCP_ENV_RE.match(auth_env):
+        raise ValueError("auth_env must be an UPPER_CASE env var name")
+    if auth_kind != "none" and not auth_env:
+        raise ValueError(
+            "auth_env is required when auth_kind is not 'none'"
+            " (the key itself lives in the Render env, never here)")
+    return {
+        "id": server_id,
+        "name": name,
+        "url": url,
+        "transport": transport,
+        "auth_kind": auth_kind,
+        "auth_header": auth_header,
+        "auth_env": auth_env,
+        "enabled": bool(data.get("enabled", True)),
+        "expose_to_model": bool(data.get("expose_to_model", True)),
+    }
+
+
+def validate_mcp_host(host):
+    """Validate a bare MCP hostname. Raises ValueError on bad input.
+    Returns the normalized (lowercase) hostname."""
+    h = str(host or "").strip().lower()
+    if not 1 <= len(h) <= 253:
+        raise ValueError("host must be 1-253 characters")
+    if not _MCP_HOST_RE.match(h) or ".." in h:
+        raise ValueError("host must be a bare hostname (no scheme,"
+                         " port, or path)")
+    return h
 
 
 class SQLiteStore:
@@ -284,6 +381,105 @@ class SQLiteStore:
         finally:
             conn.close()
 
+    # --- MCP registry (universal MCP, 2026-11-07) ---
+
+    def mcp_server_list(self):
+        """All registered MCP servers, by id."""
+        conn = sqlite_connect(self.path)
+        try:
+            rows = conn.execute(
+                "SELECT id, name, url, transport, auth_kind, auth_header,"
+                " auth_env, enabled, expose_to_model, updated_at"
+                " FROM mcp_servers ORDER BY id").fetchall()
+            return [self._mcp_server_row(dict(row)) for row in rows]
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _mcp_server_row(row):
+        row["enabled"] = bool(row["enabled"])
+        row["expose_to_model"] = bool(row["expose_to_model"])
+        return row
+
+    def mcp_server_get(self, server_id):
+        conn = sqlite_connect(self.path)
+        try:
+            row = conn.execute(
+                "SELECT id, name, url, transport, auth_kind, auth_header,"
+                " auth_env, enabled, expose_to_model, updated_at"
+                " FROM mcp_servers WHERE id=?", (server_id,)).fetchone()
+            return self._mcp_server_row(dict(row)) if row else None
+        finally:
+            conn.close()
+
+    def mcp_server_save(self, data):
+        row = validate_mcp_server(data)
+        now = time.time()
+        host = validate_mcp_host(urlsplit(row["url"]).hostname)
+        conn = sqlite_connect(self.path)
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO mcp_servers VALUES"
+                " (?,?,?,?,?,?,?,?,?,?)",
+                (row["id"], row["name"], row["url"], row["transport"],
+                 row["auth_kind"], row["auth_header"], row["auth_env"],
+                 int(row["enabled"]), int(row["expose_to_model"]), now))
+            # Mechanism B: the server's host is allowlisted for MCP
+            # calls only, at the same time as the server is saved.
+            conn.execute(
+                "INSERT OR IGNORE INTO mcp_hosts VALUES (?,?,?)",
+                (host, "wallace", now))
+            conn.commit()
+        finally:
+            conn.close()
+        row["updated_at"] = now
+        return row
+
+    def mcp_server_delete(self, server_id):
+        if server_id == "composio":
+            raise ValueError(
+                "composio is the default server and cannot be deleted")
+        conn = sqlite_connect(self.path)
+        try:
+            cur = conn.execute(
+                "DELETE FROM mcp_servers WHERE id=?", (server_id,))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    def mcp_host_list(self):
+        """Wallace-managed MCP hosts, alphabetical."""
+        conn = sqlite_connect(self.path)
+        try:
+            return [row["host"] for row in conn.execute(
+                "SELECT host FROM mcp_hosts ORDER BY host").fetchall()]
+        finally:
+            conn.close()
+
+    def mcp_host_add(self, host):
+        host = validate_mcp_host(host)
+        conn = sqlite_connect(self.path)
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO mcp_hosts VALUES (?,?,?)",
+                (host, "wallace", time.time()))
+            conn.commit()
+        finally:
+            conn.close()
+        return host
+
+    def mcp_host_remove(self, host):
+        host = validate_mcp_host(host)
+        conn = sqlite_connect(self.path)
+        try:
+            cur = conn.execute(
+                "DELETE FROM mcp_hosts WHERE host=?", (host,))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
 
 class SupabaseStore:
     """Minimal PostgREST client for the dashboard tables."""
@@ -476,6 +672,79 @@ class SupabaseStore:
             None, "return=minimal")
         return True
 
+    # --- MCP registry (universal MCP, 2026-11-07) ---
+
+    def mcp_server_list(self):
+        """All registered MCP servers, by id."""
+        return self._request(
+            "GET", MCP_SERVERS_TABLE,
+            {"select": "id,name,url,transport,auth_kind,auth_header,"
+                       "auth_env,enabled,expose_to_model,updated_at",
+             "order": "id.asc"}) or []
+
+    def mcp_server_get(self, server_id):
+        rows = self._request(
+            "GET", MCP_SERVERS_TABLE,
+            {"select": "id,name,url,transport,auth_kind,auth_header,"
+                       "auth_env,enabled,expose_to_model,updated_at",
+             "id": "eq." + quote(server_id, safe=''), "limit": "1"})
+        return rows[0] if rows else None
+
+    def mcp_server_save(self, data):
+        row = validate_mcp_server(data)
+        now = time.time()
+        host = validate_mcp_host(urlsplit(row["url"]).hostname)
+        row["updated_at"] = now
+        self._request(
+            "POST", MCP_SERVERS_TABLE,
+            {"on_conflict": "id"},
+            [row], "resolution=merge-duplicates,return=minimal")
+        # Mechanism B: the server's host is allowlisted for MCP
+        # calls only, at the same time as the server is saved.
+        self._request(
+            "POST", MCP_HOSTS_TABLE,
+            {"on_conflict": "host"},
+            [{"host": host, "added_by": "wallace", "created": now}],
+            "resolution=merge-duplicates,return=minimal")
+        return row
+
+    def mcp_server_delete(self, server_id):
+        if server_id == "composio":
+            raise ValueError(
+                "composio is the default server and cannot be deleted")
+        # PostgREST DELETE returns no row count here; True means the
+        # request succeeded.
+        self._request(
+            "DELETE", MCP_SERVERS_TABLE,
+            {"id": "eq." + quote(server_id, safe='')},
+            None, "return=minimal")
+        return True
+
+    def mcp_host_list(self):
+        """Wallace-managed MCP hosts, alphabetical."""
+        rows = self._request(
+            "GET", MCP_HOSTS_TABLE,
+            {"select": "host", "order": "host.asc"}) or []
+        return [row["host"] for row in rows]
+
+    def mcp_host_add(self, host):
+        host = validate_mcp_host(host)
+        self._request(
+            "POST", MCP_HOSTS_TABLE,
+            {"on_conflict": "host"},
+            [{"host": host, "added_by": "wallace",
+              "created": time.time()}],
+            "resolution=merge-duplicates,return=minimal")
+        return host
+
+    def mcp_host_remove(self, host):
+        host = validate_mcp_host(host)
+        self._request(
+            "DELETE", MCP_HOSTS_TABLE,
+            {"host": "eq." + quote(host, safe='')},
+            None, "return=minimal")
+        return True
+
 
 class DashboardStore:
     """Supabase first, SQLite fallback. Failed remotes back off for 60s."""
@@ -547,6 +816,27 @@ class DashboardStore:
 
     def memory_delete(self, kind, key):
         return self._call("memory_delete", kind, key)
+
+    def mcp_server_list(self):
+        return self._call("mcp_server_list")
+
+    def mcp_server_get(self, server_id):
+        return self._call("mcp_server_get", server_id)
+
+    def mcp_server_save(self, data):
+        return self._call("mcp_server_save", data)
+
+    def mcp_server_delete(self, server_id):
+        return self._call("mcp_server_delete", server_id)
+
+    def mcp_host_list(self):
+        return self._call("mcp_host_list")
+
+    def mcp_host_add(self, host):
+        return self._call("mcp_host_add", host)
+
+    def mcp_host_remove(self, host):
+        return self._call("mcp_host_remove", host)
 
     def create_session(self, session_id, title, model):
         return self._call("create_session", session_id, title, model)

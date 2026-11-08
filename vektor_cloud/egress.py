@@ -9,6 +9,12 @@ The list is hardcoded and unbypassable at runtime. Adding a host requires a
 code change + Wallace's approval + a new deploy. There is no env override,
 no config file, no runtime toggle — by design.
 
+One exception, mechanism B (universal MCP, 2026-11-07): MCP servers may
+add hosts through the Wallace-managed vektor_mcp_hosts table. Those hosts
+are additive and MCP-only — guard_url(url, extra_hosts=...) — the hardcoded
+list above is never mutated, and web_fetch / the model cascade never see
+them. The table is Wallace-only (auth-gated registry endpoints).
+
 Covers: AI providers (free cascade), Composio MCP, Wallace's own sites,
 the Meta relay worker, and local loopback.
 """
@@ -65,15 +71,34 @@ class EgressBlocked(Exception):
     pass
 
 
-def guard_host(host: str) -> str:
+def load_mcp_hosts(store):
+    """Wallace-managed MCP hosts (mechanism B) as a frozenset.
+
+    Reads the vektor_mcp_hosts table through the given store. Never
+    raises — on any failure the set is empty and MCP calls fall back
+    to the hardcoded allowlist only. Callers cache the result briefly.
+    """
+    try:
+        hosts = store.mcp_host_list() or []
+    except Exception:
+        return frozenset()
+    return frozenset(h for h in (str(x or "").strip().lower()
+                                 for x in hosts) if h)
+
+
+def guard_host(host: str, extra_hosts=None) -> str:
     """Validate a bare hostname against the egress allowlist.
+
+    extra_hosts is an additive set for MCP calls only (Wallace-managed
+    vektor_mcp_hosts table). The hardcoded allowlist is never mutated.
 
     Returns the normalized hostname. Raises EgressBlocked if not allowed.
     """
     h = (host or "").strip().lower()
     if not h:
         raise EgressBlocked("Empty host — refused")
-    if h not in VEKTOR_EGRESS_ALLOWLIST:
+    allowed = VEKTOR_EGRESS_ALLOWLIST | set(extra_hosts or ())
+    if h not in allowed:
         raise EgressBlocked(
             f"Host '{h}' is NOT on Vektor's egress allowlist — connection refused. "
             f"Adding a host needs Wallace's approval and a code change."
@@ -81,12 +106,14 @@ def guard_host(host: str) -> str:
     return h
 
 
-def guard_url(url: str):
+def guard_url(url: str, extra_hosts=None):
     """Validate a full URL against the egress allowlist.
 
     Enforces: https only, no credentials in URL, no fragments, port 443 or
     unset, and host on the allowlist. Returns the parsed URL parts.
     Raises EgressBlocked or ValueError on any violation.
+
+    extra_hosts: additive MCP-only hosts (mechanism B, see guard_host).
 
     Loopback exception: plain HTTP is allowed for loopback hosts
     (localhost / 127.0.0.1 / ::1) because that traffic never leaves the
@@ -104,13 +131,15 @@ def guard_url(url: str):
         raise EgressBlocked("URL fragments not allowed — refused")
     if p.port not in (None, 443) and not loopback:
         raise EgressBlocked(f"Only port 443 allowed — refused: {p.port}")
-    guard_host(host)
+    guard_host(host, extra_hosts=extra_hosts)
     return p
 
 
-def is_allowed(host: str) -> bool:
-    """Non-raising check: is this host on the egress allowlist?"""
-    return (host or "").strip().lower() in VEKTOR_EGRESS_ALLOWLIST
+def is_allowed(host: str, extra_hosts=None) -> bool:
+    """Non-raising check: is this host on the egress allowlist?
+    extra_hosts: additive MCP-only hosts (mechanism B)."""
+    allowed = VEKTOR_EGRESS_ALLOWLIST | set(extra_hosts or ())
+    return (host or "").strip().lower() in allowed
 
 
 def vektor_http(**kwargs):

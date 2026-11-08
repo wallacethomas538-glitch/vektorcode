@@ -50,7 +50,28 @@
             <div id="skill-list" class="skill-list" aria-labelledby="skills-label">
                 <!-- Tools loaded via JS from /api/state -->
             </div>
-            <p class="panel-note">Only Composio MCP is wired to execute. The other tools are registered labels, not executable — see Settings for detail.</p>
+            <div class="section-label" id="mcp-label">MCP SERVERS</div>
+            <div id="mcp-list" class="skill-list" aria-labelledby="mcp-label">
+                <!-- MCP servers loaded via JS from /api/state -->
+            </div>
+            <div class="memory-form">
+                <input id="mcp-id" type="text" placeholder="id (e.g. myserver)" maxlength="32" aria-label="Server id">
+                <input id="mcp-url" type="text" placeholder="https://.../mcp" maxlength="2000" aria-label="Server URL">
+                <select id="mcp-transport" aria-label="Transport">
+                    <option value="streamable-http">streamable-http</option>
+                    <option value="sse">sse</option>
+                </select>
+                <select id="mcp-auth-kind" aria-label="Auth kind">
+                    <option value="none">no key</option>
+                    <option value="bearer">bearer</option>
+                    <option value="api-key">api-key</option>
+                    <option value="header">header</option>
+                </select>
+                <input id="mcp-auth-header" type="text" placeholder="Header name (e.g. x-api-key)" maxlength="64" aria-label="Auth header name">
+                <input id="mcp-auth-env" type="text" placeholder="Key env var name (e.g. MY_MCP_KEY)" maxlength="64" aria-label="Auth env var name">
+                <button class="btn-mini" onclick="addMcpServer()">Add server</button>
+            </div>
+            <p class="panel-note">MCP servers are HTTP only (streamable HTTP or SSE). The key itself lives in the Render env — this form only names the env var, never the key. A server's host is allowlisted for MCP calls only when the server is saved.</p>
 
             <div class="section-label">ACTIVITY</div>
             <div id="activity-feed" class="activity-feed">

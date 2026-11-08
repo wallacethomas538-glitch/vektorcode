@@ -72,6 +72,8 @@ async function refreshState() {
     renderActivity();
     renderVitals();
     renderSettingsBits();
+    await loadMcpServers();
+    renderMcpServers();
     await loadMemories();
 }
 
@@ -127,20 +129,98 @@ function renderSessions() {
 
 function renderSkills() {
     const list = $('skill-list');
-    // Only Composio is actually wired to execute (via the MCP bridge in
-    // app.py). The rest are registered labels with no executor behind them.
+    // Status is live from /api/state (t.status): "Wired — native
+    // fetch/search", "Wired — N tools" / "Offline — <reason>", or
+    // "Registered, not executable". Never hardcoded here.
     list.innerHTML = state.tools.map((t) => {
-        const wired = t.id === 'composio';
-        const note = wired ? 'Wired via Composio MCP' : 'Registered, not executable';
+        const note = t.status || 'Registered, not executable';
         const locked = t.locked && !state.auth.authenticated;
         return `<label class="skill-row ${t.enabled ? 'enabled' : ''}" title="${esc(t.description)}">
             <input type="checkbox" ${t.enabled ? 'checked' : ''} ${locked ? 'disabled' : ''}
                 onchange="toggleTool('${esc(t.id)}', this.checked, this)">
             <span class="skill-body"><b>${esc(t.name)}</b>
             <small>${esc(t.description)}</small>
-            <small class="skill-note">${note}${locked ? ' · login required' : ''}${t.approval_required ? ' · approval-gated' : ''}</small></span>
+            <small class="skill-note">${esc(note)}${locked ? ' · login required' : ''}${t.approval_required ? ' · approval-gated' : ''}</small></span>
         </label>`;
     }).join('');
+}
+
+/* ---------- MCP servers (universal MCP, 2026-11-07) ---------- */
+
+// Registry rows from GET /api/mcp/servers. The live list itself comes
+// from /api/state (state.mcp_servers); the registry only decides which
+// rows show a Delete button (defaults are not registry rows; composio
+// can never be deleted).
+let mcpRegistry = [];
+
+async function loadMcpServers() {
+    const res = await api('/api/mcp/servers');
+    if (!res || !res.ok) { mcpRegistry = []; return; }
+    mcpRegistry = res.servers || [];
+}
+
+function renderMcpServers() {
+    const list = $('mcp-list');
+    const servers = state.mcp_servers || [];
+    if (!servers.length) {
+        list.innerHTML = '<div class="muted">No MCP servers configured yet.</div>';
+        return;
+    }
+    const registryIds = new Set(mcpRegistry.map((s) => s.id));
+    list.innerHTML = servers.map((s) => {
+        const status = s.connected ? `Online — ${s.tool_count} tools`
+            : `Offline — ${s.error || 'not configured'}`;
+        const flags = `${s.enabled ? '' : ' · disabled'}${s.expose_to_model ? '' : ' · hidden from model'}`;
+        const canDelete = registryIds.has(s.id) && s.id !== 'composio';
+        return `<div class="skill-row ${s.connected ? 'enabled' : ''}">
+            <span class="skill-body"><b>${esc(s.name)}</b>
+            <small>${esc(s.url)} · ${esc(s.transport)}</small>
+            <small class="skill-note">${esc(status)}${esc(flags)}</small></span>
+            <span style="margin-left:auto; display:flex; gap:6px; align-items:flex-start;">
+            <button class="btn-mini" onclick="testMcpServer('${esc(s.id)}')">Test</button>
+            ${canDelete ? `<button class="btn-mini btn-danger" onclick="deleteMcpServer('${esc(s.id)}')">Delete</button>` : ''}
+            </span>
+        </div>`;
+    }).join('');
+}
+
+async function testMcpServer(id) {
+    const res = await api('/api/mcp/status?server=' + encodeURIComponent(id) + '&force=1');
+    if (!res) return;
+    toast(res.connected ? `${id}: online, ${res.tool_count} tools`
+        : `${id}: offline — ${res.error || 'unknown error'}`);
+    await refreshState();
+}
+
+async function addMcpServer() {
+    const body = {
+        id: $('mcp-id').value.trim(),
+        url: $('mcp-url').value.trim(),
+        transport: $('mcp-transport').value,
+        auth_kind: $('mcp-auth-kind').value,
+        auth_header: $('mcp-auth-header').value.trim(),
+        auth_env: $('mcp-auth-env').value.trim(),
+    };
+    if (!body.id || !body.url) { toast('Server id and URL are required.'); return; }
+    const res = await api('/api/mcp/servers', body, 'POST');
+    if (!res || res.ok === false) {
+        toast('Add server failed: ' + ((res && res.error) || 'server error'));
+        return;
+    }
+    ['mcp-id', 'mcp-url', 'mcp-auth-header', 'mcp-auth-env'].forEach((f) => { $(f).value = ''; });
+    toast('Server saved: ' + res.server.id);
+    await refreshState();
+}
+
+async function deleteMcpServer(id) {
+    if (!confirm(`Delete MCP server "${id}"? The model will lose its tools. This cannot be undone.`)) return;
+    const res = await api('/api/mcp/servers', { id }, 'DELETE');
+    if (!res || res.ok === false) {
+        toast('Delete failed: ' + ((res && res.error) || 'server error'));
+        return;
+    }
+    toast(res.deleted ? `Server deleted: ${id}` : `Server not found: ${id}`);
+    await refreshState();
 }
 
 function renderActivity() {
@@ -223,11 +303,16 @@ function setVital(dotId, textId, text, ok) {
 }
 
 function renderVitals() {
-    // MCP status is real (from /api/state). API status comes from /health
-    // via updateStatus(); until then it stays "Checking...".
-    setVital('vital-mcp-dot', 'vital-mcp',
-        state.mcp.connected ? `Online (${state.mcp.tool_count} tools)` : 'Offline',
-        state.mcp.connected);
+    // MCP status is real (from /api/state): N/M servers online. Falls
+    // back to the single-server shape when mcp_servers is absent.
+    const servers = state.mcp_servers || [];
+    const online = servers.filter((s) => s.connected).length;
+    const mcpText = servers.length
+        ? (online > 0 ? `Online (${online}/${servers.length} servers)`
+                      : `Offline (0/${servers.length} servers)`)
+        : (state.mcp.connected ? `Online (${state.mcp.tool_count} tools)` : 'Offline');
+    const mcpOk = servers.length ? online > 0 : state.mcp.connected;
+    setVital('vital-mcp-dot', 'vital-mcp', mcpText, mcpOk);
     setVital('vital-kill-dot', 'vital-kill',
         state.kill_switch ? 'ACTIVE — chat stopped' : 'Off', !state.kill_switch);
     setVital('vital-auth-dot', 'vital-auth',
@@ -957,7 +1042,7 @@ function paletteActions() {
         }));
         state.tools.forEach((t) => actions.push({
             label: (t.enabled ? 'Disable tool: ' : 'Enable tool: ') + t.name,
-            hint: t.id === 'composio' ? 'Wired via Composio MCP' : 'Registered, not executable',
+            hint: t.status || 'Registered, not executable',
             run: () => toggleTool(t.id, !t.enabled, { checked: t.enabled })
         }));
     }
