@@ -72,6 +72,7 @@ async function refreshState() {
     renderActivity();
     renderVitals();
     renderSettingsBits();
+    await loadMemories();
 }
 
 function renderModels() {
@@ -160,6 +161,60 @@ function renderActivity() {
             ${r.sensitive ? '<span class="activity-badge">Aegis Gate</span>' : ''}
             ${detail ? `<span class="activity-detail">${esc(detail.slice(0, 140))}</span>` : ''}</div>`;
     }).join('');
+}
+
+/* ---------- long-term memory ---------- */
+
+// Durable memories (DB-backed). Only Wallace writes them — from this
+// panel, from "save to memory" in chat, or from a model suggestion he
+// approves. The model never writes memory silently.
+async function loadMemories() {
+    const res = await api('/api/memory');
+    if (!res || !res.ok) return;
+    renderMemories(res.memories || []);
+}
+
+function renderMemories(memories) {
+    const list = $('memory-list');
+    if (!list) return;
+    if (!memories.length) {
+        list.innerHTML = '<div class="muted">No memories saved yet.</div>';
+        return;
+    }
+    list.innerHTML = memories.map((m) =>
+        `<div class="memory-item"><span class="memory-kind">${esc(m.kind)}</span> ` +
+        `<span class="memory-key">${esc(m.key)}</span> — <span class="memory-value">${esc(m.value)}</span>` +
+        `<button class="memory-del" aria-label="Delete memory ${esc(m.key)}" onclick="deleteMemory('${esc(m.kind)}', '${esc(m.key)}')">×</button>` +
+        `</div>`
+    ).join('');
+}
+
+async function saveMemory() {
+    const kind = $('memory-kind').value;
+    const key = $('memory-key').value.trim();
+    const value = $('memory-value').value.trim();
+    if (!key || !value) { toast('Enter a key and a value to save.'); return; }
+    const res = await api('/api/memory', { kind, key, value }, 'POST');
+    if (res && res.ok) {
+        $('memory-key').value = '';
+        $('memory-value').value = '';
+        toast('Memory saved.');
+        await loadMemories();
+        await refreshState(); // pick up the memory_saved receipt
+    } else {
+        toast('Could not save memory: ' + ((res && res.error) || 'unknown error'));
+    }
+}
+
+async function deleteMemory(kind, key) {
+    const res = await api('/api/memory', { kind, key }, 'DELETE');
+    if (res && res.ok) {
+        toast('Memory deleted.');
+        await loadMemories();
+        await refreshState();
+    } else {
+        toast('Could not delete memory: ' + ((res && res.error) || 'unknown error'));
+    }
 }
 
 function setVital(dotId, textId, text, ok) {
@@ -359,11 +414,28 @@ function clearChat() {
     toast('Chat view cleared (session history on the server is untouched).');
 }
 
+// Turn plain-text URLs into safe links. Escape FIRST, then linkify —
+// the inserted <a> tags are the only HTML in the output, and the URL
+// regex excludes <>"' so a URL can never break out of the href
+// attribute. Trailing punctuation stays outside the link.
+function linkify(text) {
+    const escaped = esc(text);
+    return escaped.replace(/https?:\/\/[^\s<>"']+/g, (url) => {
+        let clean = url;
+        let trail = '';
+        while (clean.length && '.,;:!?'.includes(clean[clean.length - 1])) {
+            trail = clean[clean.length - 1] + trail;
+            clean = clean.slice(0, -1);
+        }
+        return `<a href="${clean}" target="_blank" rel="noopener">${clean}</a>${trail}`;
+    });
+}
+
 function addMessage(role, text) {
     const flow = $('chat-flow');
     const msg = document.createElement('div');
     msg.className = `message ${role}`;
-    msg.textContent = text;
+    msg.innerHTML = linkify(text);
     flow.appendChild(msg);
     flow.scrollTop = flow.scrollHeight;
     return msg;
@@ -381,6 +453,19 @@ function addToolResults(toolsUsed) {
             return `<div class="tool-result"><b>${esc(t)}</b><pre>Tool ran — no result detail returned by the backend.</pre></div>`;
         }
         const name = esc(t.name || t.tool || 'tool');
+        // Structured web results carry a verbatim URL + summary: render
+        // them as a titled link, never as raw model text. Only http(s)
+        // URLs become links.
+        if (typeof t.url === 'string' && /^https?:\/\//.test(t.url)) {
+            const title = esc(t.title || t.url);
+            const summary = typeof t.summary === 'string' ? t.summary : '';
+            return `<div class="tool-result"><b>${name}</b><a href="${esc(t.url)}" target="_blank" rel="noopener">${title}</a>${summary ? `<pre>${esc(summary.slice(0, 500))}</pre>` : ''}</div>`;
+        }
+        // Search results have a title + summary but no single URL.
+        if (typeof t.title === 'string' && t.title) {
+            const summary = typeof t.summary === 'string' ? t.summary : '';
+            return `<div class="tool-result"><b>${name}</b>${esc(t.title)}${summary ? `<pre>${esc(summary.slice(0, 500))}</pre>` : ''}</div>`;
+        }
         let content = t.content;
         if (typeof content !== 'string') {
             try { content = JSON.stringify(content); } catch (_) { content = String(content ?? ''); }

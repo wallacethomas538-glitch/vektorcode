@@ -46,3 +46,23 @@ create index if not exists vektor_sessions_updated_idx
     on vektor_sessions (updated desc);
 create index if not exists vektor_receipts_created_idx
     on vektor_receipts (created desc);
+
+-- Long-term memory (Option B web access, 2026-11-07): durable
+-- cross-session memories the model reads at the start of every chat.
+-- Kinds: fact / preference / decision / lesson. One row per (kind, key);
+-- saving the same kind+key replaces the value. Loaded into the system
+-- prompt under a 4,000-char cap, most-recent-first per kind.
+-- Writes come from Wallace in the UI, from "save to memory" in chat, or
+-- from a model suggestion Wallace approves — never silent model writes.
+-- Run this block in the Supabase SQL editor (no RLS — same as the
+-- existing tables; enabling RLS with no policies would block the app).
+create table if not exists vektor_memory (
+    kind text not null check (kind in ('fact', 'preference', 'decision', 'lesson')),
+    key text not null,
+    value text not null,
+    updated_at double precision not null default 0,
+    primary key (kind, key)
+);
+
+create index if not exists vektor_memory_updated_idx
+    on vektor_memory (updated_at desc);
