@@ -35,6 +35,7 @@ PROVIDERS = [
     ('groq', 'Groq', 'GROQ_KEYS', 'https://api.groq.com/openai/v1/chat/completions', 'qwen/qwen3.8-27b'),
     ('gemini', 'Gemini', 'GEMINI_KEYS', 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', 'gemini-3.8-flash'),
     ('openrouter', 'OpenRouter', 'OPENROUTER_KEYS', 'https://openrouter.ai/api/v1/chat/completions', 'openrouter/auto'),
+    ('nvidia', 'NVIDIA NIM', 'NVIDIA_NIM_KEYS', 'https://integrate.api.nvidia.com/v1/chat/completions', 'deepseek-ai/deepseek-v4.1-flash'),
     ('meta', 'Meta', 'META_KEYS', 'https://api.llama.com/v1/chat/completions', 'Llama-4-Scout-17B-16E-Instruct-FP8'),
     ('qwen', 'Qwen', 'GROQ_KEYS', 'https://api.groq.com/openai/v1/chat/completions', 'qwen/qwen3.8-27b'),
     ('mistral', 'Mistral', 'MISTRAL_KEYS', 'https://api.mistral.ai/v1/chat/completions', 'mistral-small-latest'),
@@ -53,6 +54,14 @@ FREE_MODELS = {
     'openrouter': ['meta-llama/llama-3.3-70b-instruct:free', 'qwen/qwen3-32b:free',
                    'deepseek/deepseek-r1:free', 'google/gemma-3-27b-it:free',
                    'stealth/crouton-alpha'],
+    # NVIDIA NIM free endpoints (verified 2026-11-09): no card, 1,000 calls/mo
+    # (5,000 after phone verification), 40 req/min, eval-only terms. Models
+    # retire with little warning (requests then 404/410) — the 400/404
+    # fallback rotation covers that.
+    'nvidia': ['deepseek-ai/deepseek-v4.1-flash', 'z-ai/glm-5.3-flash',
+               'nvidia/nemotron-3-ultra-550b-a55b', 'google/gemma-4-31b-it',
+               'openai/gpt-oss-20b', 'nvidia/nemotron-3.5-lightning-30b-a3b',
+               'mistralai/mistral-large-4-1t-a52b'],
     'meta': ['Llama-4-Scout-17B-16E-Instruct-FP8', 'Llama-4-Maverick-17B-128E-Instruct-FP8',
              'Llama-3.3-70B-Instruct'],
     'qwen': ['qwen/qwen3.8-27b', 'qwen2.5:7b', 'qwen-plus'],
@@ -70,7 +79,7 @@ FREE_MODELS = {
 # 5xx counts too: a 503 must rotate, one overloaded provider must never
 # kill the whole chain. Free-tier models only — fallback never selects
 # a paid model.
-FALLBACK_ORDER = ['groq', 'openrouter', 'meta', 'together', 'qwen',
+FALLBACK_ORDER = ['groq', 'openrouter', 'nvidia', 'meta', 'together', 'qwen',
                   'gemini', 'mistral', 'huggingface', 'local']
 # HTTP statuses worth rotating on: bad or retired model (400/404),
 # auth/rate-limit (401/403/429), server-side trouble (500/502/503/504).
@@ -1150,7 +1159,8 @@ class Handler(BaseHTTPRequestHandler):
 
         Streaming providers (OpenAI-compatible chat/completions with
         stream:true, incl. local Ollama): groq,
-        openrouter, together, mistral, huggingface router,
+        openrouter, nvidia (NIM, OpenAI-compat), together, mistral,
+        huggingface router,
         gemini (OpenAI-compat endpoint), meta
         (Llama API), dashscope (Qwen compat mode). If a provider ignores
         stream:true and returns plain JSON, the reply is emitted as a

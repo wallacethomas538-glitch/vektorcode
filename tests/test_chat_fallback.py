@@ -415,9 +415,9 @@ def set_pool(monkeypatch, pid, keys):
 # ---------------------------------------------------------------------------
 
 def test_fallback_order_is_free_providers_only():
-    assert FALLBACK_ORDER == ["groq", "openrouter", "meta", "together",
-                              "qwen", "gemini", "mistral", "huggingface",
-                              "local"]
+    assert FALLBACK_ORDER == ["groq", "openrouter", "nvidia", "meta",
+                              "together", "qwen", "gemini", "mistral",
+                              "huggingface", "local"]
     for pid in FALLBACK_ORDER:
         assert FREE_MODELS[pid], pid
 

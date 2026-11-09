@@ -32,6 +32,7 @@ VEKTOR_EGRESS_ALLOWLIST = frozenset({
     "dashscope.aliyuncs.com",            # Alibaba DashScope (Qwen compat mode)
     "api.llama.com",                     # Meta Llama API
     "openrouter.ai",                     # OpenRouter
+    "integrate.api.nvidia.com",          # NVIDIA NIM (free endpoints)
     "generativelanguage.googleapis.com",  # Google Gemini
     "text.pollinations.ai",              # Pollinations (text)
     "image.pollinations.ai",             # Pollinations (image)
