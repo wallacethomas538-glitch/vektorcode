@@ -85,7 +85,11 @@ _CHAT_MODELS = {
     "OLLAMA": None,  # model from OLLAMA_MODEL env, default llama3.2
     "GROQ": "qwen/qwen3.8-27b",
     "OPENROUTER": "meta-llama/llama-3.3-70b-instruct:free",
-    "GEMINI": "gemini-3.8-flash",
+    # Gemini primary is gemini-4-hydrogen (free tier, released 2026-11-12).
+    # gemini-2.5-* is dead 2026-12-01 and must never be wired here.
+    # gemini-decision-1 is the second free model but it is Decisions-API
+    # only — never a chat leg (see DECISION_MODELS in app.py).
+    "GEMINI": "gemini-4-hydrogen",
     "POLLINATIONS": None,  # keyless GET
 }
 # Local (Termux): phone Llama first, then the free cloud fallback.
