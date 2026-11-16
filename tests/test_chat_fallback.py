@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 import pytest
 
 import app
-from app import FALLBACK_ORDER, FREE_MODELS, QWEN_ROUTES
+from app import DECISION_MODELS, FALLBACK_ORDER, FREE_MODELS, QWEN_ROUTES
 
 
 # ---------------------------------------------------------------------------
@@ -330,7 +330,8 @@ def test_chat_requests_send_a_browser_user_agent(monkeypatch):
 # ---------------------------------------------------------------------------
 # Live model IDs only: retired Groq/Gemini ids must be gone (2026-11-06).
 # Groq retired qwen/qwen3-32b (2026-07-17) and llama-3.1-8b-instant +
-# llama-3.3-70b-versatile (2026-08-16); Google dropped gemini-2.0-*.
+# llama-3.3-70b-versatile (2026-08-16); Google dropped gemini-2.0-*,
+# and gemini-2.5-* dies 2026-12-01 (removed 2026-11-16).
 # ---------------------------------------------------------------------------
 
 def test_groq_free_models_contain_only_live_ids():
@@ -350,9 +351,19 @@ def test_groq_free_models_contain_only_live_ids():
 def test_gemini_free_models_contain_no_retired_2_0_models():
     assert not any(m.startswith("gemini-2.0")
                    for m in FREE_MODELS["gemini"])
-    assert FREE_MODELS["gemini"] == ["gemini-3.8-flash", "gemini-3.6-flash",
-                                     "gemini-3.5-flash-lite",
-                                     "gemini-2.5-flash"]
+    # gemini-2.5-* dies 2026-12-01 — must be gone from the free list.
+    assert not any(m.startswith("gemini-2.5")
+                   for m in FREE_MODELS["gemini"])
+    # Gemini leg is focused on the two new free models only (Wallace
+    # 2026-11-16): gemini-4-hydrogen for chat; gemini-decision-1 for
+    # decisions (DECISION_MODELS, never chat). The old 3.8/3.6/
+    # 3.5-flash-lite fallbacks were removed the same day.
+    assert FREE_MODELS["gemini"] == ["gemini-4-hydrogen"]
+    assert not any(m in FREE_MODELS["gemini"] for m in
+                   ("gemini-3.8-flash", "gemini-3.6-flash",
+                    "gemini-3.5-flash-lite"))
+    assert DECISION_MODELS["gemini"] == ["gemini-decision-1"]
+    assert FREE_MODELS["gemini"][0] == "gemini-4-hydrogen"
 
 
 def test_openrouter_free_list_includes_crouton_alpha():
@@ -377,7 +388,7 @@ def test_free_cascade_chat_models_use_live_ids():
                "llama-3.1-8b-instant", "gemini-2.0-flash"}
     assert not (retired & {m for m in _CHAT_MODELS.values() if m})
     assert _CHAT_MODELS["GROQ"] == "qwen/qwen3.8-27b"
-    assert _CHAT_MODELS["GEMINI"] == "gemini-3.8-flash"
+    assert _CHAT_MODELS["GEMINI"] == "gemini-4-hydrogen"
     assert QWEN_GROQ_MODEL == "qwen/qwen3.8-27b"
     assert qwen_model("groq") == "qwen/qwen3.8-27b"
 

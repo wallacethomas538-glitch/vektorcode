@@ -9,7 +9,7 @@ import json
 import pytest
 
 import app
-from app import (FREE_MODELS, PROVIDERS, QWEN_SOURCE, default_model,
+from app import (DECISION_MODELS, FREE_MODELS, PROVIDERS, QWEN_SOURCE, default_model,
                  provider_models)
 from vektor_cloud.egress import VEKTOR_EGRESS_ALLOWLIST
 from vektor_cloud.storage import DashboardStore
@@ -155,7 +155,12 @@ def test_qwen_unconfigured_reports_route_none_honestly():
 def test_free_model_lists_only_free_models():
     assert "qwen/qwen3.8-27b" in FREE_MODELS["groq"]
     assert "openai/gpt-oss-120b" in FREE_MODELS["groq"]
-    assert "gemini-3.8-flash" in FREE_MODELS["gemini"]
+    # Gemini chat list is gemini-4-hydrogen ONLY (Wallace 2026-11-16:
+    # focused on the two new free models; old 3.8/3.6/3.5-flash-lite
+    # fallbacks removed). gemini-decision-1 is the second free model
+    # and lives in DECISION_MODELS — Decisions API only, never chat.
+    assert FREE_MODELS["gemini"] == ["gemini-4-hydrogen"]
+    assert DECISION_MODELS["gemini"] == ["gemini-decision-1"]
     # OpenRouter entries are :free variants — except Crouton Alpha
     # (stealth/crouton-alpha), which is free by $0 preview pricing
     # rather than a :free suffix (Nov 3 2026).

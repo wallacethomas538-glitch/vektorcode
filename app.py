@@ -33,7 +33,7 @@ QWEN_SOURCE = "https://github.com/wallacethomas538-glitch/Qwen3"
 PROVIDERS = [
     ('local', 'Local (Ollama)', 'OLLAMA_BASE_URL', 'local', 'llama3.2'),
     ('groq', 'Groq', 'GROQ_KEYS', 'https://api.groq.com/openai/v1/chat/completions', 'qwen/qwen3.8-27b'),
-    ('gemini', 'Gemini', 'GEMINI_KEYS', 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', 'gemini-3.8-flash'),
+    ('gemini', 'Gemini', 'GEMINI_KEYS', 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', 'gemini-4-hydrogen'),
     ('openrouter', 'OpenRouter', 'OPENROUTER_KEYS', 'https://openrouter.ai/api/v1/chat/completions', 'openrouter/auto'),
     ('meta', 'Meta', 'META_KEYS', 'https://api.llama.com/v1/chat/completions', 'Llama-4-Scout-17B-16E-Instruct-FP8'),
     ('qwen', 'Qwen', 'GROQ_KEYS', 'https://api.groq.com/openai/v1/chat/completions', 'qwen/qwen3.8-27b'),
@@ -48,8 +48,13 @@ PROVIDERS = [
 FREE_MODELS = {
     'local': ['llama3.2', 'qwen2.5:7b', 'qwen3:8b'],
     'groq': ['qwen/qwen3.8-27b', 'openai/gpt-oss-120b', 'openai/gpt-oss-20b'],
-    'gemini': ['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3.5-flash-lite',
-               'gemini-2.5-flash'],
+    # Gemini: gemini-4-hydrogen ONLY (released 2026-11-12; input, output
+    # and context caching free on the Gemini API free tier). Wallace's
+    # order 2026-11-16: the Gemini leg is focused on the two new free
+    # models only. gemini-2.5-flash was removed — Google shuts down all
+    # gemini-2.5 models on 2026-12-01. gemini-3.8/3.6/3.5-flash-lite
+    # were removed the same day — old models, free-tier status unverified.
+    'gemini': ['gemini-4-hydrogen'],
     'openrouter': ['meta-llama/llama-3.3-70b-instruct:free', 'qwen/qwen3-32b:free',
                    'deepseek/deepseek-r1:free', 'google/gemma-3-27b-it:free',
                    'stealth/crouton-alpha'],
@@ -61,6 +66,17 @@ FREE_MODELS = {
                  'Qwen/Qwen2.5-7B-Instruct-Turbo', 'deepseek-ai/DeepSeek-R1'],
     'huggingface': ['Qwen/Qwen2.5-7B-Instruct', 'meta-llama/Llama-3.2-3B-Instruct',
                     'google/gemma-2-9b-it'],
+}
+# Decision-only models (NOT chat models). gemini-decision-1 is the second
+# new free Gemini model (released 2026-11-11; input free on the free tier,
+# 10,000 requests/day, zero output tokens). It answers only through
+# Google's Decisions API (/v1beta/decisions) — yes/no/choice/rubric calls.
+# It is NOT wired to any endpoint here; this registry names it so the
+# Gemini leg's free set is exactly the two new free models, and so a
+# future decision tool knows which model to use. Never put it in
+# FREE_MODELS — the chat path would try it as a chat model and fail.
+DECISION_MODELS = {
+    'gemini': ['gemini-decision-1'],
 }
 # Cross-provider fallback order for chat: when the selected provider's
 # call fails with a rotatable status (or the provider is unreachable),
