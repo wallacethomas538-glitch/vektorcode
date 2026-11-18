@@ -1,4 +1,4 @@
-"""Living code graph for VektorCode (codegraph-skill, 2026-11-18).
+"""VektorGraph — the living code graph for VektorCode (codegraph-skill, 2026-11-18).
 
 Parses a Python repo with Tree-sitter, stores modules / symbols / imports /
 calls in an embedded KuzuDB graph, and answers the impact question:

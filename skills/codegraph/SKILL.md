@@ -1,9 +1,9 @@
 ---
-name: codegraph
-description: Build and query a living graph of the codebase (Tree-sitter + KuzuDB) so you can answer "what breaks if I touch this?" before editing, instead of re-reading files every session and breaking working code you do not understand.
+name: VektorGraph
+description: VektorGraph — a living graph of the codebase (Tree-sitter + KuzuDB) so you can answer "what breaks if I touch this?" before editing, instead of re-reading files every session and breaking working code you do not understand.
 ---
 
-# Codegraph
+# VektorGraph
 
 You are working with a living map of the codebase, not a pile of text files.
 Build the graph once, then ask it before you touch anything.
