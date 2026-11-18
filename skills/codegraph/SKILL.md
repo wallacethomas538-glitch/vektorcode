@@ -1,0 +1,75 @@
+---
+name: codegraph
+description: Build and query a living graph of the codebase (Tree-sitter + KuzuDB) so you can answer "what breaks if I touch this?" before editing, instead of re-reading files every session and breaking working code you do not understand.
+---
+
+# Codegraph
+
+You are working with a living map of the codebase, not a pile of text files.
+Build the graph once, then ask it before you touch anything.
+
+## What it is
+
+`vektor_cloud/codegraph.py` parses every Python file in a repo with
+Tree-sitter, stores modules, symbols, imports and calls in an embedded
+KuzuDB graph (no server), and answers impact questions. It is the
+codebase's memory: functions, classes, who calls them, who imports them.
+
+## When to use it
+
+- Before editing any function, class or module: ask the graph what calls
+  it and what imports it. If the answer is wide, say so and be careful.
+- When you are about to claim work is done: the graph is part of the
+  proof — name what the change touches.
+- When you are new to a repo: build the graph first instead of reading
+  files one by one.
+
+## How to use it
+
+The module needs `tree-sitter`, `tree-sitter-python` and `kuzu`
+installed. Check first, through the approval-gated shell:
+
+```python
+from vektor_cloud.codegraph import available
+available()  # True means the graph can run
+```
+
+If it is False, say so plainly and do not claim a graph exists. Install
+with `pip install tree-sitter tree-sitter-python kuzu`, or run where
+those packages are installed. Never invent graph answers.
+
+Build (or rebuild after the code changes) — the database lives under
+the state dir so it survives deploys of new code:
+
+```python
+from vektor_cloud.codegraph import build_graph
+build_graph(repo_root, db_path)  # returns file/module/symbol/call counts
+```
+
+Ask the impact question:
+
+```python
+from vektor_cloud.codegraph import impact, importers
+impact(db_path, "vektor_cloud.skills.load_skill")
+# {"direct": [...exact callers...], "transitive": [...wider callers...]}
+importers(db_path, "vektor_cloud.skills")  # modules importing it
+```
+
+Report direct callers as exact. Report transitive callers as an upper
+bound — say that plainly, because name-based matching can pull in
+same-name functions from other modules.
+
+## Honest limits
+
+- Call resolution is NAME-BASED: `foo()` resolves to any defined symbol
+  named `foo`; `obj.method()` resolves by the last segment. No type
+  inference, no dynamic dispatch.
+- Only static calls visible in the tree are captured. `eval`, `exec`,
+  `getattr` and dynamically built names are missed.
+- The graph goes stale when the code changes. Rebuild it after edits,
+  and never quote an old graph as current.
+- On Render the app is stdlib-only by design, so the graph runs where
+  its dependencies are installed (local, Daytona, or a service with
+  them in requirements.txt) and degrades honestly everywhere else.
+  Adding the dependencies to `requirements.txt` is a deploy decision
+  for Big Chat review, not something to slip in quietly.
