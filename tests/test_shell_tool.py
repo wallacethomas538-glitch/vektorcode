@@ -106,6 +106,38 @@ class ShellToolTest(unittest.TestCase):
         self.assertFalse(res["ok"])
         self.assertIn("already used", res["error"])
 
+    def test_concurrent_calls_execute_exactly_once(self):
+        # F4: 8 threads race the same approval. Exactly one runs the
+        # command; the other 7 are refused as already used, and the
+        # command's effect happens exactly once.
+        approval_id = self._stage_and_approve("echo raced >> raced.txt")
+        args = {"command": "echo raced >> raced.txt",
+                "approval_id": approval_id}
+        results = []
+        errors = []
+
+        def worker():
+            try:
+                results.append(self._call("run_shell", args)[0])
+            except Exception as exc:  # pragma: no cover - safety net
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 8)
+        succeeded = [r for r in results if r.get("ok")]
+        self.assertEqual(len(succeeded), 1, results)
+        refused = [r for r in results if not r.get("ok")]
+        self.assertEqual(len(refused), 7)
+        for r in refused:
+            self.assertIn("already used", r.get("error", ""))
+        text = (app.VEKTOR_STATE / "sandbox" / "raced.txt").read_text()
+        self.assertEqual(text.strip().splitlines(), ["raced"])
+
     def test_unapproved_call_refused(self):
         res, _ = self._call("run_shell", {"command": "echo hi"})
         approval_id = res["approval_id"]

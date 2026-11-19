@@ -8,6 +8,8 @@ import unittest
 from pathlib import Path
 
 from vektor_cloud.skills import (
+    _note_info,
+    _skill_dir_info,
     discover_skills,
     format_skill_for_prompt,
     install_skill,
@@ -156,6 +158,120 @@ class DiscoverTest(unittest.TestCase):
         (dest / "stale.txt").write_text("stale")
         install_skill(src, self.repo / "skills", "demo2")
         self.assertFalse((dest / "stale.txt").exists())
+
+
+class SizeEnforcementTest(unittest.TestCase):
+    """F6: file sizes are enforced BEFORE the content is read, and
+    symlink tricks cannot bypass the size or location checks."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.repo = self.base / "repo"
+        self.state = self.base / "state"
+        (self.repo / "skills" / "demo").mkdir(parents=True)
+        (self.repo / "skills" / "demo" / "SKILL.md").write_text(SKILL_MD)
+        (self.repo / "skills" / "demo" / "references").mkdir()
+        (self.repo / "skills" / "demo" / "references" / "guide.md").write_text(
+            "guide content")
+        (self.state / "skills").mkdir(parents=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _slugs(self):
+        return {s["slug"] for s in discover_skills(self.repo, self.state)}
+
+    def test_oversized_skill_md_skipped(self):
+        big = self.repo / "skills" / "big"
+        big.mkdir()
+        (big / "SKILL.md").write_text("x" * 100_000)
+        self.assertNotIn("big", self._slugs())
+        self.assertIsNone(load_skill(self.repo, self.state, "big"))
+        self.assertIsNone(_skill_dir_info(big))
+
+    def test_oversized_reference_refused(self):
+        (self.repo / "skills" / "demo" / "references" / "huge.md").write_text(
+            "y" * 100_000)
+        self.assertIsNone(load_skill_reference(
+            self.repo, self.state, "demo", "references/huge.md"))
+
+    def test_symlink_skill_md_outside_refused(self):
+        # Even a SMALL file outside the skill dir must be refused:
+        # this is the location rule, not the size rule.
+        outside = self.base / "outside.md"
+        outside.write_text(SKILL_MD)
+        linked = self.repo / "skills" / "linked"
+        linked.mkdir()
+        (linked / "SKILL.md").symlink_to(outside)
+        self.assertNotIn("linked", self._slugs())
+        self.assertIsNone(load_skill(self.repo, self.state, "linked"))
+        self.assertIsNone(_skill_dir_info(linked))
+
+    def test_symlinked_skill_dir_skipped(self):
+        real = self.base / "real-skill"
+        real.mkdir()
+        (real / "SKILL.md").write_text(SKILL_MD)
+        (self.repo / "skills" / "fake").symlink_to(real, target_is_directory=True)
+        self.assertNotIn("fake", self._slugs())
+        self.assertIsNone(load_skill(self.repo, self.state, "fake"))
+
+    def test_symlink_reference_to_huge_inside_refused(self):
+        # The huge target lives INSIDE the skill dir, so it passes the
+        # path jail — the size check must still refuse it.
+        (self.repo / "skills" / "demo" / "huge-target.md").write_text(
+            "z" * 100_000)
+        (self.repo / "skills" / "demo" / "references" / "big.md").symlink_to(
+            self.repo / "skills" / "demo" / "huge-target.md")
+        self.assertIsNone(load_skill_reference(
+            self.repo, self.state, "demo", "references/big.md"))
+
+    def test_symlink_reference_outside_refused(self):
+        outside = self.base / "outside-ref.md"
+        outside.write_text("small but outside")
+        (self.repo / "skills" / "demo" / "references" / "escape.md").symlink_to(
+            outside)
+        self.assertIsNone(load_skill_reference(
+            self.repo, self.state, "demo", "references/escape.md"))
+
+    def test_symlinked_note_refused(self):
+        outside = self.base / "outside-note.md"
+        outside.write_text("## Note\nOutside note body.")
+        (self.state / "skills" / "note-link.md").symlink_to(outside)
+        self.assertNotIn("note-link", self._slugs())
+        self.assertIsNone(_note_info(self.state / "skills" / "note-link.md"))
+
+    def test_multibyte_body_loads_fully(self):
+        # 11,000 'e-acute' = 22,000 bytes: under the byte pre-check,
+        # and 11,000 chars < the 12,000-char cap, so all of it loads.
+        body = "é" * 11_000
+        mb = self.repo / "skills" / "multibyte"
+        mb.mkdir()
+        (mb / "SKILL.md").write_text(body)
+        skill = load_skill(self.repo, self.state, "multibyte")
+        self.assertIsNotNone(skill)
+        self.assertEqual(len(skill["body"]), 11_000)
+        self.assertEqual(skill["body"], body)
+
+    def test_fifty_thousand_char_body_refused_not_truncated(self):
+        # 50,000 ASCII chars = 50,000 bytes > the 49,024-byte pre-check,
+        # so the skill is refused outright, not silently truncated.
+        big = self.repo / "skills" / "huge-body"
+        big.mkdir()
+        (big / "SKILL.md").write_text("x" * 50_000)
+        self.assertNotIn("huge-body", self._slugs())
+        self.assertIsNone(load_skill(self.repo, self.state, "huge-body"))
+
+    def test_body_just_over_cap_truncates(self):
+        # 13,000 ASCII chars pass the byte pre-check (13,000 < 49,024)
+        # but exceed the 12,000-char cap: the body is truncated to the
+        # cap, which is the documented boundary behaviour.
+        over = self.repo / "skills" / "over-cap"
+        over.mkdir()
+        (over / "SKILL.md").write_text("x" * 13_000)
+        skill = load_skill(self.repo, self.state, "over-cap")
+        self.assertIsNotNone(skill)
+        self.assertEqual(len(skill["body"]), 12_000)
 
 
 if __name__ == "__main__":

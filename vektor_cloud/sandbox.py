@@ -6,10 +6,22 @@ environment scrubbing (no key material leaks into child processes).
 import os
 import subprocess
 
+try:
+    import resource
+except ImportError:  # pragma: no cover - non-Unix platforms
+    resource = None
+
 MAX_WRITE_CHARS = 20000
 MAX_READ_CHARS = 8000
 MAX_OUTPUT_CHARS = 4000
 DEFAULT_TIMEOUT = 120
+
+# F5: per-command resource caps, enforced with rlimits in the child
+# (see _limit_child). Render's free tier gives the whole instance
+# 512 MB, so the child cannot have more than that — the trade-off is
+# real: a shell that grabbed the full 512 MB would starve the server
+# itself, which is why this is a bound, not a guarantee of headroom.
+SANDBOX_MAX_MEMORY_BYTES = 512 * 1024 * 1024
 
 # Env keys ending with any of these (case-insensitive) are scrubbed before
 # a child process runs. Keys never leave the parent process.
@@ -22,6 +34,24 @@ _SCRUB_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD",
 
 class SandboxEscape(Exception):
     """Raised when a path would escape the sandbox root."""
+
+
+def _limit_child(cpu_seconds: int):
+    """preexec_fn: cap the child process's CPU and address space (F5).
+
+    Runs in the child after fork, before exec — only plain
+    setrlimit syscalls here, never anything that takes a lock
+    (preexec_fn runs while the parent's other threads are frozen).
+    RLIMIT_CPU is seconds of CPU time (soft == hard: SIGXCPU, then
+    SIGKILL if the process ignores it); RLIMIT_AS caps virtual
+    memory. Both limits are inherited by the child's children, so
+    the whole process tree is bounded.
+    """
+    if resource is None:
+        return
+    resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
+    resource.setrlimit(resource.RLIMIT_AS,
+                       (SANDBOX_MAX_MEMORY_BYTES, SANDBOX_MAX_MEMORY_BYTES))
 
 
 class Sandbox:
@@ -75,12 +105,26 @@ class Sandbox:
         return env
 
     def run(self, cmd: list, timeout: int = DEFAULT_TIMEOUT,
-            extra_env: dict | None = None) -> dict:
-        """Run cmd with cwd=root and a scrubbed environment."""
+            extra_env: dict | None = None,
+            cpu_seconds: int | None = None) -> dict:
+        """Run cmd with cwd=root, a scrubbed environment, and F5
+        resource caps (CPU = cpu_seconds, defaulting to the wall
+        timeout; address space = 512 MB).
+
+        NOT enforced, and documented as such: process count
+        (RLIMIT_NPROC counts per real UID, and the shell shares its
+        UID with the server itself, so it is not a safe per-command
+        limit — a fork bomb is bounded only by the wall-clock
+        timeout) and network egress (no per-process block exists
+        without namespaces/iptables, which need root — the egress
+        allowlist covers only the app's own HTTP, not the shell).
+        """
+        cpu_limit = timeout if cpu_seconds is None else max(1, cpu_seconds)
         try:
             r = subprocess.run(cmd, cwd=self._root, capture_output=True,
                                text=True, timeout=timeout,
-                               env=self._scrubbed_env(extra_env))
+                               env=self._scrubbed_env(extra_env),
+                               preexec_fn=lambda: _limit_child(cpu_limit))
             return {"returncode": r.returncode,
                     "stdout": r.stdout[:MAX_OUTPUT_CHARS],
                     "stderr": r.stderr[:MAX_OUTPUT_CHARS],

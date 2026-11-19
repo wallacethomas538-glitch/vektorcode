@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """VektorCode dashboard: dependency-free local control plane."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import base64, hashlib, hmac, json, os, secrets, sqlite3, time, uuid
+import base64, hashlib, hmac, json, os, secrets, sqlite3, threading, time, uuid
 from urllib.request import Request, urlopen
 from urllib.parse import urlencode, unquote, urlparse, parse_qs
 import re
@@ -395,6 +395,51 @@ SHELL_CALL_CAP_PER_SESSION = 5
 # (unapproved) approvals, which must then be staged again.
 _SHELL_APPROVALS = {}
 _SHELL_CALL_COUNTS = {}
+# F4: every read-modify-write on the approval dicts goes through this
+# lock (consume, approve, stage, list). Without it, two threads
+# calling run_shell with the same approval_id could both pass the
+# checks before either marked it used, and the command would run
+# twice on one approval. The lock is never held during subprocess
+# execution — only for the validate + mark-used step.
+_SHELL_APPROVALS_LOCK = threading.Lock()
+
+
+def _consume_shell_approval(approval_id: str, command: str,
+                            sid: str) -> str | None:
+    """Atomically validate and consume one shell approval (F4).
+
+    Under _SHELL_APPROVALS_LOCK: check unknown/used/expired/
+    unapproved/command+session match/session cap, then mark the
+    approval used and reserve one slot of the per-session cap.
+    Returns None when the approval is consumed (the caller may run
+    the command), or the refusal message otherwise. The entry stays
+    in the dict with used=True so a second call still reports
+    "already used" instead of "unknown".
+    """
+    with _SHELL_APPROVALS_LOCK:
+        ap = _SHELL_APPROVALS.get(approval_id)
+        if ap is None:
+            return ("Unknown approval_id; stage the command again "
+                    "without approval_id")
+        if ap["used"]:
+            return ("Approval already used (single-use); stage the "
+                    "command again")
+        if time.time() > ap["expires"]:
+            return ("Approval expired (10 minutes); stage the command "
+                    "again")
+        if not ap["approved"]:
+            return ("Command not yet approved by Wallace; approve via "
+                    "POST /api/shell/approve, then call again")
+        if ap["command"] != command or ap["session_id"] != (sid or ""):
+            return ("approval_id does not match this exact "
+                    "command/session")
+        count = _SHELL_CALL_COUNTS.get(sid or "", 0)
+        if count >= SHELL_CALL_CAP_PER_SESSION:
+            return ("Shell call cap reached for this session "
+                    "(5 executed commands)")
+        ap["used"] = True
+        _SHELL_CALL_COUNTS[sid or ""] = count + 1
+        return None
 # A model can emit tool_calls for any name, so write-capable names are
 # refused before any network call. Substrings, uppercased. The Composio
 # meta-tools are exempt: they are the sanctioned discovery path when
@@ -862,10 +907,11 @@ class Handler(BaseHTTPRequestHandler):
         approval_id = args.get("approval_id", "")
         if not isinstance(approval_id, str) or not approval_id:
             approval_id = str(uuid.uuid4())
-            _SHELL_APPROVALS[approval_id] = {
-                "command": command, "session_id": sid or "",
-                "expires": time.time() + SHELL_APPROVAL_TTL_SECONDS,
-                "approved": False, "used": False}
+            with _SHELL_APPROVALS_LOCK:
+                _SHELL_APPROVALS[approval_id] = {
+                    "command": command, "session_id": sid or "",
+                    "expires": time.time() + SHELL_APPROVAL_TTL_SECONDS,
+                    "approved": False, "used": False}
             receipt("shell_staged",
                     {"approval_id": approval_id,
                      "command": command[:500]}, True)
@@ -876,40 +922,17 @@ class Handler(BaseHTTPRequestHandler):
                               "/api/shell/approve with this approval_id), "
                               "then call run_shell again with the same "
                               "command and approval_id.")}, "run_shell")
-        ap = _SHELL_APPROVALS.get(approval_id)
-        if ap is None:
-            return ({"ok": False,
-                     "error": "Unknown approval_id; stage the command "
-                              "again without approval_id"}, "run_shell")
-        if ap["used"]:
-            return ({"ok": False,
-                     "error": "Approval already used (single-use); stage "
-                              "the command again"}, "run_shell")
-        if time.time() > ap["expires"]:
-            return ({"ok": False,
-                     "error": "Approval expired (10 minutes); stage the "
-                              "command again"}, "run_shell")
-        if not ap["approved"]:
-            return ({"ok": False,
-                     "error": "Command not yet approved by Wallace; "
-                              "approve via POST /api/shell/approve, then "
-                              "call again"}, "run_shell")
-        if ap["command"] != command or ap["session_id"] != (sid or ""):
-            return ({"ok": False,
-                     "error": "approval_id does not match this exact "
-                              "command/session"}, "run_shell")
-        count = _SHELL_CALL_COUNTS.get(sid or "", 0)
-        if count >= SHELL_CALL_CAP_PER_SESSION:
-            return ({"ok": False,
-                     "error": "Shell call cap reached for this session "
-                              "(5 executed commands)"}, "run_shell")
+        # F4: validate + consume atomically; the lock is released
+        # before the subprocess runs, so concurrent calls cannot both
+        # execute on one approval.
+        refusal = _consume_shell_approval(approval_id, command, sid)
+        if refusal is not None:
+            return ({"ok": False, "error": refusal}, "run_shell")
         try:
             timeout_s = int(args.get("timeout", SANDBOX_TIMEOUT))
         except (TypeError, ValueError):
             timeout_s = SANDBOX_TIMEOUT
         timeout_s = max(1, min(120, timeout_s))
-        ap["used"] = True
-        _SHELL_CALL_COUNTS[sid or ""] = count + 1
         sandbox = Sandbox(str(self._shell_workdir()))
         result = sandbox.run(["/bin/sh", "-c", command],
                              timeout=timeout_s)
@@ -1746,11 +1769,15 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/shell/approvals":
             if not require_auth(self): self.send_json({"ok": False, "error": "Authentication required", "retryable": False}, 401); return
             now = time.time()
+            # F4: snapshot under the lock so a concurrent consume
+            # cannot mutate the dict mid-iteration.
+            with _SHELL_APPROVALS_LOCK:
+                items = list(_SHELL_APPROVALS.items())
             pending = [{"approval_id": aid, "command": ap["command"],
                         "session_id": ap["session_id"],
                         "approved": ap["approved"], "used": ap["used"],
                         "expires_in_s": max(0, int(ap["expires"] - now))}
-                       for aid, ap in _SHELL_APPROVALS.items()
+                       for aid, ap in items
                        if not ap["used"] and now <= ap["expires"]]
             self.send_json({"approvals": pending}); return
         if self.path == "/api/voice/status":
@@ -1901,14 +1928,18 @@ class Handler(BaseHTTPRequestHandler):
             approval_id = data.get("approval_id", "")
             if not isinstance(approval_id, str) or not approval_id:
                 self.send_json({"ok":False,"error":"approval_id is required"}, 400); return
-            ap = _SHELL_APPROVALS.get(approval_id)
-            if ap is None:
-                self.send_json({"ok":False,"error":"Unknown approval_id"}, 404); return
-            if ap["used"]:
-                self.send_json({"ok":False,"error":"Approval already used"}, 409); return
-            if time.time() > ap["expires"]:
-                self.send_json({"ok":False,"error":"Approval expired"}, 410); return
-            ap["approved"] = True
+            # F4: the approve write goes through the same lock as the
+            # consume step, so an approval cannot be approved and
+            # consumed in a torn state.
+            with _SHELL_APPROVALS_LOCK:
+                ap = _SHELL_APPROVALS.get(approval_id)
+                if ap is None:
+                    self.send_json({"ok":False,"error":"Unknown approval_id"}, 404); return
+                if ap["used"]:
+                    self.send_json({"ok":False,"error":"Approval already used"}, 409); return
+                if time.time() > ap["expires"]:
+                    self.send_json({"ok":False,"error":"Approval expired"}, 410); return
+                ap["approved"] = True
             receipt("shell_approved", {"approval_id": approval_id, "command": ap["command"][:500]}, True, True)
             self.send_json({"ok":True, "approval_id": approval_id, "command": ap["command"]}); return
         if path == "/api/login":
