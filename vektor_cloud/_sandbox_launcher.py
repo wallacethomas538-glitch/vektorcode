@@ -29,6 +29,14 @@ and fail there. The subreaper needs no privilege and works in both
 places. It does NOT add filesystem or network containment — F3
 Decision B is unchanged; the shell child is still cwd-only.
 
+Fail-closed inspection (follow-up 7): the teardown's child
+enumeration distinguishes ordinary exit races from incomplete
+inspection. A process whose ``/proc`` entry cannot be read for a
+reason other than its exit is never treated as absent, and an
+unlistable ``/proc`` is never treated as an empty tree: both
+report ``teardown_complete: false``. Only an empty,
+fully-inspected enumeration ever reports complete.
+
 Usage:
   python3 _sandbox_launcher.py <cpu_seconds> <mem_bytes> <report_fd> <cmd...>
 report_fd is a file descriptor to write one JSON status line to at
@@ -65,6 +73,27 @@ _SYS_PIDFD_SEND_SIGNAL = 424
 # the parent to observe it.
 _TEARDOWN_ROUNDS = 30
 _TEARDOWN_DELAY_S = 0.1
+
+
+class _IncompleteChildScan(Exception):
+    """A _children_of scan could not inspect every process.
+
+    Carries .found (the partial {pid: starttime} snapshot) and
+    .pids (the pids whose /proc entries could not be inspected).
+    Raised for inspection errors that do NOT establish that the
+    process exited — e.g. PermissionError. Exit races
+    (FileNotFoundError / ProcessLookupError) and torn reads
+    (ValueError / IndexError) are still skipped silently by
+    _children_of: those are the ordinary case of a process dying
+    between the directory listing and the stat read.
+    """
+
+    def __init__(self, found, pids):
+        super().__init__(
+            f"incomplete child scan: {len(pids)} process(es) "
+            "could not be inspected")
+        self.found = found
+        self.pids = pids
 
 
 def _libc():
@@ -148,12 +177,24 @@ def _children_of(pid):
     """{pid: starttime} for processes whose parent is pid.
 
     Returns None when /proc cannot be listed at all — the caller
-    must treat that as "unknown", never as "no children"."""
+    must treat that as "unknown", never as "no children".
+    Raises _IncompleteChildScan when individual entries cannot be
+    inspected for a reason other than the process having exited:
+    a process whose /proc entry is unreadable must never be
+    treated as absent — it may still be alive. Exit races
+    (FileNotFoundError, ProcessLookupError) and torn reads
+    (ValueError, IndexError) are skipped silently: those are the
+    ordinary case of a process dying between the directory
+    listing and the stat read. (Follow-up 7: the previous version
+    caught every OSError here, so a PermissionError on a live
+    daemon's /proc entry was silently skipped and the teardown
+    could report complete with the daemon still alive.)"""
     found = {}
     try:
         names = os.listdir("/proc")
     except OSError:
         return None
+    inaccessible = []
     for name in names:
         if not name.isdigit():
             continue
@@ -164,8 +205,13 @@ def _children_of(pid):
             rest = raw[raw.rfind(b")") + 2:].split()
             if int(rest[1]) == pid:
                 found[child] = int(rest[19])
-        except (OSError, ValueError, IndexError):
+        except (FileNotFoundError, ProcessLookupError,
+                ValueError, IndexError):
             continue
+        except OSError:
+            inaccessible.append(child)
+    if inaccessible:
+        raise _IncompleteChildScan(found, inaccessible)
     return found
 
 
@@ -193,11 +239,26 @@ def _teardown(child_pid=None):
     When /proc cannot be inspected at all (children is None), the
     known command child is still killed by pid and the teardown is
     reported incomplete — "unknown" is never reported as clean.
+    When a scan is incomplete (_IncompleteChildScan), the visible
+    children are still killed (best effort) and the teardown is
+    reported incomplete — an unreadable process is never treated
+    as absent. Only an empty, fully-inspected enumeration ever
+    reports complete. (Follow-up 7: the previous final check was
+    `if not _children_of(...)`, which treated None — /proc
+    unlistable — as success. That is fixed here: None and
+    incomplete scans both return False.)
     Returns (complete, orphans_killed, rounds).
     """
     killed = 0
     for round_no in range(1, _TEARDOWN_ROUNDS + 1):
-        children = _children_of(os.getpid())
+        try:
+            children = _children_of(os.getpid())
+        except _IncompleteChildScan as exc:
+            for pid, starttime in sorted(exc.found.items()):
+                if _pidfd_kill(pid, starttime, signal.SIGKILL):
+                    killed += 1
+            _reap_any()
+            return False, killed, round_no
         if children is None:
             if child_pid is not None:
                 starttime = _read_starttime(child_pid)
@@ -214,7 +275,17 @@ def _teardown(child_pid=None):
         _reap_any()
         time.sleep(_TEARDOWN_DELAY_S)
     # One last look: anything still here survived the bound.
-    if not _children_of(os.getpid()):
+    # None (unlistable /proc) or an incomplete scan is NOT success:
+    # only an empty, fully-inspected enumeration completes.
+    try:
+        children = _children_of(os.getpid())
+    except _IncompleteChildScan:
+        _reap_any()
+        return False, killed, _TEARDOWN_ROUNDS
+    if children is None:
+        _reap_any()
+        return False, killed, _TEARDOWN_ROUNDS
+    if not children:
         _reap_any()
         return True, killed, _TEARDOWN_ROUNDS
     _reap_any()

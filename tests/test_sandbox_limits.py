@@ -32,6 +32,14 @@ returns the child's exit code promptly and never reaches the
 timeout path; the -1 timeout sentinel is pinned by a test that
 stubs a stuck supervisor instead, since a live stuck supervisor
 has no deterministic trigger (its teardown bound is 3s).
+
+Follow-up 7: the supervisor's teardown verification is fail-closed
+too. _children_of raises _IncompleteChildScan when an individual
+/proc entry cannot be inspected for a reason other than an exit
+race (a PermissionError on a live daemon's entry is no longer
+silently skipped), and _teardown never reports complete on an
+incomplete scan or an unlistable /proc — the previous final check
+`if not _children_of(...)` treated None as success.
 """
 import os
 import re
@@ -44,6 +52,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from vektor_cloud._sandbox_launcher import (
+    _IncompleteChildScan,
+    _children_of,
+    _read_starttime,
+    _teardown,
+)
 from vektor_cloud.sandbox import (
     Sandbox,
     _kill_tree,
@@ -524,6 +538,176 @@ class ResourceLimitTest(unittest.TestCase):
             if root.poll() is None:
                 root.kill()
             root.wait()
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+class SupervisorInspectionTest(unittest.TestCase):
+    """F5 (follow-up 7): the supervisor's teardown verification
+    must be fail-closed. _children_of distinguishes ordinary
+    exit races from incomplete inspection, and _teardown never
+    reports complete when inspection cannot be established.
+    These tests import the launcher module directly (it is a
+    plain module; main() only runs under __main__), so the
+    enumeration and teardown logic are tested in-process without
+    needing to inject a failure into the launcher subprocess.
+    """
+
+    def _alive(self, pid):
+        # Alive means running, not merely present: a zombie (killed
+        # but not yet reaped by its parent) still answers kill(pid, 0)
+        # with success, so read the state from /proc and treat "Z"
+        # as dead.
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as f:
+                raw = f.read()
+        except OSError:
+            return False
+        rest = raw[raw.rfind(b")") + 2:].split()
+        return rest[0] != b"Z"
+
+    def test_children_of_raises_on_stat_permission_error(self):
+        # A child whose /proc/<pid>/stat cannot be read (e.g.
+        # PermissionError) must NOT be silently skipped: it may
+        # still be alive. _children_of raises _IncompleteChildScan
+        # carrying the partial snapshot and the inaccessible pid.
+        # This is the first manifestation Big Chat found in
+        # follow-up 6: the old code caught every OSError and
+        # continued, so the supervisor could conclude "no children"
+        # with a live daemon it simply could not see.
+        child = subprocess.Popen(["sleep", "30"])
+        try:
+            target = f"/proc/{child.pid}/stat"
+            real_open = open
+
+            def guarded_open(path, *args, **kwargs):
+                if os.fspath(path) == target:
+                    raise PermissionError("cannot inspect (test)")
+                return real_open(path, *args, **kwargs)
+
+            with mock.patch("builtins.open", side_effect=guarded_open):
+                with self.assertRaises(_IncompleteChildScan) as cm:
+                    _children_of(os.getpid())
+            self.assertIn(child.pid, cm.exception.pids)
+        finally:
+            child.kill()
+            child.wait()
+
+    def test_children_of_silently_skips_exit_race(self):
+        # Control for the test above: a FileNotFoundError on a stat
+        # read is an ordinary exit race (the process died between
+        # the listdir and the read) and must NOT raise. The scan
+        # completes; the unreadable entry is simply absent.
+        child = subprocess.Popen(["sleep", "30"])
+        try:
+            target = f"/proc/{child.pid}/stat"
+            real_open = open
+
+            def guarded_open(path, *args, **kwargs):
+                if os.fspath(path) == target:
+                    raise FileNotFoundError("gone (test)")
+                return real_open(path, *args, **kwargs)
+
+            with mock.patch("builtins.open", side_effect=guarded_open):
+                found = _children_of(os.getpid())
+            self.assertNotIn(child.pid, found)
+        finally:
+            child.kill()
+            child.wait()
+
+    def test_children_of_returns_none_when_proc_unlistable(self):
+        # /proc directory enumeration failure: _children_of returns
+        # None ("unknown"), never an empty dict. The caller must
+        # treat it as unknown.
+        with mock.patch("os.listdir",
+                        side_effect=PermissionError("cannot list (test)")):
+            self.assertIsNone(_children_of(os.getpid()))
+
+    def test_teardown_incomplete_on_per_entry_failure(self):
+        # When the scan is incomplete, _teardown reports incomplete
+        # — it never treats an unreadable process as absent.
+        exc = _IncompleteChildScan(found={}, pids=[999999])
+        with mock.patch(
+                "vektor_cloud._sandbox_launcher._children_of",
+                side_effect=exc):
+            complete, killed, rounds = _teardown(child_pid=None)
+        self.assertFalse(complete)
+
+    def test_teardown_kills_visible_children_before_reporting_incomplete(self):
+        # Best effort on an incomplete scan: the visible children
+        # are still killed before the incomplete report.
+        child = subprocess.Popen(["sleep", "30"])
+        try:
+            starttime = _read_starttime(child.pid)
+            self.assertIsNotNone(starttime)
+            exc = _IncompleteChildScan(
+                found={child.pid: starttime}, pids=[999998])
+            with mock.patch(
+                    "vektor_cloud._sandbox_launcher._children_of",
+                    side_effect=exc):
+                complete, killed, rounds = _teardown(child_pid=None)
+            self.assertFalse(complete)
+            self.assertEqual(killed, 1)
+            # SIGKILL is delivered, not instantaneous: poll briefly
+            # for the death instead of asserting it in the same
+            # instant (the signal was just sent; the child may still
+            # be scheduled on another CPU for a few milliseconds).
+            deadline = time.monotonic() + 2.0
+            while self._alive(child.pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertFalse(self._alive(child.pid),
+                             "visible child survived the teardown")
+        finally:
+            try:
+                child.kill()
+            except OSError:
+                pass
+            child.wait()
+
+    def test_teardown_incomplete_when_final_check_cannot_list_proc(self):
+        # The final check after the loop: if /proc cannot be listed
+        # (None), the teardown is incomplete. This is the second
+        # manifestation Big Chat found: the old code was
+        # `if not _children_of(...)`, and None is falsy, so it
+        # entered the successful-completion branch. The stub keeps
+        # the loop running (a non-empty dict each round) and returns
+        # None only on the final check; _TEARDOWN_ROUNDS is patched
+        # to 2 so the test does not wait out the full 30-round bound.
+        calls = {"n": 0}
+
+        def stub(pid):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                return {999999: 12345}  # keeps the loop running
+            return None  # the final check cannot list /proc
+
+        with mock.patch(
+                "vektor_cloud._sandbox_launcher._children_of",
+                side_effect=stub):
+            with mock.patch(
+                    "vektor_cloud._sandbox_launcher._TEARDOWN_ROUNDS", 2):
+                complete, killed, rounds = _teardown(child_pid=None)
+        self.assertFalse(complete)
+
+    def test_teardown_incomplete_when_final_check_scan_incomplete(self):
+        # Same shape, but the final check raises _IncompleteChildScan
+        # instead of returning None: also incomplete, never complete.
+        calls = {"n": 0}
+
+        def stub(pid):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                return {999999: 12345}
+            raise _IncompleteChildScan(found={}, pids=[999999])
+
+        with mock.patch(
+                "vektor_cloud._sandbox_launcher._children_of",
+                side_effect=stub):
+            with mock.patch(
+                    "vektor_cloud._sandbox_launcher._TEARDOWN_ROUNDS", 2):
+                complete, killed, rounds = _teardown(child_pid=None)
+        self.assertFalse(complete)
 
 
 if __name__ == "__main__":
