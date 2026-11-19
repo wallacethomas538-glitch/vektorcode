@@ -176,17 +176,46 @@ def test_build_refuses_existing_file(repo, tmp_path):
 
 
 @needs_deps
-def test_build_replaces_marker_verified_file(repo, tmp_path):
-    # A file carrying the sibling marker IS a verified VektorGraph
-    # database, so a rebuild may replace it.
+def test_build_refuses_forged_marker(repo, tmp_path):
+    # The old marker check accepted any file carrying the predictable
+    # marker string. A forged marker must NOT authorize deletion.
+    # (Negative control: this test FAILS on the follow-up 1 code.)
     victim = tmp_path / "graph.db"
-    victim.write_text("stale database bytes")
+    victim.write_text("unrelated data, do not delete")
     marker = tmp_path / "graph.db.vektorgraph-db"
     marker.write_text("vektorgraph-db-v1\n", encoding="utf-8")
-    stats = codegraph.build_graph(repo, victim)
-    assert stats["complete"] is True
-    assert stats["files"] == 3
-    assert marker.is_file()
+    with pytest.raises(ValueError, match="not a verified VektorGraph database"):
+        codegraph.build_graph(repo, victim)
+    assert victim.read_text() == "unrelated data, do not delete"
+
+
+@needs_deps
+def test_build_refuses_valid_kuzu_db_wrong_schema(repo, tmp_path):
+    # A real KuzuDB database built for something else is not ours,
+    # even though it opens cleanly.
+    import kuzu
+
+    victim = tmp_path / "graph.db"
+    db = kuzu.Database(str(victim))
+    conn = kuzu.Connection(db)
+    conn.execute("CREATE NODE TABLE Other(name STRING, PRIMARY KEY(name))")
+    del conn, db
+    with pytest.raises(ValueError, match="not a verified VektorGraph database"):
+        codegraph.build_graph(repo, victim)
+    assert victim.is_file()
+    check = kuzu.Database(str(victim), read_only=True)
+    names = {r[0] for r in kuzu.Connection(check).execute(
+        "CALL SHOW_TABLES() RETURN name")}
+    assert names == {"Other"}
+
+
+@needs_deps
+def test_build_refuses_random_bytes_file(repo, tmp_path):
+    victim = tmp_path / "graph.db"
+    victim.write_bytes(b"\x00\x01not a database at all\xff\xfe")
+    with pytest.raises(ValueError, match="not a verified VektorGraph database"):
+        codegraph.build_graph(repo, victim)
+    assert victim.read_bytes().startswith(b"\x00\x01")
 
 
 @needs_deps
@@ -199,16 +228,32 @@ def test_build_refuses_symlink_to_repo_root(repo, tmp_path):
 
 
 @needs_deps
-def test_build_replaces_marked_database(repo, tmp_path):
+def test_build_refuses_symlink_to_empty_dir(repo, tmp_path):
+    # The old code resolved the symlink, saw an empty directory, and
+    # rmtree'd the TARGET — an unrelated directory the caller never
+    # meant as the database. The link itself must be refused.
+    # (Negative control: this test FAILS on the follow-up 1 code.)
+    victim = tmp_path / "victim-dir"
+    victim.mkdir()
+    link = tmp_path / "db-link"
+    os.symlink(victim, link)
+    with pytest.raises(ValueError, match="symlink"):
+        codegraph.build_graph(repo, link)
+    assert victim.is_dir()  # untouched
+    assert list(victim.iterdir()) == []
+
+
+@needs_deps
+def test_build_replaces_real_database(repo, tmp_path):
+    # A database built by build_graph() verifies by its actual schema,
+    # so a rebuild may replace it.
     db = tmp_path / "graph.db"
     first = codegraph.build_graph(repo, db)
     assert first["complete"] is True
     assert db.is_file()  # KuzuDB stores the database as a single file
-    assert (tmp_path / "graph.db.vektorgraph-db").is_file()
     second = codegraph.build_graph(repo, db)
     assert second["complete"] is True
     assert second["files"] == 3
-    assert (tmp_path / "graph.db.vektorgraph-db").is_file()
 
 
 # --- Correction 3: incomplete graph detection --------------------------
@@ -249,6 +294,44 @@ def test_build_strict_fails_on_parse_failure(repo, tmp_path):
     (tmp_path / "broken.py").mkdir()
     with pytest.raises(RuntimeError, match="incomplete.*broken.py"):
         codegraph.build_graph(repo, tmp_path / "graph.db", strict=True)
+
+
+@needs_deps
+def test_build_records_malformed_python(repo, tmp_path):
+    # Tree-sitter's has_error marks this file: a syntax error is a
+    # failed file, never a partial graph, and never "complete".
+    (tmp_path / "bad.py").write_text("def broken(:\n    pass\n")
+    stats = codegraph.build_graph(repo, tmp_path / "graph.db")
+    assert stats["complete"] is False
+    assert stats["files"] == 4
+    assert stats["files_parsed"] == 3
+    assert [entry["path"] for entry in stats["failed_files"]] == ["bad.py"]
+    assert "SyntaxError" in stats["failed_files"][0]["error"]
+    assert stats["modules"] == 3  # the good files still build
+
+
+@needs_deps
+def test_build_strict_preserves_previous_graph(repo, tmp_path):
+    # A failed strict build must leave the previous graph intact:
+    # parse and validate happen BEFORE the old database is replaced.
+    # (Negative control: this test FAILS on the follow-up 1 code,
+    # which deleted the database before parsing.)
+    db = tmp_path / "graph.db"
+    first = codegraph.build_graph(repo, db)
+    assert first["complete"] is True
+    before = codegraph.stats(db)
+    assert before["modules"] == 3
+    assert before["symbols"] == 6
+    # Break a file after the good build.
+    (tmp_path / "a.py").write_text("def broken(:\n    pass\n")
+    with pytest.raises(RuntimeError, match="incomplete.*a.py"):
+        codegraph.build_graph(repo, db, strict=True)
+    # The old graph is still there, answering as before.
+    assert db.is_file()
+    after = codegraph.stats(db)
+    assert after == before
+    assert set(codegraph.impact(db, "a.foo")["direct"]) == {
+        "a.bar", "a.Calc.calc", "b.use"}
 
 
 @needs_deps

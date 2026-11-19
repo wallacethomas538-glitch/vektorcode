@@ -39,13 +39,18 @@ Honest limits (by design, not hidden):
     present an incomplete graph as complete; pass ``strict=True`` to
     fail the build instead.
   - The database file is REPLACED on rebuild. build_graph() only
-    replaces a file it can verify is a VektorGraph database (a marker
-    file written next to it after a successful build) or an empty
-    directory. It refuses to delete the repository, anything
-    containing it, the filesystem root, the home directory, an
-    existing file without the marker, or any non-empty directory.
+    replaces a file it can verify is a VektorGraph database: it opens
+    the file read-only and checks the actual tables against the
+    expected schema. A marker string is NOT verification — anyone can
+    write the marker next to an unrelated file. It refuses to delete
+    the repository, anything containing it, the filesystem root, the
+    home directory, a symlink destination, an unverified file, or any
+    non-empty directory. The old database is replaced only AFTER the
+    code is parsed and validated, so a failed strict build leaves the
+    previous graph intact.
 """
 
+import os
 import shutil
 from pathlib import Path
 
@@ -80,11 +85,29 @@ def _require_available() -> None:
         )
 
 
-# Marker written NEXT TO every database file build_graph() creates
-# (the database itself is a single KuzuDB file, not a directory).
-# Only a file carrying this sibling marker may be replaced on rebuild.
-_DB_MARKER_SUFFIX = ".vektorgraph-db"
-_DB_MARKER_CONTENT = "vektorgraph-db-v1\n"
+# The tables a VektorGraph database must have. Replacement of an
+# existing database file is allowed only when the file opens read-only
+# as a KuzuDB database AND contains all of these — the schema is the
+# verification. A marker string is not verification: anyone can write
+# it next to an unrelated file, so it proves nothing.
+_EXPECTED_TABLES = frozenset({"Module", "Symbol", "DEFINES", "IMPORTS", "CALLS"})
+
+
+def _is_vektorgraph_db(db_path) -> bool:
+    """True only when the file is a KuzuDB database with our schema.
+
+    Opens the file read-only and checks the actual tables. Anything
+    that cannot be opened, or lacks the expected tables, is not a
+    VektorGraph database — including a valid KuzuDB database built for
+    something else, an empty file, and random bytes.
+    """
+    try:
+        db = kuzu.Database(str(db_path), read_only=True)
+        conn = kuzu.Connection(db)
+        tables = {row[0] for row in conn.execute("CALL SHOW_TABLES() RETURN name")}
+        return _EXPECTED_TABLES <= tables
+    except Exception:
+        return False
 
 
 def _validate_db_path(repo_root, db_path) -> Path:
@@ -92,9 +115,17 @@ def _validate_db_path(repo_root, db_path) -> Path:
 
     Returns the resolved path. Raises ValueError when the path is unsafe
     to replace: the filesystem root, the home directory, the repository
-    itself, or anything containing the repository. Symlinks are resolved
-    first, so a link to a protected directory is caught too.
+    itself, or anything containing the repository. A symlink destination
+    is refused outright — resolving it could point the deletion at an
+    unrelated directory, so the link is checked before resolve() hides
+    it. Symlinks are resolved first for the remaining checks, so a link
+    to a protected directory is caught too.
     """
+    if os.path.islink(db_path):
+        raise ValueError(
+            f"refusing to use database path {db_path}: it is a symlink; "
+            "a symlink destination must never be deleted"
+        )
     repo_root = Path(repo_root).resolve()
     db_path = Path(db_path).resolve()
     for guard in (Path("/").resolve(), Path.home().resolve(), repo_root):
@@ -110,11 +141,10 @@ def _prepare_db_path(db_path: Path) -> None:
     """Make room for a fresh database, deleting only what is verified.
 
     The database is a single KuzuDB file. An existing file is removed
-    only when its sibling marker (written by build_graph() after a
-    successful build) verifies it is a VektorGraph database. An
-    existing directory is removed only when empty — a directory is
-    never a KuzuDB database, so a non-empty one is never deleted.
-    Anything else raises instead of being deleted.
+    only when _is_vektorgraph_db() verifies it — a read-only open plus
+    the expected schema. An existing directory is removed only when
+    empty — a directory is never a KuzuDB database, so a non-empty one
+    is never deleted. Anything else raises instead of being deleted.
     """
     if not db_path.exists():
         return
@@ -126,11 +156,7 @@ def _prepare_db_path(db_path: Path) -> None:
             )
         shutil.rmtree(db_path)
         return
-    marker = db_path.with_name(db_path.name + _DB_MARKER_SUFFIX)
-    owned = marker.is_file() and marker.read_text(
-        encoding="utf-8", errors="replace"
-    ).strip() == _DB_MARKER_CONTENT.strip()
-    if not owned:
+    if not _is_vektorgraph_db(db_path):
         raise ValueError(
             f"refusing to use database path {db_path}: it exists and is "
             "not a verified VektorGraph database"
@@ -155,6 +181,11 @@ def parse_file(path: Path, repo_root: Path):
     """
     src = path.read_bytes()
     tree = _PARSER.parse(src)
+    if tree.root_node.has_error:
+        # A syntax error is a failed file, not a partial graph: raise
+        # so build_graph() records it instead of silently building
+        # from a broken tree.
+        raise SyntaxError(f"syntax error in {path} (tree-sitter parse error)")
     mod = module_name(repo_root, path)
     defs, imports, calls = [], [], []
     stack = []
@@ -243,17 +274,16 @@ def build_graph(repo_root, db_path, strict=False):
     the build raises RuntimeError listing the failed files instead of
     returning an incomplete graph.
 
-    The database file is replaced on rebuild, but only after
-    validation: _validate_db_path() refuses protected paths and
-    _prepare_db_path() deletes only a marker-verified database file
-    or an empty directory. The marker is written last, after the
-    database builds successfully, so a failed build never claims
-    ownership of a file.
+    The database file is replaced on rebuild, but only AFTER the code
+    is parsed and validated: _validate_db_path() refuses protected
+    paths and symlinks, the parse phase records failures, the strict
+    check raises before anything is deleted, and only then does
+    _prepare_db_path() replace the old database. A failed strict
+    build leaves the previous graph intact.
     """
     _require_available()
     repo_root = Path(repo_root).resolve()
     db_path = _validate_db_path(repo_root, db_path)
-    _prepare_db_path(db_path)
 
     py_files = sorted(
         p for p in repo_root.rglob("*.py")
@@ -283,6 +313,10 @@ def build_graph(repo_root, db_path, strict=False):
             f"failed to parse ({names}); refusing to report an "
             "incomplete graph as complete"
         )
+
+    # Only now, with parsing done and validation passed, is the old
+    # database replaced.
+    _prepare_db_path(db_path)
 
     by_simple = {}
     for qname, _kind, _mod in all_defs:
@@ -328,11 +362,6 @@ def build_graph(repo_root, db_path, strict=False):
         "UNWIND $rows AS r MATCH (a:Symbol {name: r[1]}), (b:Symbol {name: r[2]}) "
         "CREATE (a)-[:CALLS]->(b)",
         {"rows": [list(e) for e in resolved]},
-    )
-    # Marker last: only a successfully built database claims ownership,
-    # so a later rebuild may replace this file.
-    db_path.with_name(db_path.name + _DB_MARKER_SUFFIX).write_text(
-        _DB_MARKER_CONTENT, encoding="utf-8"
     )
     return {
         "files": len(py_files),

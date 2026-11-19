@@ -72,11 +72,16 @@ stats["failed_files"]  # [{"path": ..., "error": ...}, ...]
 ```
 
 Never present an incomplete graph as complete. Pass `strict=True` to
-fail the build instead of returning an incomplete graph. The database
-directory is replaced on rebuild, but only when build_graph() can
-verify it is a VektorGraph database (a marker file it wrote) or an
-empty directory — it refuses to delete anything else, including the
-repository itself.
+fail the build instead of returning an incomplete graph — and a failed
+strict build leaves the previous graph untouched, because the code is
+parsed and validated before the old database is replaced. Files with
+syntax errors are recorded as failed files, never silently skipped.
+The database file is replaced on rebuild only when build_graph() can
+verify it is a VektorGraph database: it opens the file read-only and
+checks the actual tables against the expected schema. A marker string
+is not verification. It refuses to delete anything else — including
+the repository itself, a symlink destination, an unverified file, or
+any non-empty directory.
 
 ## Honest limits
 
