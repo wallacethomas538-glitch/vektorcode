@@ -25,12 +25,25 @@ Honest limits (by design, not hidden):
   - Call resolution is NAME-BASED: a call to ``foo()`` resolves to any
     defined symbol named ``foo``; ``obj.method()`` resolves by the last
     segment. No type inference, no dynamic dispatch. Direct callers are
-    usually exact; transitive callers are an upper bound and can include
-    same-name collisions — say so when reporting them.
+    POTENTIALLY AMBIGUOUS whenever the same simple name is defined in
+    more than one place — impact() reports this in ``direct_ambiguous``
+    and ``ambiguous_definitions``. Never present ambiguous direct
+    callers as proven callers of one symbol. Transitive callers are
+    always an upper bound.
   - Only static calls visible in the tree are captured. eval/exec/getattr
     and dynamically built names are missed.
   - Imports come from import statements only; relative imports are
     recorded only when they name a resolvable in-repo module.
+  - A build can be INCOMPLETE: files that fail to parse are recorded in
+    ``failed_files`` and the stats report ``complete: False``. Never
+    present an incomplete graph as complete; pass ``strict=True`` to
+    fail the build instead.
+  - The database file is REPLACED on rebuild. build_graph() only
+    replaces a file it can verify is a VektorGraph database (a marker
+    file written next to it after a successful build) or an empty
+    directory. It refuses to delete the repository, anything
+    containing it, the filesystem root, the home directory, an
+    existing file without the marker, or any non-empty directory.
 """
 
 import shutil
@@ -65,6 +78,64 @@ def _require_available() -> None:
             "and kuzu first (pip install tree-sitter tree-sitter-python kuzu). "
             f"Import error was: {IMPORT_ERROR!r}"
         )
+
+
+# Marker written NEXT TO every database file build_graph() creates
+# (the database itself is a single KuzuDB file, not a directory).
+# Only a file carrying this sibling marker may be replaced on rebuild.
+_DB_MARKER_SUFFIX = ".vektorgraph-db"
+_DB_MARKER_CONTENT = "vektorgraph-db-v1\n"
+
+
+def _validate_db_path(repo_root, db_path) -> Path:
+    """Validate a database path before anything is deleted.
+
+    Returns the resolved path. Raises ValueError when the path is unsafe
+    to replace: the filesystem root, the home directory, the repository
+    itself, or anything containing the repository. Symlinks are resolved
+    first, so a link to a protected directory is caught too.
+    """
+    repo_root = Path(repo_root).resolve()
+    db_path = Path(db_path).resolve()
+    for guard in (Path("/").resolve(), Path.home().resolve(), repo_root):
+        if guard.is_relative_to(db_path):
+            raise ValueError(
+                f"refusing to use database path {db_path}: it is, or "
+                f"contains, {guard}, which must never be deleted"
+            )
+    return db_path
+
+
+def _prepare_db_path(db_path: Path) -> None:
+    """Make room for a fresh database, deleting only what is verified.
+
+    The database is a single KuzuDB file. An existing file is removed
+    only when its sibling marker (written by build_graph() after a
+    successful build) verifies it is a VektorGraph database. An
+    existing directory is removed only when empty — a directory is
+    never a KuzuDB database, so a non-empty one is never deleted.
+    Anything else raises instead of being deleted.
+    """
+    if not db_path.exists():
+        return
+    if db_path.is_dir():
+        if list(db_path.iterdir()):
+            raise ValueError(
+                f"refusing to use database path {db_path}: it is a "
+                "non-empty directory that is not a VektorGraph database"
+            )
+        shutil.rmtree(db_path)
+        return
+    marker = db_path.with_name(db_path.name + _DB_MARKER_SUFFIX)
+    owned = marker.is_file() and marker.read_text(
+        encoding="utf-8", errors="replace"
+    ).strip() == _DB_MARKER_CONTENT.strip()
+    if not owned:
+        raise ValueError(
+            f"refusing to use database path {db_path}: it exists and is "
+            "not a verified VektorGraph database"
+        )
+    db_path.unlink()
 
 
 def module_name(repo_root: Path, path: Path) -> str:
@@ -159,34 +230,59 @@ def parse_file(path: Path, repo_root: Path):
     return mod, defs, imports, calls
 
 
-def build_graph(repo_root, db_path):
+def build_graph(repo_root, db_path, strict=False):
     """(Re)build the code graph for ``repo_root`` into ``db_path``.
 
-    Returns a stats dict: files, modules, symbols, import_edges,
-    call_sites, calls_resolved, calls_unresolved.
+    Returns a stats dict: files, files_parsed, failed_files, complete,
+    modules, symbols, import_edges, call_sites, calls_resolved,
+    calls_unresolved.
+
+    ``failed_files`` lists {"path": ..., "error": ...} for every .py file
+    that could not be parsed; ``complete`` is False when any file failed.
+    Never present an incomplete graph as complete. With ``strict=True``
+    the build raises RuntimeError listing the failed files instead of
+    returning an incomplete graph.
+
+    The database file is replaced on rebuild, but only after
+    validation: _validate_db_path() refuses protected paths and
+    _prepare_db_path() deletes only a marker-verified database file
+    or an empty directory. The marker is written last, after the
+    database builds successfully, so a failed build never claims
+    ownership of a file.
     """
     _require_available()
     repo_root = Path(repo_root).resolve()
-    db_path = Path(db_path)
-    if db_path.is_dir():
-        shutil.rmtree(db_path)
-    elif db_path.exists():
-        db_path.unlink()
+    db_path = _validate_db_path(repo_root, db_path)
+    _prepare_db_path(db_path)
 
     py_files = sorted(
         p for p in repo_root.rglob("*.py")
         if ".venv" not in p.parts and "__pycache__" not in p.parts
     )
     modules, all_defs, all_imports, all_calls = {}, [], [], []
+    failed_files = []
     for f in py_files:
         try:
             mod, defs, imports, calls = parse_file(f, repo_root)
-        except Exception:
+        except Exception as exc:
+            failed_files.append({
+                "path": str(f.relative_to(repo_root)),
+                "error": f"{type(exc).__name__}: {exc}",
+            })
             continue
         modules[mod] = str(f.relative_to(repo_root))
         all_defs.extend(defs)
         all_imports.extend((mod, imp) for imp in imports)
         all_calls.extend((mod, enc, callee) for enc, callee in calls)
+
+    complete = not failed_files
+    if strict and failed_files:
+        names = ", ".join(entry["path"] for entry in failed_files)
+        raise RuntimeError(
+            f"code graph build incomplete: {len(failed_files)} file(s) "
+            f"failed to parse ({names}); refusing to report an "
+            "incomplete graph as complete"
+        )
 
     by_simple = {}
     for qname, _kind, _mod in all_defs:
@@ -233,8 +329,16 @@ def build_graph(repo_root, db_path):
         "CREATE (a)-[:CALLS]->(b)",
         {"rows": [list(e) for e in resolved]},
     )
+    # Marker last: only a successfully built database claims ownership,
+    # so a later rebuild may replace this file.
+    db_path.with_name(db_path.name + _DB_MARKER_SUFFIX).write_text(
+        _DB_MARKER_CONTENT, encoding="utf-8"
+    )
     return {
         "files": len(py_files),
+        "files_parsed": len(py_files) - len(failed_files),
+        "failed_files": failed_files,
+        "complete": complete,
         "modules": len(modules),
         "symbols": len(all_defs),
         "import_edges": len(set(all_imports)),
@@ -252,9 +356,17 @@ def _connect(db_path):
 def impact(db_path, symbol):
     """What breaks if ``symbol`` (qualified name) changes.
 
-    Returns {"direct": [...], "transitive": [...]} — direct callers are
-    exact; transitive callers are an upper bound (name-based resolution
-    can pull in same-name collisions). Say so when reporting them.
+    Returns {"direct": [...], "transitive": [...],
+    "direct_ambiguous": bool, "ambiguous_definitions": [...]}.
+
+    Resolution is NAME-BASED: a call to ``foo()`` resolves to every
+    symbol named ``foo``. When the target's simple name is defined in
+    more than one place, the direct callers are POTENTIALLY AMBIGUOUS —
+    they may be callers of a same-named symbol elsewhere, not of this
+    one. ``direct_ambiguous`` is True then, and
+    ``ambiguous_definitions`` lists every qualified name sharing the
+    simple name. Check both before reporting direct callers as fact.
+    Transitive callers are always an upper bound.
     """
     conn = _connect(db_path)
     direct = sorted(
@@ -273,7 +385,18 @@ def impact(db_path, symbol):
             {"t": symbol},
         )
     )
-    return {"direct": direct, "transitive": transitive}
+    simple = symbol.split(".")[-1]
+    definitions = sorted(
+        r[0]
+        for r in conn.execute("MATCH (s:Symbol) RETURN s.name")
+        if r[0].split(".")[-1] == simple
+    )
+    return {
+        "direct": direct,
+        "transitive": transitive,
+        "direct_ambiguous": len(definitions) > 1,
+        "ambiguous_definitions": definitions,
+    }
 
 
 def importers(db_path, module):

@@ -1,15 +1,24 @@
 """Tests for vektor_cloud/codegraph.py (codegraph-skill).
 
-The happy-path tests need tree-sitter + kuzu; they skip honestly when
-the dependencies are absent. The unavailable-path test needs nothing.
+Most tests need tree-sitter + kuzu and skip honestly when the
+dependencies are absent — each of those carries its own skip mark.
+The unavailable-path test has NO mark on purpose: it must execute in
+both environments (it monkeypatches AVAILABLE off itself). A
+module-level skip mark used to swallow it in the no-deps environment;
+that arrangement is the bug Big Chat caught, and this file is the
+regression guard for it.
 """
+
+import os
+from pathlib import Path
 
 import pytest
 
 from vektor_cloud import codegraph
 
-pytestmark = pytest.mark.skipif(
-    not codegraph.AVAILABLE, reason="codegraph deps (tree-sitter/kuzu) not installed"
+needs_deps = pytest.mark.skipif(
+    not codegraph.AVAILABLE,
+    reason="codegraph deps (tree-sitter/kuzu) not installed",
 )
 
 
@@ -36,21 +45,43 @@ def repo(tmp_path):
     return tmp_path
 
 
+@needs_deps
 def test_build_stats(repo, tmp_path):
     stats = codegraph.build_graph(repo, tmp_path / "graph.db")
     assert stats["files"] == 3
     assert stats["modules"] == 3
     assert stats["symbols"] == 6  # a.foo, a.bar, a.Calc, a.Calc.calc, b.use, c.foo
     assert stats["calls_resolved"] >= 3
+    assert stats["complete"] is True
+    assert stats["failed_files"] == []
 
 
-def test_impact_direct_callers_are_exact(repo, tmp_path):
+@needs_deps
+def test_impact_direct_callers_flagged_ambiguous_on_collision(repo, tmp_path):
+    # a.foo and c.foo share the simple name "foo", so the direct callers
+    # of a.foo are POTENTIALLY AMBIGUOUS: they may be callers of c.foo.
+    # The API must say so instead of presenting them as exact.
     db = tmp_path / "graph.db"
     codegraph.build_graph(repo, db)
     result = codegraph.impact(db, "a.foo")
     assert set(result["direct"]) == {"a.bar", "a.Calc.calc", "b.use"}
+    assert result["direct_ambiguous"] is True
+    assert result["ambiguous_definitions"] == ["a.foo", "c.foo"]
 
 
+@needs_deps
+def test_impact_direct_callers_unambiguous_when_unique(repo, tmp_path):
+    # "bar" is defined exactly once, so its direct callers are not
+    # ambiguous — the flag must stay off for the unique case.
+    db = tmp_path / "graph.db"
+    codegraph.build_graph(repo, db)
+    result = codegraph.impact(db, "a.bar")
+    assert result["direct"] == []
+    assert result["direct_ambiguous"] is False
+    assert result["ambiguous_definitions"] == ["a.bar"]
+
+
+@needs_deps
 def test_name_collision_is_reported_not_hidden(repo, tmp_path):
     # b.use, a.bar and a.Calc.calc all call foo() by bare name, so each
     # resolves to BOTH a.foo and c.foo. The graph must show that honestly
@@ -58,12 +89,15 @@ def test_name_collision_is_reported_not_hidden(repo, tmp_path):
     # and the caller cannot tell from the graph alone which foo was meant.
     db = tmp_path / "graph.db"
     codegraph.build_graph(repo, db)
-    a_foo = codegraph.impact(db, "a.foo")["direct"]
-    c_foo = codegraph.impact(db, "c.foo")["direct"]
-    assert set(a_foo) == {"a.bar", "a.Calc.calc", "b.use"}
-    assert set(c_foo) == set(a_foo)
+    a_foo = codegraph.impact(db, "a.foo")
+    c_foo = codegraph.impact(db, "c.foo")
+    assert set(a_foo["direct"]) == {"a.bar", "a.Calc.calc", "b.use"}
+    assert set(c_foo["direct"]) == set(a_foo["direct"])
+    assert a_foo["direct_ambiguous"] is True
+    assert c_foo["direct_ambiguous"] is True
 
 
+@needs_deps
 def test_importers(repo, tmp_path):
     db = tmp_path / "graph.db"
     codegraph.build_graph(repo, db)
@@ -71,6 +105,7 @@ def test_importers(repo, tmp_path):
     assert codegraph.importers(db, "c") == []
 
 
+@needs_deps
 def test_stats_counts(repo, tmp_path):
     db = tmp_path / "graph.db"
     codegraph.build_graph(repo, db)
@@ -86,3 +121,139 @@ def test_build_raises_plainly_without_deps(monkeypatch, tmp_path):
     monkeypatch.setattr(codegraph, "AVAILABLE", False)
     with pytest.raises(RuntimeError, match="code graph unavailable"):
         codegraph.build_graph(tmp_path, tmp_path / "graph.db")
+
+
+# --- Correction 1: database path safety -------------------------------
+# build_graph() replaces the database directory on rebuild. It must
+# only delete a directory it can verify is a VektorGraph database (or
+# an empty one). Everything else must raise, with the data intact.
+
+
+@needs_deps
+def test_build_refuses_repo_root(repo, tmp_path):
+    with pytest.raises(ValueError, match="refusing to use database path"):
+        codegraph.build_graph(repo, repo)
+    assert (repo / "a.py").is_file()  # repo untouched
+
+
+@needs_deps
+def test_build_refuses_parent_of_repo(repo, tmp_path):
+    with pytest.raises(ValueError, match="refusing to use database path"):
+        codegraph.build_graph(repo, repo.parent)
+    assert (repo / "a.py").is_file()
+
+
+@needs_deps
+def test_build_refuses_filesystem_root(repo, tmp_path):
+    with pytest.raises(ValueError, match="refusing to use database path"):
+        codegraph.build_graph(repo, Path("/"))
+
+
+@needs_deps
+def test_build_refuses_home_directory(repo, tmp_path):
+    with pytest.raises(ValueError, match="refusing to use database path"):
+        codegraph.build_graph(repo, Path.home())
+
+
+@needs_deps
+def test_build_refuses_unmarked_nonempty_dir(repo, tmp_path):
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    sentinel = foreign / "keep-me.txt"
+    sentinel.write_text("not a database")
+    with pytest.raises(ValueError, match="not a VektorGraph database"):
+        codegraph.build_graph(repo, foreign)
+    assert sentinel.is_file()  # nothing deleted
+
+
+@needs_deps
+def test_build_refuses_existing_file(repo, tmp_path):
+    victim = tmp_path / "not-a-dir"
+    victim.write_text("precious")
+    with pytest.raises(ValueError, match="not a verified VektorGraph database"):
+        codegraph.build_graph(repo, victim)
+    assert victim.read_text() == "precious"
+
+
+@needs_deps
+def test_build_replaces_marker_verified_file(repo, tmp_path):
+    # A file carrying the sibling marker IS a verified VektorGraph
+    # database, so a rebuild may replace it.
+    victim = tmp_path / "graph.db"
+    victim.write_text("stale database bytes")
+    marker = tmp_path / "graph.db.vektorgraph-db"
+    marker.write_text("vektorgraph-db-v1\n", encoding="utf-8")
+    stats = codegraph.build_graph(repo, victim)
+    assert stats["complete"] is True
+    assert stats["files"] == 3
+    assert marker.is_file()
+
+
+@needs_deps
+def test_build_refuses_symlink_to_repo_root(repo, tmp_path):
+    link = tmp_path / "db-link"
+    os.symlink(repo, link)
+    with pytest.raises(ValueError, match="refusing to use database path"):
+        codegraph.build_graph(repo, link)
+    assert (repo / "a.py").is_file()
+
+
+@needs_deps
+def test_build_replaces_marked_database(repo, tmp_path):
+    db = tmp_path / "graph.db"
+    first = codegraph.build_graph(repo, db)
+    assert first["complete"] is True
+    assert db.is_file()  # KuzuDB stores the database as a single file
+    assert (tmp_path / "graph.db.vektorgraph-db").is_file()
+    second = codegraph.build_graph(repo, db)
+    assert second["complete"] is True
+    assert second["files"] == 3
+    assert (tmp_path / "graph.db.vektorgraph-db").is_file()
+
+
+# --- Correction 3: incomplete graph detection --------------------------
+# Files that fail to parse must be recorded, never silently skipped.
+
+
+@needs_deps
+def test_build_records_parse_failures(repo, tmp_path):
+    # A directory named *.py is found by rglob but cannot be read as a
+    # file, so it fails to parse for real — no monkeypatching needed.
+    (tmp_path / "broken.py").mkdir()
+    stats = codegraph.build_graph(repo, tmp_path / "graph.db")
+    assert stats["complete"] is False
+    assert stats["files"] == 4
+    assert stats["files_parsed"] == 3
+    assert [entry["path"] for entry in stats["failed_files"]] == ["broken.py"]
+    assert stats["modules"] == 3  # the good files still build
+
+
+@needs_deps
+def test_build_records_parse_failures_monkeypatched(repo, tmp_path, monkeypatch):
+    real_parse = codegraph.parse_file
+
+    def flaky(path, root):
+        if path.name == "b.py":
+            raise OSError("disk read failed (test)")
+        return real_parse(path, root)
+
+    monkeypatch.setattr(codegraph, "parse_file", flaky)
+    stats = codegraph.build_graph(repo, tmp_path / "graph.db")
+    assert stats["complete"] is False
+    assert [entry["path"] for entry in stats["failed_files"]] == ["b.py"]
+    assert "OSError" in stats["failed_files"][0]["error"]
+
+
+@needs_deps
+def test_build_strict_fails_on_parse_failure(repo, tmp_path):
+    (tmp_path / "broken.py").mkdir()
+    with pytest.raises(RuntimeError, match="incomplete.*broken.py"):
+        codegraph.build_graph(repo, tmp_path / "graph.db", strict=True)
+
+
+@needs_deps
+def test_build_complete_when_all_parse(repo, tmp_path):
+    stats = codegraph.build_graph(repo, tmp_path / "graph.db")
+    assert stats["complete"] is True
+    assert stats["failed_files"] == []
+    assert stats["files_parsed"] == stats["files"] == 3

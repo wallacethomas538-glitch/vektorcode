@@ -51,23 +51,48 @@ Ask the impact question:
 ```python
 from vektor_cloud.codegraph import impact, importers
 impact(db_path, "vektor_cloud.skills.load_skill")
-# {"direct": [...exact callers...], "transitive": [...wider callers...]}
+# {"direct": [...], "transitive": [...], "direct_ambiguous": bool,
+#  "ambiguous_definitions": [...]}
 importers(db_path, "vektor_cloud.skills")  # modules importing it
 ```
 
-Report direct callers as exact. Report transitive callers as an upper
-bound — say that plainly, because name-based matching can pull in
-same-name functions from other modules.
+Direct callers are NAME-BASED and potentially ambiguous. If
+`direct_ambiguous` is true, say so plainly and list the colliding
+definitions from `ambiguous_definitions` — those callers may belong to
+a same-named symbol elsewhere, not to this one. Never present
+ambiguous direct callers as proven. Report transitive callers as an
+upper bound, always.
+
+Check every build for completeness before quoting it:
+
+```python
+stats = build_graph(repo_root, db_path)
+stats["complete"]  # False when files failed to parse
+stats["failed_files"]  # [{"path": ..., "error": ...}, ...]
+```
+
+Never present an incomplete graph as complete. Pass `strict=True` to
+fail the build instead of returning an incomplete graph. The database
+directory is replaced on rebuild, but only when build_graph() can
+verify it is a VektorGraph database (a marker file it wrote) or an
+empty directory — it refuses to delete anything else, including the
+repository itself.
 
 ## Honest limits
 
 - Call resolution is NAME-BASED: `foo()` resolves to any defined symbol
   named `foo`; `obj.method()` resolves by the last segment. No type
-  inference, no dynamic dispatch.
+  inference, no dynamic dispatch. Direct callers are potentially
+  ambiguous when the same simple name is defined in more than one
+  place — check `direct_ambiguous` and `ambiguous_definitions` before
+  reporting them as fact.
 - Only static calls visible in the tree are captured. `eval`, `exec`,
   `getattr` and dynamically built names are missed.
 - The graph goes stale when the code changes. Rebuild it after edits,
   and never quote an old graph as current.
+- A build can be incomplete: files that fail to parse are recorded, and
+  the stats report `complete: False`. Never present an incomplete graph
+  as complete.
 - On Render the app is stdlib-only by design, so the graph runs where
   its dependencies are installed (local, Daytona, or a service with
   them in requirements.txt) and degrades honestly everywhere else.
