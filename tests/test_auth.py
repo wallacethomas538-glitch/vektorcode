@@ -363,6 +363,40 @@ class AuthTest(unittest.TestCase):
         finally:
             self._restore_env(old)
 
+    def test_meta_callback_concurrent_replay_single_winner(self):
+        """F1 (follow-up 4): eight simultaneous callbacks with the same
+        state — exactly one reaches the token exchange (502, fake
+        code); the other seven are refused (400). Without atomic
+        consumption, two or more could validate the same state before
+        either cleared it."""
+        old = self._meta_env()
+        try:
+            os.environ["VEKTORCODE_TOOL_PASSWORD"] = PASSWORD
+            _, cookie = self._login(PASSWORD)
+            headers = {"Cookie": cookie.split(";")[0]}
+            state = self._mint_meta_state(headers)
+            url = f"/api/meta/callback?state={state}&code=fake-code"
+            results = []
+            # A barrier releases all threads at once, so the callbacks
+            # overlap as tightly as the server allows.
+            barrier = threading.Barrier(16)
+
+            def hit():
+                barrier.wait(timeout=10)
+                status, _, _ = self._call("GET", url, headers=headers)
+                results.append(status)
+
+            threads = [threading.Thread(target=hit) for _ in range(16)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=30)
+            self.assertEqual(len(results), 16, results)
+            self.assertEqual(results.count(502), 1, results)
+            self.assertEqual(results.count(400), 15, results)
+        finally:
+            self._restore_env(old)
+
 
 if __name__ == "__main__":
     unittest.main()

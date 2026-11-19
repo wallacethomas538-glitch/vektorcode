@@ -16,8 +16,11 @@ external data. The trust boundary is the install/save path: repo
 skills ship with code Wallace approved, state notes are saved by
 Wallace through the authenticated /api/skill/save endpoint.
 """
+import os
 import re
 import shutil
+import stat
+import uuid
 from pathlib import Path
 
 SKILL_BODY_CAP = 12000
@@ -66,7 +69,8 @@ def parse_skill_markdown(text: str, fallback_name: str = "") -> dict:
 
 def _read_capped(path: Path, cap_chars: int) -> str | None:
     """Read a skill file with the size enforced BEFORE its content is
-    held in memory (F6).
+    held in memory (F6), and with the open hardened against
+    symlink / time-of-check-time-of-use swaps (follow-up 4).
 
     1. Resolve symlinks first, so a link to a huge file elsewhere is
        measured by its target, not by the link.
@@ -74,21 +78,44 @@ def _read_capped(path: Path, cap_chars: int) -> str | None:
        byte size exceeds cap_chars * 4 + 1024 (max 4 bytes per UTF-8
        char, plus frontmatter slack — a bigger file cannot be within
        the char cap).
-    3. Read at most cap_chars + 1 chars, so the held content stays
+    3. Open with O_NOFOLLOW, then fstat the open descriptor and
+       refuse unless it is the same regular file that was just
+       statted (same device + inode) and still within the byte cap.
+       A swap between the stat and the open — a different file, a
+       symlink planted at the path, or growth past the cap — is
+       refused instead of read.
+    4. Read at most cap_chars + 1 chars, so the held content stays
        bounded by the cap even when the byte pre-check passes.
-    Returns None when the file is missing, unreadable, or oversized.
+    Returns None when the file is missing, unreadable, oversized,
+    not a regular file, or swapped between stat and open.
     """
     try:
         resolved = path.resolve()
-        size = resolved.stat().st_size
+        pre = resolved.stat()
     except OSError:
         return None
-    if size > cap_chars * 4 + 1024:
+    if pre.st_size > cap_chars * 4 + 1024:
+        return None
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(resolved, flags)
+    except OSError:
         return None
     try:
-        with resolved.open(encoding="utf-8") as f:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        if (st.st_dev, st.st_ino) != (pre.st_dev, pre.st_ino):
+            return None
+        if st.st_size > cap_chars * 4 + 1024:
+            return None
+        with os.fdopen(fd, encoding="utf-8") as f:
             return f.read(cap_chars + 1)
     except (OSError, UnicodeDecodeError):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
         return None
 
 
@@ -248,24 +275,112 @@ def load_skill_reference(repo_root=None, state_dir=None,
             "content": content[:REFERENCE_CAP]}
 
 
+def _file_cap(path: Path) -> int:
+    """Byte cap for one installed file: SKILL.md gets the body cap,
+    everything else (references, agents) gets the reference cap."""
+    if path.name == "SKILL.md":
+        return SKILL_BODY_CAP * 4 + 1024
+    return REFERENCE_CAP * 4 + 1024
+
+
+def _validate_skill_tree(skill_dir: Path) -> dict:
+    """Validate a skill directory completely, without modifying
+    anything (F6, follow-up 4).
+
+    Every entry must be a real file or directory — symlinks are
+    refused outright, so a link can never smuggle outside content
+    into an install. Every file must be a regular file within its
+    byte cap and readable through _read_capped. SKILL.md must exist
+    and parse. Raises ValueError on the first problem; the caller
+    installs nothing when this raises.
+    """
+    skill_dir = Path(skill_dir)
+    skill_file = skill_dir / "SKILL.md"
+    if not skill_dir.is_dir():
+        raise ValueError(f"not a skill directory: {skill_dir}")
+    if not skill_file.is_file() or skill_file.is_symlink():
+        raise ValueError(f"not a skill directory (no SKILL.md): {skill_dir}")
+    for entry in sorted(skill_dir.rglob("*")):
+        if entry.is_symlink():
+            raise ValueError(f"symlinked entry refused: {entry}")
+        if entry.is_file():
+            try:
+                size = entry.stat().st_size
+            except OSError as exc:
+                raise ValueError(f"unreadable file: {entry}") from exc
+            if size > _file_cap(entry):
+                raise ValueError(f"file too large: {entry}")
+    info = _skill_dir_info(skill_dir)
+    if info is None:
+        raise ValueError(f"skill is too large or unreadable: {skill_dir}")
+    for ref in info["references"]:
+        if _read_capped(skill_dir / ref, REFERENCE_CAP) is None:
+            raise ValueError(f"reference too large or unreadable: {ref}")
+    return info
+
+
+def _bounded_copy(src, dst):
+    """copy_function for install staging: refuse symlinks and
+    over-cap files during the copy itself, so a source that changes
+    mid-copy (a file swapped for a symlink to a huge file) cannot
+    fill the disk before validation runs."""
+    src_path = Path(src)
+    if src_path.is_symlink():
+        raise ValueError(f"symlinked entry refused: {src}")
+    try:
+        size = src_path.stat().st_size
+    except OSError as exc:
+        raise ValueError(f"unreadable file: {src}") from exc
+    if size > max(SKILL_BODY_CAP, REFERENCE_CAP) * 4 + 1024:
+        raise ValueError(f"file too large: {src}")
+    shutil.copy2(src, dst)
+
+
 def install_skill(src_dir, dest_root, slug: str | None = None) -> dict:
     """Copy a skill directory (SKILL.md + references/ + agents/) into
-    ``dest_root/<slug>``. Clean-replaces an existing install of the
-    same slug. Refuses sources without a SKILL.md."""
+    ``dest_root/<slug>``. The replacement is validated COMPLETELY
+    before anything already installed is touched (F6, follow-up 4):
+    the source is validated, the copy is staged beside the
+    destination and validated again, and only then is the old
+    installation swapped aside and the staged copy renamed into
+    place. A failed validation or a failed swap leaves the previous
+    valid installation exactly as it was. Refuses sources without a
+    SKILL.md, and refuses symlinked, oversized, or unreadable
+    entries anywhere in the replacement."""
     src = Path(src_dir)
-    skill_file = src / "SKILL.md"
-    if not src.is_dir() or not skill_file.is_file():
-        raise ValueError(f"not a skill directory (no SKILL.md): {src}")
+    _validate_skill_tree(src)
     dest = Path(dest_root) / slugify(slug or src.name)
-    if dest.exists():
-        shutil.rmtree(dest)
-    shutil.copytree(src, dest)
-    info = _skill_dir_info(dest)
-    if info is None:
-        raise ValueError(f"skill is too large or unreadable: {dest}")
-    return {"slug": dest.name, "name": info["name"],
-            "description": info["description"], "path": str(dest),
-            "reference_count": len(info["references"])}
+    tag = uuid.uuid4().hex[:12]
+    staging = dest.parent / f".{dest.name}.staging-{tag}"
+    backup = dest.parent / f".{dest.name}.backup-{tag}"
+    try:
+        shutil.copytree(
+            src, staging, copy_function=_bounded_copy,
+            ignore=lambda d, names: [n for n in names
+                                     if (Path(d) / n).is_symlink()])
+        info = _validate_skill_tree(staging)
+        if dest.exists() or dest.is_symlink():
+            dest.rename(backup)
+        try:
+            staging.rename(dest)
+        except OSError:
+            if backup.exists() or backup.is_symlink():
+                backup.rename(dest)
+            raise
+        if backup.exists() or backup.is_symlink():
+            if backup.is_dir() and not backup.is_symlink():
+                shutil.rmtree(backup)
+            else:
+                backup.unlink()
+        return {"slug": dest.name, "name": info["name"],
+                "description": info["description"], "path": str(dest),
+                "reference_count": len(info["references"])}
+    finally:
+        if staging.exists() or staging.is_symlink():
+            if staging.is_dir() and not staging.is_symlink():
+                shutil.rmtree(staging, ignore_errors=True)
+            else:
+                staging.unlink(missing_ok=True)
 
 
 def format_skill_for_prompt(skill: dict) -> str:

@@ -8,7 +8,10 @@ import unittest
 from pathlib import Path
 
 from vektor_cloud.skills import (
+    REFERENCE_CAP,
+    SKILL_BODY_CAP,
     _note_info,
+    _read_capped,
     _skill_dir_info,
     discover_skills,
     format_skill_for_prompt,
@@ -272,6 +275,94 @@ class SizeEnforcementTest(unittest.TestCase):
         skill = load_skill(self.repo, self.state, "over-cap")
         self.assertIsNotNone(skill)
         self.assertEqual(len(skill["body"]), 12_000)
+
+
+class InstallValidationTest(unittest.TestCase):
+    """F6 (follow-up 4): a replacement is validated completely
+    before the existing install is touched, and a failed
+    replacement leaves the previous valid install intact."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.dest_root = self.base / "skills"
+        self.dest_root.mkdir()
+        good_src = self.base / "good"
+        (good_src / "references").mkdir(parents=True)
+        (good_src / "SKILL.md").write_text(SKILL_MD)
+        (good_src / "references" / "a.md").write_text("a")
+        install_skill(good_src, self.dest_root, "demo")
+        self.dest = self.dest_root / "demo"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _old_install_intact(self):
+        self.assertEqual((self.dest / "SKILL.md").read_text(), SKILL_MD)
+        self.assertEqual((self.dest / "references" / "a.md").read_text(), "a")
+        self.assertIn("demo",
+                      {s["slug"] for s in discover_skills(self.base, None)})
+        leftovers = [p for p in self.dest_root.iterdir()
+                     if p.name.startswith(".demo.")]
+        self.assertEqual(leftovers, [], [str(p) for p in leftovers])
+
+    def _bad_src(self, name):
+        src = self.base / name
+        src.mkdir()
+        return src
+
+    def test_oversized_skill_replacement_preserves_old(self):
+        src = self._bad_src("big")
+        (src / "SKILL.md").write_text("x" * 60000)
+        with self.assertRaises(ValueError):
+            install_skill(src, self.dest_root, "demo")
+        self._old_install_intact()
+
+    def test_oversized_reference_replacement_preserves_old(self):
+        src = self._bad_src("bigref")
+        (src / "references").mkdir()
+        (src / "SKILL.md").write_text(SKILL_MD)
+        (src / "references" / "big.md").write_text("y" * 40000)
+        with self.assertRaises(ValueError):
+            install_skill(src, self.dest_root, "demo")
+        self._old_install_intact()
+
+    def test_unreadable_replacement_preserves_old(self):
+        # SKILL.md as a directory: not a regular file, so the
+        # replacement is refused. (A chmod-0 file would not test
+        # anything as root, which reads through permissions.)
+        src = self._bad_src("nodata")
+        (src / "SKILL.md").mkdir()
+        with self.assertRaises(ValueError):
+            install_skill(src, self.dest_root, "demo")
+        self._old_install_intact()
+
+    def test_symlink_skill_replacement_preserves_old(self):
+        outside = self.base / "outside.md"
+        outside.write_text("outside content")
+        src = self._bad_src("linky")
+        (src / "SKILL.md").symlink_to(outside)
+        with self.assertRaises(ValueError):
+            install_skill(src, self.dest_root, "demo")
+        self._old_install_intact()
+
+    def test_symlink_reference_replacement_preserves_old(self):
+        outside = self.base / "outside.md"
+        outside.write_text("outside content")
+        src = self._bad_src("linkref")
+        (src / "references").mkdir()
+        (src / "SKILL.md").write_text(SKILL_MD)
+        (src / "references" / "evil.md").symlink_to(outside)
+        with self.assertRaises(ValueError):
+            install_skill(src, self.dest_root, "demo")
+        self._old_install_intact()
+
+    def test_read_capped_refuses_directory(self):
+        # The fstat regular-file check: opening a directory with
+        # O_RDONLY succeeds on Linux, so the type check is what
+        # refuses it.
+        self.assertIsNone(_read_capped(self.base, SKILL_BODY_CAP))
+        self.assertIsNone(_read_capped(self.base, REFERENCE_CAP))
 
 
 if __name__ == "__main__":

@@ -403,6 +403,41 @@ _SHELL_CALL_COUNTS = {}
 # execution — only for the validate + mark-used step.
 _SHELL_APPROVALS_LOCK = threading.Lock()
 
+# F1 (follow-up 4): the Meta OAuth state is consumed atomically.
+# The callback used to read the stored state, validate it, and clear
+# it as three separate steps — two concurrent callbacks could both
+# read the same valid state before either cleared it, and both would
+# proceed to the token exchange. Every read-modify-write on the
+# stored state (mint in /api/meta/login, consume in the callback)
+# goes through this lock, so exactly one callback can consume a
+# valid state. The lock is never held during the token exchange.
+_META_OAUTH_STATE_LOCK = threading.Lock()
+
+
+def _consume_meta_oauth_state(handler, state: str, code: str) -> bool:
+    """Atomically validate and consume one Meta OAuth state (F1).
+
+    Under _META_OAUTH_STATE_LOCK: read the stored {"state", "created"}
+    dict, compare it with `state`, and clear it when it matches (or
+    when it is expired). Returns True only when the state matched and
+    was consumed — the caller may then run the token exchange. A
+    missing code or a wrong state leaves the stored state untouched,
+    so the legitimate redirect can still complete; an expired state
+    is cleared and refused.
+    """
+    if not code:
+        return False
+    with _META_OAUTH_STATE_LOCK:
+        saved = handler.setting("meta_oauth_state", "")
+        saved_state = saved.get("state", "") if isinstance(saved, dict) else ""
+        saved_created = saved.get("created", 0) if isinstance(saved, dict) else 0
+        if not saved_state or not secrets.compare_digest(state, saved_state):
+            return False
+        handler.save_setting("meta_oauth_state", "")
+        if time.time() - saved_created > META_OAUTH_STATE_TTL_SECONDS:
+            return False
+        return True
+
 
 def _consume_shell_approval(approval_id: str, command: str,
                             sid: str) -> str | None:
@@ -1702,18 +1737,24 @@ class Handler(BaseHTTPRequestHandler):
             # Stored with a creation time so the callback can expire it.
             # (Settings are JSON-serialized; a legacy plain-string
             # value reads back as a non-dict and is treated as invalid.)
-            self.save_setting("meta_oauth_state", {"state": state, "created": time.time()})
+            # Minting takes the state lock so a new state cannot land
+            # between a callback's read and clear (see F1).
+            with _META_OAUTH_STATE_LOCK:
+                self.save_setting("meta_oauth_state", {"state": state, "created": time.time()})
             redirect = os.environ.get("META_REDIRECT_URI", public_base(self) + "/api/meta/callback")
             params = urlencode({"client_id":os.environ["META_APP_ID"],"redirect_uri":redirect,"state":state,"scope":os.environ.get("META_SCOPES","public_profile,email"),"response_type":"code"})
             self.send_response(302); self.send_header("Location", "https://www.facebook.com/v24.0/dialog/oauth?" + params); self.end_headers(); return
         if self.path.startswith("/api/meta/callback"):
             query = parse_qs(urlparse(self.path).query); code = query.get("code", [""])[0]; state = query.get("state", [""])[0]
-            # State validation: the saved state is a {"state", "created"}
-            # dict (see /api/meta/login). A missing code leaves the state
-            # untouched — the legitimate redirect has not completed yet.
-            # A matching state is consumed BEFORE the token exchange, so
-            # a replayed callback URL cannot complete a second login,
-            # and an expired state (10 minutes) is refused outright.
+            # State validation is atomic (see _consume_meta_oauth_state,
+            # F1): the stored state is read, compared, and cleared under
+            # one lock, so two concurrent callbacks cannot both consume
+            # the same state. A matching state is consumed BEFORE the
+            # token exchange, so a replayed callback URL cannot complete
+            # a second login, and an expired state (10 minutes) is
+            # refused outright. A missing code or wrong state leaves the
+            # stored state untouched — the legitimate redirect has not
+            # completed yet.
             # Residual, stated plainly: the callback itself cannot carry
             # the session cookie (vc_auth is SameSite=Strict, and the
             # redirect from Facebook is cross-site), so the single-use,
@@ -1721,15 +1762,8 @@ class Handler(BaseHTTPRequestHandler):
             # (which requires auth) and this callback. Allowing the
             # cookie on the callback would need SameSite=Lax — a
             # decision for Big Chat, not a silent change here.
-            saved = self.setting("meta_oauth_state", "")
-            saved_state = saved.get("state", "") if isinstance(saved, dict) else ""
-            saved_created = saved.get("created", 0) if isinstance(saved, dict) else 0
-            if not code or not saved_state or not secrets.compare_digest(state, saved_state):
+            if not _consume_meta_oauth_state(self, state, code):
                 self.send_error(400, "Invalid Meta OAuth state"); return
-            if time.time() - saved_created > META_OAUTH_STATE_TTL_SECONDS:
-                self.save_setting("meta_oauth_state", "")
-                self.send_error(400, "Invalid Meta OAuth state"); return
-            self.save_setting("meta_oauth_state", "")
             redirect = os.environ.get("META_REDIRECT_URI", public_base(self) + "/api/meta/callback")
             token_url = "https://graph.facebook.com/v24.0/oauth/access_token?" + urlencode({"client_id":os.environ["META_APP_ID"],"client_secret":os.environ["META_APP_SECRET"],"redirect_uri":redirect,"code":code})
             try:

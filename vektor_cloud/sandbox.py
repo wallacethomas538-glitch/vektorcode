@@ -4,24 +4,81 @@ Filesystem jail (no escapes), subprocess limits (timeout, output caps),
 environment scrubbing (no key material leaks into child processes).
 """
 import os
+import signal
 import subprocess
+import sys
+import threading
 
-try:
-    import resource
-except ImportError:  # pragma: no cover - non-Unix platforms
-    resource = None
+_LAUNCHER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "_sandbox_launcher.py")
 
 MAX_WRITE_CHARS = 20000
 MAX_READ_CHARS = 8000
 MAX_OUTPUT_CHARS = 4000
 DEFAULT_TIMEOUT = 120
 
-# F5: per-command resource caps, enforced with rlimits in the child
-# (see _limit_child). Render's free tier gives the whole instance
-# 512 MB, so the child cannot have more than that — the trade-off is
-# real: a shell that grabbed the full 512 MB would starve the server
-# itself, which is why this is a bound, not a guarantee of headroom.
+# F5: per-command resource caps. Render's free tier gives the whole
+# instance 512 MB, so one command cannot have more than that — the
+# trade-off is real: a shell that grabbed the full 512 MB would
+# starve the server itself, which is why this is a bound, not a
+# guarantee of headroom.
 SANDBOX_MAX_MEMORY_BYTES = 512 * 1024 * 1024
+
+# How often the tree watchdog re-sums the process group's memory.
+_TREE_WATCH_INTERVAL_S = 0.05
+
+
+def _kill_tree(pgid: int) -> None:
+    """SIGKILL every process in the group (launcher + descendants)."""
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _tree_rss_bytes(pgid: int) -> int:
+    """Sum of resident memory of every process in the group (Linux).
+
+    Reads /proc/<pid>/stat: the pgrp is the field after the comm
+    (which may contain spaces, so split after the last ')'), and
+    rss is 21 fields past that. Raises OSError when /proc is
+    unavailable — the caller treats that as "no tree data".
+    """
+    total = 0
+    page = os.sysconf("SC_PAGE_SIZE")
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/stat", "rb") as f:
+                raw = f.read()
+            rest = raw[raw.rfind(b")") + 2:].split()
+            if int(rest[2]) != pgid:
+                continue
+            total += int(rest[21]) * page
+        except (OSError, ValueError, IndexError):
+            continue
+    return total
+
+
+def _watch_tree(pgid: int, cap_bytes: int, stop: threading.Event,
+                breach: threading.Event) -> None:
+    """Poll the process group's aggregate RSS; kill it past the cap.
+
+    RLIMIT_AS bounds each process on its own — a tree of N processes
+    could otherwise hold N x 512 MB. This monitor enforces the
+    combined ceiling instead. It is best-effort: a fast spike can
+    briefly exceed the cap inside one poll interval before the kill
+    lands, so the ceiling is enforced within ~50 ms, not instantly.
+    """
+    while not stop.wait(_TREE_WATCH_INTERVAL_S):
+        try:
+            if _tree_rss_bytes(pgid) > cap_bytes:
+                breach.set()
+                _kill_tree(pgid)
+                return
+        except OSError:
+            return
 
 # Env keys ending with any of these (case-insensitive) are scrubbed before
 # a child process runs. Keys never leave the parent process.
@@ -34,24 +91,6 @@ _SCRUB_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD",
 
 class SandboxEscape(Exception):
     """Raised when a path would escape the sandbox root."""
-
-
-def _limit_child(cpu_seconds: int):
-    """preexec_fn: cap the child process's CPU and address space (F5).
-
-    Runs in the child after fork, before exec — only plain
-    setrlimit syscalls here, never anything that takes a lock
-    (preexec_fn runs while the parent's other threads are frozen).
-    RLIMIT_CPU is seconds of CPU time (soft == hard: SIGXCPU, then
-    SIGKILL if the process ignores it); RLIMIT_AS caps virtual
-    memory. Both limits are inherited by the child's children, so
-    the whole process tree is bounded.
-    """
-    if resource is None:
-        return
-    resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
-    resource.setrlimit(resource.RLIMIT_AS,
-                       (SANDBOX_MAX_MEMORY_BYTES, SANDBOX_MAX_MEMORY_BYTES))
 
 
 class Sandbox:
@@ -109,33 +148,69 @@ class Sandbox:
             cpu_seconds: int | None = None) -> dict:
         """Run cmd with cwd=root, a scrubbed environment, and F5
         resource caps (CPU = cpu_seconds, defaulting to the wall
-        timeout; address space = 512 MB).
+        timeout; address space = 512 MB per process, and 512 MB for
+        the whole process tree together, enforced by a watchdog).
+
+        How the caps are applied (follow-up 4): the command is NOT
+        started with preexec_fn — that is unsafe in this server's
+        multithreaded process. Instead the parent execs a small
+        launcher (vektor_cloud/_sandbox_launcher.py), which sets the
+        rlimits in a fresh single-threaded process and then execs the
+        command. The command runs in its own process group, so a
+        timeout or a tree-memory breach kills the whole tree, not
+        just the direct child (the old code left grandchildren
+        running after a timeout). Returns "tree_memory_killed": True
+        when the watchdog killed the tree.
 
         NOT enforced, and documented as such: process count
         (RLIMIT_NPROC counts per real UID, and the shell shares its
         UID with the server itself, so it is not a safe per-command
         limit — a fork bomb is bounded only by the wall-clock
-        timeout) and network egress (no per-process block exists
-        without namespaces/iptables, which need root — the egress
-        allowlist covers only the app's own HTTP, not the shell).
+        timeout and the tree-memory watchdog) and network egress (no
+        per-process block exists without namespaces/iptables, which
+        need root — the egress allowlist covers only the app's own
+        HTTP, not the shell). The tree ceiling is enforced by a
+        ~50 ms polling monitor, so a fast spike can briefly exceed
+        it before the kill lands.
         """
         cpu_limit = timeout if cpu_seconds is None else max(1, cpu_seconds)
+        launcher_cmd = [sys.executable or "python3", _LAUNCHER_PATH,
+                        str(cpu_limit), str(SANDBOX_MAX_MEMORY_BYTES),
+                        *cmd]
+        proc = subprocess.Popen(
+            launcher_cmd, cwd=self._root, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True,
+            env=self._scrubbed_env(extra_env), start_new_session=True)
+        stop = threading.Event()
+        breach = threading.Event()
+        monitor = threading.Thread(
+            target=_watch_tree,
+            args=(proc.pid, SANDBOX_MAX_MEMORY_BYTES, stop, breach),
+            daemon=True)
+        monitor.start()
+        timed_out = False
+        returncode = None
         try:
-            r = subprocess.run(cmd, cwd=self._root, capture_output=True,
-                               text=True, timeout=timeout,
-                               env=self._scrubbed_env(extra_env),
-                               preexec_fn=lambda: _limit_child(cpu_limit))
-            return {"returncode": r.returncode,
-                    "stdout": r.stdout[:MAX_OUTPUT_CHARS],
-                    "stderr": r.stderr[:MAX_OUTPUT_CHARS],
-                    "timed_out": False}
+            out, err = proc.communicate(timeout=timeout)
+            returncode = proc.returncode
         except subprocess.TimeoutExpired as e:
-            out = e.stdout if isinstance(e.stdout, str) else ""
-            err = e.stderr if isinstance(e.stderr, str) else ""
-            return {"returncode": -1,
-                    "stdout": out[:MAX_OUTPUT_CHARS],
-                    "stderr": err[:MAX_OUTPUT_CHARS],
-                    "timed_out": True}
+            _kill_tree(proc.pid)
+            out, err = proc.communicate()
+            out = e.stdout if isinstance(e.stdout, str) else (out or "")
+            err = e.stderr if isinstance(e.stderr, str) else (err or "")
+            # The timeout sentinel stays -1 (the run_shell contract):
+            # the process itself died by SIGKILL from the group kill,
+            # but callers distinguish "timed out" by this value.
+            returncode = -1
+            timed_out = True
+        finally:
+            stop.set()
+            monitor.join(timeout=2)
+        return {"returncode": returncode,
+                "stdout": (out or "")[:MAX_OUTPUT_CHARS],
+                "stderr": (err or "")[:MAX_OUTPUT_CHARS],
+                "timed_out": timed_out,
+                "tree_memory_killed": breach.is_set()}
 
     def list_files(self) -> list:
         """Audit helper for the verifier: all files under root, relative."""
