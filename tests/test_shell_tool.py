@@ -145,19 +145,40 @@ class ShellToolTest(unittest.TestCase):
         self.assertEqual(status, 404)
 
     def test_env_scrubbed_of_keys(self):
-        os.environ["HYPIT_TEST_API_KEY"] = "do-not-leak"
+        # Every real key name the app uses must be absent from the child
+        # environment — not just _API_KEY names (Finding 2: GEMINI_KEYS,
+        # GROQ_KEYS and SUPABASE_KEY used to leak through `env`).
+        key_vars = {
+            "HYPIT_TEST_API_KEY": "do-not-leak-apikey",
+            "GEMINI_KEYS": "do-not-leak-gemini",
+            "GROQ_KEYS": "do-not-leak-groq",
+            "SUPABASE_KEY": "do-not-leak-supabase",
+            "OPENROUTER_KEYS": "do-not-leak-openrouter",
+            "META_KEYS": "do-not-leak-meta",
+            "QWEN_KEYS": "do-not-leak-qwen",
+            "MISTRAL_KEYS": "do-not-leak-mistral",
+            "TOGETHER_KEYS": "do-not-leak-together",
+            "HUGGINGFACE_KEYS": "do-not-leak-hf",
+        }
+        for name, sentinel in key_vars.items():
+            os.environ[name] = sentinel
         try:
-            approval_id = self._stage_and_approve(
-                'echo "X${HYPIT_TEST_API_KEY}X"')
-            res, _ = self._call(
-                "run_shell",
-                {"command": 'echo "X${HYPIT_TEST_API_KEY}X"',
-                 "approval_id": approval_id})
-            self.assertTrue(res["ok"], res)
-            self.assertNotIn("do-not-leak", res["stdout"])
-            self.assertIn("XX", res["stdout"])
+            for name, sentinel in key_vars.items():
+                # Fresh session per var: the 5-per-session execution cap
+                # would otherwise refuse the later vars.
+                self.sid = f"test-session-{name}"
+                cmd = f'echo "X${{{name}}}X"'
+                approval_id = self._stage_and_approve(cmd)
+                res, _ = self._call(
+                    "run_shell",
+                    {"command": cmd, "approval_id": approval_id})
+                self.assertTrue(res["ok"], res)
+                self.assertNotIn(sentinel, res["stdout"],
+                                 f"{name} leaked into child env")
+                self.assertIn("XX", res["stdout"])
         finally:
-            del os.environ["HYPIT_TEST_API_KEY"]
+            for name in key_vars:
+                del os.environ[name]
 
     def test_output_capped(self):
         approval_id = self._stage_and_approve(

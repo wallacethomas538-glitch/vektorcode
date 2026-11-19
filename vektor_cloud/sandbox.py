@@ -13,7 +13,11 @@ DEFAULT_TIMEOUT = 120
 
 # Env keys ending with any of these (case-insensitive) are scrubbed before
 # a child process runs. Keys never leave the parent process.
-_SCRUB_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD")
+# NOTE: the app's own provider keys end in _KEYS (GEMINI_KEYS, GROQ_KEYS,
+# ...) and SUPABASE_KEY ends in _KEY — both suffixes must stay listed here,
+# or an approved shell command can dump live keys with `env`.
+_SCRUB_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD",
+                    "_KEYS", "_KEY")
 
 
 class SandboxEscape(Exception):
