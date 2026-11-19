@@ -40,7 +40,19 @@ race (a PermissionError on a live daemon's entry is no longer
 silently skipped), and _teardown never reports complete on an
 incomplete scan or an unlistable /proc — the previous final check
 `if not _children_of(...)` treated None as success.
+
+Follow-up 8: fail-closed parsing. A /proc/PID/stat that exists
+but cannot be parsed (ValueError / IndexError) is incomplete
+inspection, not an exit race — only a missing entry
+(FileNotFoundError / ProcessLookupError) proves the process is
+gone. _children_of raises _IncompleteChildScan on malformed or
+truncated stats, and _teardown reports incomplete. The test
+harness is also fixed: the file had two `if __name__ == "__main__"`
+blocks (one before SupervisorInspectionTest, one at the end), so
+direct execution invoked unittest.main() before the class was
+defined; only the final block remains.
 """
+import io
 import os
 import re
 import signal
@@ -540,9 +552,6 @@ class ResourceLimitTest(unittest.TestCase):
             root.wait()
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 class SupervisorInspectionTest(unittest.TestCase):
     """F5 (follow-up 7): the supervisor's teardown verification
     must be fail-closed. _children_of distinguishes ordinary
@@ -689,6 +698,109 @@ class SupervisorInspectionTest(unittest.TestCase):
                     "vektor_cloud._sandbox_launcher._TEARDOWN_ROUNDS", 2):
                 complete, killed, rounds = _teardown(child_pid=None)
         self.assertFalse(complete)
+
+    def test_children_of_raises_on_malformed_stat(self):
+        # Follow-up 8: a live child whose stat exists but cannot be
+        # parsed (ValueError) is incomplete inspection, not an exit
+        # race. The patched read returns garbage; the parse fails
+        # on int(rest[1]) and _children_of must raise with the
+        # child in .pids. (Follow-up 7 treated ValueError as a
+        # "torn read" and skipped it — a live child with a
+        # malformed stat was silently treated as absent.)
+        child = subprocess.Popen(["sleep", "30"])
+        try:
+            target = f"/proc/{child.pid}/stat"
+            real_open = open
+
+            def guarded_open(path, *args, **kwargs):
+                if os.fspath(path) == target:
+                    return io.BytesIO(b"not a stat file at all")
+                return real_open(path, *args, **kwargs)
+
+            with mock.patch("builtins.open", side_effect=guarded_open):
+                with self.assertRaises(_IncompleteChildScan) as cm:
+                    _children_of(os.getpid())
+            self.assertIn(child.pid, cm.exception.pids)
+        finally:
+            child.kill()
+            child.wait()
+
+    def test_children_of_raises_on_truncated_stat(self):
+        # Follow-up 8: a truncated stat — too few fields for
+        # rest[19] (IndexError) — is incomplete inspection too.
+        # The truncated line names this process as the parent, so
+        # the parse reaches the starttime lookup and fails there;
+        # a stat that never reaches rest[19] would be skipped as
+        # a non-child instead, which is why the ppid is set
+        # deliberately.
+        child = subprocess.Popen(["sleep", "30"])
+        try:
+            target = f"/proc/{child.pid}/stat"
+            real_open = open
+            truncated = (
+                f"{child.pid} (sleep) S {os.getpid()}".encode("utf-8"))
+
+            def guarded_open(path, *args, **kwargs):
+                if os.fspath(path) == target:
+                    return io.BytesIO(truncated)
+                return real_open(path, *args, **kwargs)
+
+            with mock.patch("builtins.open", side_effect=guarded_open):
+                with self.assertRaises(_IncompleteChildScan) as cm:
+                    _children_of(os.getpid())
+            self.assertIn(child.pid, cm.exception.pids)
+        finally:
+            child.kill()
+            child.wait()
+
+    def test_children_of_raises_on_malformed_stat_for_non_child(self):
+        # The raise is not conditional on the unreadable process
+        # being the supervisor's child: any entry in the
+        # enumeration that cannot be parsed makes the enumeration
+        # incomplete. Here pid 1's stat is garbage (pid 1 is not
+        # a child of this process) and _children_of still raises.
+        real_open = open
+
+        def guarded_open(path, *args, **kwargs):
+            if os.fspath(path) == "/proc/1/stat":
+                return io.BytesIO(b"not a stat file at all")
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch("builtins.open", side_effect=guarded_open):
+            with self.assertRaises(_IncompleteChildScan) as cm:
+                _children_of(os.getpid())
+        self.assertIn(1, cm.exception.pids)
+
+    def test_teardown_incomplete_on_malformed_stat(self):
+        # Follow-up 8, end to end through the real _children_of:
+        # a live child with a malformed stat makes the teardown
+        # report incomplete. The child is deliberately NOT killed
+        # — its starttime could not be verified, and killing by
+        # pid alone would violate the PID-safe rule (follow-up 6,
+        # P6). The incomplete report is what forces the parent to
+        # treat the run as failed containment; pretending the
+        # child is gone would be the fail-open the correction
+        # exists to prevent.
+        child = subprocess.Popen(["sleep", "30"])
+        try:
+            target = f"/proc/{child.pid}/stat"
+            real_open = open
+
+            def guarded_open(path, *args, **kwargs):
+                if os.fspath(path) == target:
+                    return io.BytesIO(b"not a stat file at all")
+                return real_open(path, *args, **kwargs)
+
+            with mock.patch("builtins.open", side_effect=guarded_open):
+                complete, killed, rounds = _teardown(child_pid=None)
+            self.assertFalse(complete)
+            self.assertTrue(
+                self._alive(child.pid),
+                "malformed-stat child was killed without a verified "
+                "starttime — the teardown must not signal by pid alone")
+        finally:
+            child.kill()
+            child.wait()
 
     def test_teardown_incomplete_when_final_check_scan_incomplete(self):
         # Same shape, but the final check raises _IncompleteChildScan

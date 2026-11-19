@@ -81,11 +81,16 @@ class _IncompleteChildScan(Exception):
     Carries .found (the partial {pid: starttime} snapshot) and
     .pids (the pids whose /proc entries could not be inspected).
     Raised for inspection errors that do NOT establish that the
-    process exited — e.g. PermissionError. Exit races
-    (FileNotFoundError / ProcessLookupError) and torn reads
-    (ValueError / IndexError) are still skipped silently by
-    _children_of: those are the ordinary case of a process dying
-    between the directory listing and the stat read.
+    process exited — e.g. PermissionError, or a malformed /
+    unparseable stat (ValueError / IndexError). Only a missing
+    entry (FileNotFoundError / ProcessLookupError) is skipped
+    silently by _children_of: that is the ordinary case of a
+    process dying between the directory listing and the stat
+    read. A stat that exists but cannot be parsed is NOT proof
+    the process exited — it may be alive with an unreadable
+    entry. (Follow-up 8: ValueError / IndexError were previously
+    treated as torn reads and skipped; a live child with a
+    malformed stat was silently treated as absent.)
     """
 
     def __init__(self, found, pids):
@@ -181,14 +186,17 @@ def _children_of(pid):
     Raises _IncompleteChildScan when individual entries cannot be
     inspected for a reason other than the process having exited:
     a process whose /proc entry is unreadable must never be
-    treated as absent — it may still be alive. Exit races
-    (FileNotFoundError, ProcessLookupError) and torn reads
-    (ValueError, IndexError) are skipped silently: those are the
-    ordinary case of a process dying between the directory
-    listing and the stat read. (Follow-up 7: the previous version
-    caught every OSError here, so a PermissionError on a live
-    daemon's /proc entry was silently skipped and the teardown
-    could report complete with the daemon still alive.)"""
+    treated as absent — it may still be alive. Only a missing
+    entry (FileNotFoundError, ProcessLookupError) is skipped
+    silently: that is the ordinary case of a process dying
+    between the directory listing and the stat read. A stat that
+    exists but cannot be parsed (ValueError, IndexError) is
+    incomplete inspection, not an exit race. (Follow-up 7: the
+    previous version caught every OSError here, so a PermissionError
+    on a live daemon's /proc entry was silently skipped and the
+    teardown could report complete with the daemon still alive.
+    Follow-up 8: ValueError / IndexError were still skipped as
+    "torn reads"; they are now incomplete inspection too.)"""
     found = {}
     try:
         names = os.listdir("/proc")
@@ -205,10 +213,16 @@ def _children_of(pid):
             rest = raw[raw.rfind(b")") + 2:].split()
             if int(rest[1]) == pid:
                 found[child] = int(rest[19])
-        except (FileNotFoundError, ProcessLookupError,
-                ValueError, IndexError):
+        except (FileNotFoundError, ProcessLookupError):
+            # Exit race: the process died between the directory
+            # listing and the stat read. Only a missing entry
+            # proves the process is gone.
             continue
-        except OSError:
+        except (OSError, ValueError, IndexError):
+            # Incomplete inspection: the entry exists but cannot
+            # be read (e.g. PermissionError) or parsed (a
+            # malformed / truncated stat). A live process with an
+            # unreadable entry is never treated as absent.
             inaccessible.append(child)
     if inaccessible:
         raise _IncompleteChildScan(found, inaccessible)
