@@ -2,9 +2,11 @@
 
 Covers vektor_cloud/skills.py only — no server, no network.
 """
+import multiprocessing
 import os
 import shutil
 import socket
+import stat
 import tempfile
 import threading
 import time
@@ -14,6 +16,7 @@ from pathlib import Path
 from vektor_cloud.skills import (
     REFERENCE_CAP,
     SKILL_BODY_CAP,
+    _copy_skill_file,
     _copy_skill_tree,
     _note_info,
     _read_capped,
@@ -24,6 +27,7 @@ from vektor_cloud.skills import (
     load_skill,
     load_skill_reference,
     parse_skill_markdown,
+    _slug_lock,
     recover_interrupted_installs,
     slugify,
 )
@@ -309,7 +313,7 @@ class InstallValidationTest(unittest.TestCase):
         self.assertIn("demo",
                       {s["slug"] for s in discover_skills(self.base, None)})
         leftovers = [p for p in self.dest_root.iterdir()
-                     if p.name.startswith(".demo.")]
+                     if p.name.startswith(".demo.") and not p.name.endswith(".lock")]
         self.assertEqual(leftovers, [], [str(p) for p in leftovers])
 
     def _bad_src(self, name):
@@ -398,7 +402,7 @@ class InstallHardeningTest(unittest.TestCase):
         self.assertIn("demo",
                       {s["slug"] for s in discover_skills(self.base, None)})
         leftovers = [p for p in self.dest_root.iterdir()
-                     if p.name.startswith(".demo.")]
+                     if p.name.startswith(".demo.") and not p.name.endswith(".lock")]
         self.assertEqual(leftovers, [], [str(p) for p in leftovers])
 
     def _bad_src(self, name):
@@ -496,7 +500,7 @@ class InstallHardeningTest(unittest.TestCase):
         self.assertIn(final, [self._skill_md("version-one"),
                               self._skill_md("version-two")])
         leftovers = [p for p in self.dest_root.iterdir()
-                     if p.name.startswith(".demo.")]
+                     if p.name.startswith(".demo.") and not p.name.endswith(".lock")]
         self.assertEqual(leftovers, [], [str(p) for p in leftovers])
 
     def _simulate_crash_between_renames(self):
@@ -515,7 +519,7 @@ class InstallHardeningTest(unittest.TestCase):
         self.assertEqual((self.dest / "SKILL.md").read_text(), SKILL_MD)
         self.assertEqual((self.dest / "references" / "a.md").read_text(), "a")
         leftovers = [p for p in self.dest_root.iterdir()
-                     if p.name.startswith(".demo.")]
+                     if p.name.startswith(".demo.") and not p.name.endswith(".lock")]
         self.assertEqual(leftovers, [], [str(p) for p in leftovers])
 
     def test_install_after_crash_installs_new_version(self):
@@ -528,7 +532,7 @@ class InstallHardeningTest(unittest.TestCase):
         self.assertEqual((self.dest / "SKILL.md").read_text(),
                          self._skill_md("version-two"))
         leftovers = [p for p in self.dest_root.iterdir()
-                     if p.name.startswith(".demo.")]
+                     if p.name.startswith(".demo.") and not p.name.endswith(".lock")]
         self.assertEqual(leftovers, [], [str(p) for p in leftovers])
 
     def test_recovery_cleans_orphan_backup_and_staging(self):
@@ -624,6 +628,262 @@ class InstallHardeningTest(unittest.TestCase):
         self.assertIn("demo", slugs)
         self.assertFalse(any("staging" in s or "backup" in s
                              for s in slugs), slugs)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+# -- Follow-up 6 child-process helpers (module level so the fork
+# start method can run them) -------------------------------------
+def _install_in_child(src, dest_root, slug, queue):
+    """install_skill in a child process; report ok/error on queue."""
+    try:
+        install_skill(src, dest_root, slug)
+        queue.put("ok")
+    except Exception as exc:  # noqa: BLE001 - report, don't crash
+        queue.put(("error", repr(exc)))
+
+
+def _recover_in_child(dest_root, slug, queue, ready):
+    """recover_interrupted_installs in a child; report on queue.
+
+    Waits for `ready` first: the parent takes the per-slug lock
+    before setting it, so the child is forked BEFORE the lock fd
+    exists and cannot inherit it (fork + flock: a child that
+    inherits the lock fd deadlocks against its own copy).
+    """
+    try:
+        ready.wait(timeout=10)
+        recover_interrupted_installs(dest_root, slug)
+        queue.put("ok")
+    except Exception as exc:  # noqa: BLE001 - report, don't crash
+        queue.put(("error", repr(exc)))
+
+
+class InstallFollowup6Test(unittest.TestCase):
+    """F6 (follow-up 6): FIFO race, bounded copying, cross-process
+    install locking. The FIFO and growth tests are written so the
+    OLD code fails them instead of hanging: the FIFO test runs the
+    copy in a worker thread with a join timeout, and the growth
+    test uses a real writer thread coordinated through the target
+    open.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.dest_root = self.base / "skills"
+        self.dest_root.mkdir()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _good_src(self, name, body=SKILL_MD, ref="a"):
+        src = self.base / name
+        (src / "references").mkdir(parents=True)
+        (src / "SKILL.md").write_text(body)
+        (src / "references" / "a.md").write_text(ref)
+        return src
+
+    def test_copy_refuses_fifo_swapped_in_between_stat_and_open(self):
+        # F6 (follow-up 6, Priority 2): a regular file swapped for
+        # a FIFO between the pre-stat and the open. O_NOFOLLOW does
+        # NOT refuse a FIFO, so without O_NONBLOCK the open would
+        # block until a writer appears; with it, the open returns
+        # immediately and the fstat S_ISREG check refuses it. The
+        # copy runs in a worker thread so old code FAILS (thread
+        # still alive at the join timeout) instead of hanging the
+        # suite; the cleanup opens the FIFO for writing to release
+        # a stuck reader.
+        src = self._good_src("good")
+        dst = self.base / "out"
+        target_file = src / "a.md"
+        (src / "a.md").write_text("a" * 100)
+        real_open = os.open
+        swapped = {"done": False}
+
+        def swapping_open(path, flags, *args, **kwargs):
+            name = os.path.basename(os.fspath(path))
+            is_file_open = (kwargs.get("dir_fd") is not None
+                            or "dir_fd" in kwargs)
+            # dir_fd arrives as a keyword in _copy_skill_file.
+            if (name == "a.md" and not swapped["done"]
+                    and not (flags & getattr(os, "O_DIRECTORY", 0))):
+                swapped["done"] = True
+                os.unlink(target_file)
+                os.mkfifo(target_file)
+            return real_open(path, flags, *args, **kwargs)
+
+        result = {}
+
+        def run_copy():
+            try:
+                _copy_skill_tree(src, dst)
+                result["ok"] = True
+            except Exception as exc:  # noqa: BLE001 - captured
+                result["error"] = exc
+
+        import unittest.mock as mock
+        with mock.patch("os.open", side_effect=swapping_open):
+            worker = threading.Thread(target=run_copy, daemon=True)
+            worker.start()
+            worker.join(timeout=5)
+            try:
+                # The discriminating assertion: with O_NONBLOCK the
+                # open returns immediately and the copy finishes in
+                # milliseconds, so the thread must already be done.
+                # Without it, the open blocks until a writer appears
+                # and the thread is still alive here. The cleanup
+                # below only releases a stuck reader so the suite
+                # does not leak a thread; it must NOT run before
+                # this assertion, or it would mask the failure.
+                self.assertFalse(worker.is_alive(),
+                                 "copy blocked on the swapped-in FIFO "
+                                 "(no O_NONBLOCK)")
+            finally:
+                if worker.is_alive():
+                    try:
+                        wfd = real_open(target_file, os.O_WRONLY)
+                        os.close(wfd)
+                    except OSError:
+                        pass
+                    worker.join(timeout=2)
+            self.assertIsInstance(result.get("error"), ValueError,
+                                  result)
+            self.assertFalse((dst / "a.md").exists(),
+                             "partial output left in place")
+
+    def test_copy_aborts_when_file_grows_past_cap(self):
+        # F6 (follow-up 6, Priority 3): a file that grows during
+        # the copy. The writer thread is started by the target
+        # open (which strictly precedes the first read), so the
+        # file is within cap at the pre-stat and over cap at the
+        # first read. The copy must abort with the growth error
+        # and leave no partial target behind.
+        src_dir = self.base / "grow"
+        src_dir.mkdir()
+        src_file = src_dir / "a.md"
+        src_file.write_bytes(b"x" * 1024)
+        out_dir = self.base / "out"
+        out_dir.mkdir()
+        target = out_dir / "a.md"
+        cap = 4096
+        stop = threading.Event()
+
+        def writer():
+            while not stop.is_set():
+                with open(src_file, "ab") as f:
+                    f.write(b"y" * 16384)
+                time.sleep(0.001)
+
+        real_open = os.open
+        started = {"thread": None}
+
+        def triggering_open(path, flags, *args, **kwargs):
+            if (os.fspath(path) == os.fspath(target)
+                    and (flags & os.O_CREAT)
+                    and started["thread"] is None):
+                # The first append is done synchronously here, in
+                # the open hook: a thread-start race made the test
+                # flaky under load (the copy's first read could
+                # return the whole 1 KB file before the writer
+                # thread was even scheduled). The writer thread
+                # then keeps appending concurrently while the copy
+                # streams. Either way the growth lands after the
+                # pre-stat and before/during the streaming reads —
+                # that is the window the cumulative cap must catch.
+                with open(src_file, "ab") as f:
+                    f.write(b"y" * 16384)
+                started["thread"] = threading.Thread(target=writer,
+                                                     daemon=True)
+                started["thread"].start()
+            return real_open(path, flags, *args, **kwargs)
+
+        dfd = os.open(src_dir, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            pre = os.stat("a.md", dir_fd=dfd, follow_symlinks=False)
+            import unittest.mock as mock
+            with mock.patch("os.open", side_effect=triggering_open):
+                with self.assertRaisesRegex(ValueError, "grew past cap"):
+                    _copy_skill_file(dfd, "a.md", pre, target, cap)
+            self.assertFalse(target.exists(),
+                             "partial output left after growth abort")
+        finally:
+            stop.set()
+            if started["thread"] is not None:
+                started["thread"].join(timeout=2)
+            os.close(dfd)
+
+    def test_cross_process_installs_serialized(self):
+        # F6 (follow-up 6, Priority 5): two processes install the
+        # same slug concurrently from different sources. The flock
+        # serializes them: both succeed, and the final install is
+        # exactly one coherent version (body + reference match).
+        # Three rounds to shake out races.
+        ctx = multiprocessing.get_context("fork")
+        for round_no in range(3):
+            src_v1 = self._good_src(f"v1-{round_no}", SKILL_MD.replace(
+                "Do the demo thing.", "version one."), "v1")
+            src_v2 = self._good_src(f"v2-{round_no}", SKILL_MD.replace(
+                "Do the demo thing.", "version two."), "v2")
+            queue = ctx.Queue()
+            p1 = ctx.Process(target=_install_in_child,
+                             args=(src_v1, self.dest_root, "demo", queue))
+            p2 = ctx.Process(target=_install_in_child,
+                             args=(src_v2, self.dest_root, "demo", queue))
+            p1.start()
+            p2.start()
+            p1.join(timeout=10)
+            p2.join(timeout=10)
+            self.assertFalse(p1.is_alive(), "installer 1 hung")
+            self.assertFalse(p2.is_alive(), "installer 2 hung")
+            results = [queue.get(timeout=5), queue.get(timeout=5)]
+            self.assertEqual(results, ["ok", "ok"], results)
+            body = (self.dest_root / "demo" / "SKILL.md").read_text()
+            ref = (self.dest_root / "demo" / "references"
+                   / "a.md").read_text()
+            coherent = ((body == SKILL_MD.replace(
+                "Do the demo thing.", "version one.") and ref == "v1")
+                or (body == SKILL_MD.replace(
+                    "Do the demo thing.", "version two.") and ref == "v2"))
+            self.assertTrue(coherent,
+                            f"incoherent final install: body={body!r} "
+                            f"ref={ref!r}")
+
+    def test_recovery_cannot_delete_active_staging_dir(self):
+        # F6 (follow-up 6, Priority 5): while one process holds the
+        # per-slug lock with a staging directory present, another
+        # process's recovery must block on the lock and must NOT
+        # delete the staging directory. Once the lock is released,
+        # the recovery proceeds and removes the leftover.
+        ctx = multiprocessing.get_context("fork")
+        staging = self.dest_root / ".demo.staging-active"
+        queue = ctx.Queue()
+        ready = ctx.Event()
+        child = ctx.Process(target=_recover_in_child,
+                            args=(self.dest_root, "demo", queue, ready))
+        # Forked BEFORE the lock is taken, so the child cannot
+        # inherit the lock fd (see _recover_in_child).
+        child.start()
+        try:
+            with _slug_lock(self.dest_root, "demo"):
+                staging.mkdir()
+                (staging / "SKILL.md").write_text(SKILL_MD)
+                ready.set()
+                time.sleep(0.5)
+                self.assertTrue(child.is_alive(),
+                                "recovery did not block on the lock")
+                self.assertTrue(staging.exists(),
+                                "recovery deleted an active staging dir")
+            child.join(timeout=5)
+            self.assertFalse(child.is_alive(), "recovery hung")
+            self.assertEqual(queue.get(timeout=5), "ok")
+            self.assertFalse(staging.exists(),
+                             "leftover staging dir was not recovered")
+        finally:
+            if child.is_alive():
+                child.terminate()
+            child.join(timeout=5)
 
 
 if __name__ == "__main__":

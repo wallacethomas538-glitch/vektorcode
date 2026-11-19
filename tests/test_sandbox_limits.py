@@ -16,15 +16,39 @@ also the tree-total CPU budget; a missing /proc refuses the run
 (fail-closed); a daemonized descendant holding the pipes cannot hang
 a timeout (bounded drain). The daemonization escape itself is still
 open and is pinned by a LIMITATION test, not a passing fix.
+
+Follow-up 6: the launcher is now a supervisor — it makes itself a
+child subreaper, so a double-forked daemon is adopted by the
+supervisor and killed in its teardown, and the daemon LIMITATION
+test is converted into a containment test. _scan_proc raises
+_IncompleteProcScan when individual processes cannot be inspected
+for a reason other than an exit race, and the watchdog fails closed
+on it. _kill_tree signals by pidfd-verified identity (pidfd opened
+first, starttime read and compared, then the signal) and asks the
+supervisor to terminate from inside (its SIGTERM handler kills the
+command child by pid, needing no /proc). The pipe-holding-daemon
+test is converted too: the daemon no longer escapes, so run()
+returns the child's exit code promptly and never reaches the
+timeout path; the -1 timeout sentinel is pinned by a test that
+stubs a stuck supervisor instead, since a live stuck supervisor
+has no deterministic trigger (its teardown bound is 3s).
 """
 import os
+import re
+import signal
+import subprocess
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from vektor_cloud.sandbox import Sandbox
+from vektor_cloud.sandbox import (
+    Sandbox,
+    _kill_tree,
+    _scan_proc,
+)
 
 
 class ResourceLimitTest(unittest.TestCase):
@@ -191,22 +215,27 @@ class ResourceLimitTest(unittest.TestCase):
         self.assertIn("/proc", res["stderr"], res)
         self.assertFalse(os.path.exists(marker))
 
-    def test_daemonized_descendant_escapes(self):
-        # F5 (follow-up 5) LIMITATION: a double-forked daemon leaves
-        # both the process group and the ancestry (re-parented to
-        # init), so it is neither monitored nor killed. This test
-        # PASSES while the limitation exists — the daemon writes its
-        # marker after run() has returned. It must be UPDATED (not
-        # deleted) the day real containment lands, like the F3
-        # tripwire test.
+    def test_daemonized_descendant_is_contained(self):
+        # F5 (follow-up 6, Priority 1): CONVERTED from the
+        # follow-up-5 LIMITATION test test_daemonized_descendant_
+        # escapes (same daemon shape - double fork plus setsid).
+        # The launcher is now a supervisor (child subreaper), so
+        # the daemon is adopted by the supervisor and killed in its
+        # teardown. The daemon writes its pid to a pidfile first so
+        # this test can prove it is dead (ESRCH) after run() returns,
+        # and the marker must never appear even after the daemon's
+        # full 30-second sleep would have elapsed. The result must
+        # report the containment as complete, not missing.
         marker = os.path.join(self.tmp.name, "daemon-marker.txt")
+        pidfile = os.path.join(self.tmp.name, "daemon-pid.txt")
         daemon = (
             "import os,time; pid = os.fork()\n"
             "if pid > 0: os._exit(0)\n"
             "os.setsid()\n"
             "pid2 = os.fork()\n"
             "if pid2 > 0: os._exit(0)\n"
-            "time.sleep(2)\n"
+            f"open(\"{pidfile}\", \"w\").write(str(os.getpid()))\n"
+            "time.sleep(30)\n"
             f"open(\"{marker}\", \"w\").write(\"daemon-alive\")\n"
         )
         cmd = ["/bin/sh", "-c", f"python3 -c '{daemon}'"]
@@ -214,19 +243,35 @@ class ResourceLimitTest(unittest.TestCase):
         res = self.box.run(cmd, timeout=30)
         elapsed = time.monotonic() - started
         self.assertEqual(res["returncode"], 0, res)
+        self.assertFalse(res["teardown_incomplete"], res)
+        self.assertFalse(res["supervisor_report_missing"], res)
         self.assertLess(elapsed, 5, res)
-        deadline = time.monotonic() + 8
-        while not os.path.exists(marker) and time.monotonic() < deadline:
-            time.sleep(0.2)
-        self.assertTrue(os.path.exists(marker),
-                        "daemon did not outlive the run")
+        deadline = time.monotonic() + 2
+        while not os.path.exists(pidfile) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(os.path.exists(pidfile),
+                        "daemon never started")
+        daemon_pid = int(Path(pidfile).read_text())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(daemon_pid, 0)
+        time.sleep(3)
+        self.assertFalse(os.path.exists(marker),
+                         "daemon outlived the run and wrote its marker")
 
-    def test_escaped_descendant_holding_pipes_does_not_hang_timeout(self):
-        # F5 (follow-up 5): on follow-up-4 code, a daemonized
-        # descendant holding the stdout pipe made run(timeout=3)
-        # block until the daemon exited (a 3s timeout blocked 20s+
-        # in the probe). The bounded drain must return the handler
-        # thread at timeout + drain grace, with the -1 sentinel.
+    def test_pipe_holding_daemon_is_contained_no_timeout(self):
+        # F5 (follow-up 6): CONVERTED from the follow-up-5 test
+        # test_escaped_descendant_holding_pipes_does_not_hang_
+        # timeout. On follow-up-4 code a daemonized descendant
+        # holding the stdout pipe made run(timeout=3) block until
+        # the daemon exited (a 3s timeout blocked 20s+ in the
+        # probe), and the bounded drain was the only defence. The
+        # daemon no longer escapes at all — the supervisor kills
+        # it in teardown — so run() returns the child's exit code
+        # promptly and never reaches the timeout path. The -1
+        # timeout sentinel is pinned separately by
+        # test_timeout_sentinel_when_supervisor_stuck, since a
+        # live stuck supervisor has no deterministic trigger (its
+        # teardown bound is 3s).
         daemon = (
             "import os,time,sys; pid = os.fork()\n"
             "if pid > 0: os._exit(0)\n"
@@ -242,9 +287,243 @@ class ResourceLimitTest(unittest.TestCase):
         started = time.monotonic()
         res = self.box.run(cmd, timeout=3)
         elapsed = time.monotonic() - started
+        self.assertEqual(res["returncode"], 0, res)
+        self.assertFalse(res["timed_out"], res)
+        self.assertFalse(res["teardown_incomplete"], res)
+        self.assertLess(elapsed, 10, res)
+
+    def test_timeout_sentinel_when_supervisor_stuck(self):
+        # F5 (follow-up 6): the -1 sentinel. A live supervisor
+        # always exits within its 3s teardown bound, so there is
+        # no deterministic live trigger for a stuck supervisor;
+        # this test stubs Popen.communicate to raise TimeoutExpired
+        # on both the wall-clock call and the drain-grace call,
+        # simulating a supervisor that never exits, and pins that
+        # run() then returns -1 with timed_out True instead of
+        # hanging. The real tree is still killed by _kill_tree
+        # (the sleep is dead afterwards), so the stub only changes
+        # what run() observes, not what it kills.
+        real_popen = subprocess.Popen
+        calls = {"n": 0}
+
+        def failing_communicate(self, *args, **kwargs):
+            calls["n"] += 1
+            raise subprocess.TimeoutExpired(cmd="sleep", timeout=1)
+
+        started = time.monotonic()
+        with mock.patch.object(subprocess.Popen, "communicate",
+                               failing_communicate):
+            res = self.box.run(["/bin/sh", "-c", "sleep 30"],
+                               timeout=1)
+        elapsed = time.monotonic() - started
+        self.assertEqual(calls["n"], 2, res)
         self.assertEqual(res["returncode"], -1, res)
         self.assertTrue(res["timed_out"], res)
+        self.assertLess(elapsed, 15, res)
+
+    def test_watchdog_incomplete_inspection_fails_closed(self):
+        # F5 (follow-up 6, Priority 4): if the watchdog cannot read
+        # a tree member's /proc stat for a reason other than an
+        # exit race, it must fail closed - watchdog_failed True
+        # and the tree killed - never silently report success.
+        # The patched open raises PermissionError for
+        # /proc/<pid>/stat reads only; everything else delegates
+        # to the real open. The kill itself does not depend on
+        # /proc: _kill_tree signals the supervisor, whose handler
+        # kills the command child by pid from inside.
+        real_open = open
+
+        def guarded(path, *args, **kwargs):
+            s = os.fspath(path)
+            if isinstance(s, str) and re.fullmatch(r"/proc/\d+/stat", s):
+                raise PermissionError("simulated inspection failure")
+            return real_open(path, *args, **kwargs)
+
+        started = time.monotonic()
+        with mock.patch("builtins.open", side_effect=guarded):
+            res = self.box.run(["/bin/sh", "-c", "sleep 30"],
+                               timeout=10)
+        elapsed = time.monotonic() - started
+        self.assertTrue(res["watchdog_failed"], res)
+        self.assertLess(res["returncode"], 0, res)
         self.assertLess(elapsed, 10, res)
+
+    def test_watchdog_exit_race_stays_silent_skip(self):
+        # F5 (follow-up 6, Priority 4): the other side of the
+        # contract - a FileNotFoundError on a /proc stat read is
+        # an ordinary exit race (the process died between the
+        # listdir and the read) and stays a silent skip, NOT a
+        # watchdog failure. Here every stat read "races", so the
+        # watchdog sees an empty tree and never trips; the run
+        # ends on the wall-clock timeout instead, killed from
+        # inside by the supervisor.
+        real_open = open
+
+        def guarded(path, *args, **kwargs):
+            s = os.fspath(path)
+            if isinstance(s, str) and re.fullmatch(r"/proc/\d+/stat", s):
+                raise FileNotFoundError("simulated exit race")
+            return real_open(path, *args, **kwargs)
+
+        started = time.monotonic()
+        with mock.patch("builtins.open", side_effect=guarded):
+            res = self.box.run(["/bin/sh", "-c", "sleep 30"],
+                               timeout=3)
+        elapsed = time.monotonic() - started
+        self.assertFalse(res["watchdog_failed"], res)
+        self.assertTrue(res["timed_out"], res)
+        self.assertLess(elapsed, 10, res)
+
+    # -- P6 helpers -------------------------------------------------
+    def _spawn_sleep_tree(self, root_cmd):
+        # Start a root process that spawns a sleep child, and return
+        # (root_proc, child_pid) once the child shows up in the
+        # process table. The root keeps sleeping itself, so it
+        # survives _kill_tree (the root is never a kill target).
+        root = subprocess.Popen(root_cmd, start_new_session=True)
+        deadline = time.monotonic() + 5
+        child = None
+        while time.monotonic() < deadline:
+            procs = _scan_proc()
+            for pid, info in procs.items():
+                if info["ppid"] == root.pid:
+                    child = pid
+                    break
+            if child is not None:
+                break
+            time.sleep(0.05)
+        self.assertIsNotNone(child, "sleep child never appeared")
+        return root, child
+
+    def _alive(self, pid):
+        # Alive means running, not merely present: a zombie (killed
+        # but not yet reaped by its parent, which may be sleeping
+        # for a minute) still answers kill(pid, 0) with success,
+        # so read the state from /proc and treat "Z" as dead.
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as f:
+                raw = f.read()
+        except OSError:
+            return False
+        rest = raw[raw.rfind(b")") + 2:].split()
+        return rest[0] != b"Z"
+
+    def test_kill_tree_kills_descendant_by_identity(self):
+        # P6 positive control: _kill_tree on a real tree kills the
+        # descendant (verified by pidfd + starttime) and leaves the
+        # root alone - the root is never a kill target.
+        # The root ignores SIGTERM, like the supervisor does:
+        # _kill_tree signals the root (its SIGTERM handler kills
+        # the command child from inside), and a plain root would
+        # die on it. The identity checks below are about the
+        # descendant, not the root.
+        root, child = self._spawn_sleep_tree(
+            ["python3", "-c",
+             "import signal,subprocess,time; "
+             "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+             "subprocess.Popen(['sleep', '30']); time.sleep(60)"])
+        try:
+            self.assertTrue(self._alive(child))
+            _kill_tree(pgid=root.pid, root_pid=root.pid)
+            deadline = time.monotonic() + 3
+            while self._alive(child) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertFalse(self._alive(child),
+                             "descendant survived _kill_tree")
+            self.assertIsNone(root.poll(), "root was killed too")
+        finally:
+            if root.poll() is None:
+                root.kill()
+            root.wait()
+
+    def test_kill_tree_skips_reused_pid(self):
+        # P6 (Priority 6): simulate PID reuse - the scan reports
+        # the sleep child with a WRONG starttime, as if its pid
+        # had been reused by a different process. _kill_tree must
+        # NOT signal it: the pidfd path opens the fd first, then
+        # reads the real starttime and refuses on the mismatch.
+        # The root ignores SIGTERM, like the supervisor does:
+        # _kill_tree signals the root (its SIGTERM handler kills
+        # the command child from inside), and a plain root would
+        # die on it. The identity checks below are about the
+        # descendant, not the root.
+        root, child = self._spawn_sleep_tree(
+            ["python3", "-c",
+             "import signal,subprocess,time; "
+             "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+             "subprocess.Popen(['sleep', '30']); time.sleep(60)"])
+        try:
+            real = _scan_proc()
+            self.assertIn(child, real)
+            forged = dict(real)
+            info = dict(forged[child])
+            info["starttime"] = info["starttime"] + 12345
+            forged[child] = info
+            with mock.patch("vektor_cloud.sandbox._scan_proc",
+                           return_value=forged):
+                _kill_tree(pgid=root.pid, root_pid=root.pid)
+            time.sleep(0.3)
+            self.assertTrue(self._alive(child),
+                            "reused pid was signalled anyway")
+            self.assertIsNone(root.poll())
+        finally:
+            if root.poll() is None:
+                root.kill()
+            root.wait()
+            # The child outlives the root (re-parented); kill it.
+            if self._alive(child):
+                os.kill(child, signal.SIGKILL)
+
+    def test_kill_tree_skips_group_when_leader_identity_changed(self):
+        # P6 (Priority 6): the direct child setsid'd into its own
+        # group and spawned a sleep in that group. The scan reports
+        # the group leader with a WRONG starttime (reused pid) but
+        # the sleep with its correct one. killpg must be skipped
+        # (the leader's identity no longer matches), the leader
+        # itself must not be signalled by pid either, but the
+        # correctly identified sleep must still be killed by pid.
+        root = subprocess.Popen(
+            ["/bin/sh", "-c",
+             "python3 -c \"import os,time; os.setsid(); "
+             "os.system('sleep 30'); time.sleep(30)\" & wait"],
+            start_new_session=True)
+        try:
+            deadline = time.monotonic() + 5
+            leader = sleeper = None
+            while time.monotonic() < deadline:
+                procs = _scan_proc()
+                for pid, info in procs.items():
+                    if info["ppid"] == root.pid and info["pgrp"] == pid:
+                        leader = pid
+                    if info["ppid"] == leader and leader is not None:
+                        sleeper = pid
+                if leader is not None and sleeper is not None:
+                    break
+                time.sleep(0.05)
+            self.assertIsNotNone(leader, "group leader never appeared")
+            self.assertIsNotNone(sleeper, "group sleeper never appeared")
+            real = _scan_proc()
+            forged = dict(real)
+            info = dict(forged[leader])
+            info["starttime"] = info["starttime"] + 12345
+            forged[leader] = info
+            with mock.patch("vektor_cloud.sandbox._scan_proc",
+                           return_value=forged):
+                _kill_tree(pgid=root.pid, root_pid=root.pid)
+            deadline = time.monotonic() + 3
+            while self._alive(sleeper) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertFalse(self._alive(sleeper),
+                             "correctly identified sleeper survived")
+            self.assertTrue(self._alive(leader),
+                            "leader with changed identity was killed")
+        finally:
+            for pid in (leader, sleeper):
+                if pid is not None and self._alive(pid):
+                    os.kill(pid, signal.SIGKILL)
+            if root.poll() is None:
+                root.kill()
+            root.wait()
 
 
 if __name__ == "__main__":

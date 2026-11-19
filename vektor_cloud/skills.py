@@ -16,12 +16,14 @@ external data. The trust boundary is the install/save path: repo
 skills ship with code Wallace approved, state notes are saved by
 Wallace through the authenticated /api/skill/save endpoint.
 """
+import fcntl
 import os
 import re
 import shutil
 import stat
 import threading
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 SKILL_BODY_CAP = 12000
@@ -341,20 +343,51 @@ def _validate_skill_tree(skill_dir: Path) -> dict:
     return info
 
 
-# One lock per installed skill slug, so two concurrent installs of the
-# same slug cannot race the validate → stage → swap sequence. The
-# locks are never removed (removing one reintroduces the race); one
-# entry per distinct slug ever installed is negligible. Threading
-# locks are per-process only, like the F1 OAuth lock — two processes
-# installing the same slug can still race (see the F5/F1 report).
+# One lock per installed skill slug, in two layers (follow-up 6):
+# a threading lock for threads in this process, and an flock(2)
+# exclusive lock on a per-slug lock file for processes. The threading
+# lock is taken first: it serializes threads, and it also makes the
+# flock acquisition safe — flock conflicts even within one process
+# across separate opens, so code that already holds a slug's lock
+# (install_skill calling recovery for the same slug) must not try
+# to flock it again. The lock files are never deleted: deleting a
+# lock file reintroduces the race it exists to close. flock is
+# released by the OS when the holder dies, so a crashed install's
+# lock does not block the recovery that follows it. The lock file is
+# dot-prefixed, so discover_skills never lists it as a skill.
 _INSTALL_LOCKS: dict[str, threading.Lock] = {}
 _INSTALL_LOCKS_GUARD = threading.Lock()
 
 
-def _install_lock(slug):
-    """Return the install lock for one slug (acquire with `with`)."""
+def _thread_install_lock(slug):
+    """Return the in-process install lock for one slug."""
     with _INSTALL_LOCKS_GUARD:
         return _INSTALL_LOCKS.setdefault(slug, threading.Lock())
+
+
+@contextmanager
+def _slug_lock(skills_dir, slug):
+    """Hold both layers of the per-slug install lock: the threading
+    lock, then an exclusive flock on `.<slug>.lock` in the skills
+    directory. Blocks until every other thread and process
+    installing the same slug has finished. The caller must ensure
+    the skills directory exists first."""
+    skills_dir = Path(skills_dir)
+    lock_path = skills_dir / f".{slug}.lock"
+    thread_lock = _thread_install_lock(slug)
+    with thread_lock:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+        finally:
+            os.close(fd)
 
 
 def _remove_tree_or_link(path):
@@ -365,23 +398,13 @@ def _remove_tree_or_link(path):
         path.unlink()
 
 
-def recover_interrupted_installs(skills_dir, slug=None):
-    """Heal interrupted installs in a skills directory (F6, follow-up 5).
-
-    A crash between install_skill's two renames leaves the destination
-    missing and the old install as `.<slug>.backup-<tag>`; a crash
-    during staging leaves `.<slug>.staging-<tag>` behind. For each
-    leftover: a backup whose destination is missing is renamed back
-    into place (the old install is restored, exactly as it was — no
-    validation, recovery restores the previous state); a backup whose
-    destination exists is an orphan from a completed install and is
-    removed; a staging directory was never live and is removed.
-    When slug is given, only that slug is healed (called under the
-    install lock at the start of install_skill); otherwise every
-    leftover is healed. Returns {"recovered": [...], "cleaned": [...]}.
-    Idempotent: a leftover that vanished mid-scan (another thread
-    healed it) is skipped.
-    """
+def _recover_locked(skills_dir, slug):
+    """Heal one slug's interrupted install. The caller must hold
+    that slug's lock (see _slug_lock): recovery deletes staging
+    directories and renames backups, so it must never run while
+    another process is actively installing the same slug — without
+    the lock it could delete a live staging directory out from
+    under a running install (follow-up 6)."""
     skills_dir = Path(skills_dir)
     recovered, cleaned = [], []
     try:
@@ -404,7 +427,7 @@ def recover_interrupted_installs(skills_dir, slug=None):
         if parsed is None:
             continue
         target_slug, kind = parsed
-        if slug is not None and target_slug != slug:
+        if target_slug != slug:
             continue
         dest = skills_dir / target_slug
         try:
@@ -420,6 +443,67 @@ def recover_interrupted_installs(skills_dir, slug=None):
                     cleaned.append(target_slug)
         except OSError:
             continue
+    return {"recovered": recovered, "cleaned": cleaned}
+
+
+def _leftover_slugs(skills_dir):
+    """Slugs with a backup or staging leftover in a skills dir."""
+    skills_dir = Path(skills_dir)
+    slugs = set()
+    try:
+        children = sorted(skills_dir.iterdir())
+    except OSError:
+        return slugs
+    for child in children:
+        name = child.name
+        if not name.startswith("."):
+            continue
+        for marker in (".backup-", ".staging-"):
+            rest = name[1:]
+            if marker in rest:
+                base, _tag = rest.rsplit(marker, 1)
+                if base:
+                    slugs.add(base)
+                break
+    return slugs
+
+
+def recover_interrupted_installs(skills_dir, slug=None):
+    """Heal interrupted installs in a skills directory (F6, follow-up 5).
+
+    A crash between install_skill's two renames leaves the destination
+    missing and the old install as `.<slug>.backup-<tag>`; a crash
+    during staging leaves `.<slug>.staging-<tag>` behind. For each
+    leftover: a backup whose destination is missing is renamed back
+    into place (the old install is restored, exactly as it was — no
+    validation, recovery restores the previous state); a backup whose
+    destination exists is an orphan from a completed install and is
+    removed; a staging directory was never live and is removed.
+    When slug is given, only that slug is healed (called under the
+    install lock at the start of install_skill); otherwise every
+    leftover is healed. Returns {"recovered": [...], "cleaned": [...]}.
+    Idempotent: a leftover that vanished mid-scan (another thread
+    healed it) is skipped.
+
+    Cross-process safety (follow-up 6): every slug's recovery runs
+    under that slug's lock, so recovery can never delete another
+    process's ACTIVE staging directory — an active install holds
+    the lock, and recovery blocks on it instead. When healing every
+    slug, locks are taken one at a time in sorted slug order, so two
+    processes recovering different slug sets cannot deadlock.
+    """
+    skills_dir = Path(skills_dir)
+    if not skills_dir.is_dir():
+        return {"recovered": [], "cleaned": []}
+    if slug is not None:
+        with _slug_lock(skills_dir, slug):
+            return _recover_locked(skills_dir, slug)
+    recovered, cleaned = [], []
+    for target_slug in sorted(_leftover_slugs(skills_dir)):
+        with _slug_lock(skills_dir, target_slug):
+            result = _recover_locked(skills_dir, target_slug)
+        recovered.extend(result["recovered"])
+        cleaned.extend(result["cleaned"])
     return {"recovered": recovered, "cleaned": cleaned}
 
 
@@ -493,12 +577,26 @@ def _copy_skill_dir_fd(dfd, dst):
 
 
 def _copy_skill_file(dfd, name, pre_stat, target, cap):
-    """Copy one regular file: open with O_NOFOLLOW relative to its
-    parent directory's descriptor, re-check by fstat, stream in
-    bounded chunks (see _copy_skill_tree)."""
+    """Copy one regular file: open with O_NOFOLLOW + O_NONBLOCK
+    relative to its parent directory's descriptor, re-check by
+    fstat, stream in bounded chunks (see _copy_skill_tree).
+
+    O_NONBLOCK matters because O_NOFOLLOW does NOT refuse a FIFO:
+    without it, a regular file swapped for a FIFO between the
+    pre-stat and the open would block the open until a writer
+    appears. With O_NONBLOCK the open returns immediately and the
+    fstat S_ISREG check below refuses it. The cumulative byte cap
+    is enforced WHILE streaming (follow-up 6): the pre-check only
+    bounds the size at open time, so a file that grows during the
+    copy (concurrent writer) would otherwise be copied past the
+    cap. When the running total exceeds the cap, the copy aborts
+    and the partial target is removed — no over-cap file is ever
+    left in place.
+    """
     try:
         fd = os.open(name,
-                     os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                     os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                     | getattr(os, "O_NONBLOCK", 0),
                      dir_fd=dfd)
     except OSError as exc:
         raise ValueError(f"cannot open file: {name}") from exc
@@ -512,10 +610,15 @@ def _copy_skill_file(dfd, name, pre_stat, target, cap):
             raise ValueError(f"file too large: {name}")
         out = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
         try:
+            total = 0
             while True:
                 chunk = os.read(fd, 64 * 1024)
                 if not chunk:
                     break
+                total += len(chunk)
+                if total > cap:
+                    raise ValueError(
+                        f"file grew past cap during copy: {name}")
                 view = memoryview(chunk)
                 while view:
                     written = os.write(out, view)
@@ -526,6 +629,12 @@ def _copy_skill_file(dfd, name, pre_stat, target, cap):
             except OSError:
                 pass
             raise ValueError(f"cannot copy file: {name}") from exc
+        except ValueError:
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
         finally:
             os.close(out)
     finally:
@@ -545,14 +654,18 @@ def install_skill(src_dir, dest_root, slug: str | None = None) -> dict:
     special (FIFO / socket / device) entries anywhere in the
     replacement, including a symlinked source root. Concurrent
     installs of the same slug are serialized by a per-slug lock
-    (follow-up 5). Interrupted installs are healed first: a crash
-    between the two renames leaves the old install as a backup
-    directory, and recover_interrupted_installs restores it before
-    the new install proceeds."""
+    that works across processes as well as threads (follow-up 6):
+    a threading lock plus an flock on `.<slug>.lock`. Interrupted
+    installs are healed first: a crash between the two renames
+    leaves the old install as a backup directory, and
+    recover_interrupted_installs restores it before the new install
+    proceeds."""
     src = Path(src_dir)
     slug = slugify(slug or src.name)
-    with _install_lock(slug):
-        recover_interrupted_installs(Path(dest_root), slug)
+    dest_root = Path(dest_root)
+    dest_root.mkdir(parents=True, exist_ok=True)
+    with _slug_lock(dest_root, slug):
+        _recover_locked(dest_root, slug)
         _validate_skill_tree(src)
         dest = Path(dest_root) / slug
         tag = uuid.uuid4().hex[:12]
