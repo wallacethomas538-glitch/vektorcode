@@ -386,6 +386,9 @@ READ_SKILL_REFERENCE_SCHEMA = {"type": "function", "function": {
                       "description": "Path relative to the skill directory, e.g. references/environment/distribution.md"}},
         "required": ["skill", "reference"]}}}
 SHELL_APPROVAL_TTL_SECONDS = 600
+# Meta OAuth state lifetime: a login must complete within 10 minutes
+# of initiation, and the state is single-use (consumed on first match).
+META_OAUTH_STATE_TTL_SECONDS = 600
 SHELL_CALL_CAP_PER_SESSION = 5
 # Pending shell approvals: approval_id -> {command, session_id,
 # expires, approved, used}. In-memory only: a restart drops pending
@@ -1666,15 +1669,44 @@ class Handler(BaseHTTPRequestHandler):
             if not require_auth(self): self.send_json({"ok": False, "error": "Authentication required", "retryable": False}, 401); return
             self.send_json({"ok": True, "servers": store().mcp_server_list()}); return
         if self.path == "/api/meta/login":
+            # OAuth initiation mints a server-side state token, so only
+            # an authenticated session may start it. Before this gate,
+            # anyone could mint a state and complete the flow, binding
+            # their own Facebook profile to the server.
+            if not require_auth(self): self.send_json({"ok": False, "error": "Authentication required", "retryable": False}, 401); return
             if not meta_ready(): self.send_json({"ok":False,"error":"Meta OAuth is not configured on Render"}, 503); return
-            state = secrets.token_urlsafe(24); self.save_setting("meta_oauth_state", state)
+            state = secrets.token_urlsafe(24)
+            # Stored with a creation time so the callback can expire it.
+            # (Settings are JSON-serialized; a legacy plain-string
+            # value reads back as a non-dict and is treated as invalid.)
+            self.save_setting("meta_oauth_state", {"state": state, "created": time.time()})
             redirect = os.environ.get("META_REDIRECT_URI", public_base(self) + "/api/meta/callback")
             params = urlencode({"client_id":os.environ["META_APP_ID"],"redirect_uri":redirect,"state":state,"scope":os.environ.get("META_SCOPES","public_profile,email"),"response_type":"code"})
             self.send_response(302); self.send_header("Location", "https://www.facebook.com/v24.0/dialog/oauth?" + params); self.end_headers(); return
         if self.path.startswith("/api/meta/callback"):
             query = parse_qs(urlparse(self.path).query); code = query.get("code", [""])[0]; state = query.get("state", [""])[0]
-            if not code or not secrets.compare_digest(state, self.setting("meta_oauth_state", "")):
+            # State validation: the saved state is a {"state", "created"}
+            # dict (see /api/meta/login). A missing code leaves the state
+            # untouched — the legitimate redirect has not completed yet.
+            # A matching state is consumed BEFORE the token exchange, so
+            # a replayed callback URL cannot complete a second login,
+            # and an expired state (10 minutes) is refused outright.
+            # Residual, stated plainly: the callback itself cannot carry
+            # the session cookie (vc_auth is SameSite=Strict, and the
+            # redirect from Facebook is cross-site), so the single-use,
+            # time-limited state is the binding between the initiation
+            # (which requires auth) and this callback. Allowing the
+            # cookie on the callback would need SameSite=Lax — a
+            # decision for Big Chat, not a silent change here.
+            saved = self.setting("meta_oauth_state", "")
+            saved_state = saved.get("state", "") if isinstance(saved, dict) else ""
+            saved_created = saved.get("created", 0) if isinstance(saved, dict) else 0
+            if not code or not saved_state or not secrets.compare_digest(state, saved_state):
                 self.send_error(400, "Invalid Meta OAuth state"); return
+            if time.time() - saved_created > META_OAUTH_STATE_TTL_SECONDS:
+                self.save_setting("meta_oauth_state", "")
+                self.send_error(400, "Invalid Meta OAuth state"); return
+            self.save_setting("meta_oauth_state", "")
             redirect = os.environ.get("META_REDIRECT_URI", public_base(self) + "/api/meta/callback")
             token_url = "https://graph.facebook.com/v24.0/oauth/access_token?" + urlencode({"client_id":os.environ["META_APP_ID"],"client_secret":os.environ["META_APP_SECRET"],"redirect_uri":redirect,"code":code})
             try:
@@ -1685,7 +1717,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.save_setting("meta_access_token", access_token)
                 receipt("meta_login", {"id":profile.get("id"),"name":profile.get("name")}, True, True)
                 self.send_response(302); self.send_header("Location", "/?meta=connected"); self.end_headers()
-            except (HTTPError, URLError, KeyError, ValueError) as exc: self.send_error(502, "Meta login failed: " + str(exc)[:160])
+            except (HTTPError, URLError, KeyError, ValueError,
+                    TimeoutError) as exc: self.send_error(502, "Meta login failed: " + str(exc)[:160])
             return
         if self.path == "/api/state":
             auth_enabled = bool(os.environ.get("VEKTORCODE_TOOL_PASSWORD"))

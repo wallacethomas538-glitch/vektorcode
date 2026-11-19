@@ -64,15 +64,51 @@ def parse_skill_markdown(text: str, fallback_name: str = "") -> dict:
             "description": description, "body": body}
 
 
+def _read_capped(path: Path, cap_chars: int) -> str | None:
+    """Read a skill file with the size enforced BEFORE its content is
+    held in memory (F6).
+
+    1. Resolve symlinks first, so a link to a huge file elsewhere is
+       measured by its target, not by the link.
+    2. Stat the resolved target and refuse WITHOUT opening when the
+       byte size exceeds cap_chars * 4 + 1024 (max 4 bytes per UTF-8
+       char, plus frontmatter slack — a bigger file cannot be within
+       the char cap).
+    3. Read at most cap_chars + 1 chars, so the held content stays
+       bounded by the cap even when the byte pre-check passes.
+    Returns None when the file is missing, unreadable, or oversized.
+    """
+    try:
+        resolved = path.resolve()
+        size = resolved.stat().st_size
+    except OSError:
+        return None
+    if size > cap_chars * 4 + 1024:
+        return None
+    try:
+        with resolved.open(encoding="utf-8") as f:
+            return f.read(cap_chars + 1)
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
 def _skill_dir_info(skill_dir: Path) -> dict | None:
     """Read one skill directory. Returns None when it has no SKILL.md."""
     skill_file = skill_dir / "SKILL.md"
     if not skill_file.is_file():
         return None
+    # The SKILL.md itself must live in this directory: resolve it and
+    # refuse when a symlink points the read elsewhere.
     try:
-        parsed = parse_skill_markdown(
-            skill_file.read_text(encoding="utf-8"),
-            fallback_name=skill_dir.name)
+        if skill_file.resolve().parent != skill_dir.resolve():
+            return None
+    except OSError:
+        return None
+    text = _read_capped(skill_file, SKILL_BODY_CAP)
+    if text is None:
+        return None
+    try:
+        parsed = parse_skill_markdown(text, fallback_name=skill_dir.name)
     except (OSError, UnicodeDecodeError):
         return None
     references = []
@@ -89,10 +125,18 @@ def _skill_dir_info(skill_dir: Path) -> dict | None:
 
 def _note_info(note_file: Path) -> dict | None:
     """Read one loose Markdown note (saved via /api/skill/save)."""
+    # Same rule as skills: the note must resolve inside its own
+    # directory — a symlink pointing elsewhere is refused.
     try:
-        parsed = parse_skill_markdown(
-            note_file.read_text(encoding="utf-8"),
-            fallback_name=note_file.stem)
+        if note_file.resolve().parent != note_file.parent.resolve():
+            return None
+    except OSError:
+        return None
+    text = _read_capped(note_file, SKILL_BODY_CAP)
+    if text is None:
+        return None
+    try:
+        parsed = parse_skill_markdown(text, fallback_name=note_file.stem)
     except (OSError, UnicodeDecodeError):
         return None
     return {"slug": slugify(note_file.stem), "name": parsed["name"],
@@ -122,6 +166,10 @@ def discover_skills(repo_root=None, state_dir=None) -> list:
         if not skills_dir.is_dir():
             continue
         for child in sorted(skills_dir.iterdir()):
+            # A symlinked skill entry could point the read anywhere
+            # (F6 alternate-path bypass): only real entries load.
+            if child.is_symlink():
+                continue
             if child.is_dir():
                 info = _skill_dir_info(child)
             elif child.is_file() and child.suffix.lower() == ".md":
@@ -152,6 +200,9 @@ def load_skill(repo_root=None, state_dir=None, slug: str = "") -> dict | None:
         if not skills_dir.is_dir():
             continue
         for child in sorted(skills_dir.iterdir()):
+            # Symlinked entries are refused (see discover_skills).
+            if child.is_symlink():
+                continue
             if child.is_dir():
                 info = _skill_dir_info(child)
             elif child.is_file() and child.suffix.lower() == ".md":
@@ -187,9 +238,11 @@ def load_skill_reference(repo_root=None, state_dir=None,
         return None
     if not target.is_file():
         return None
-    try:
-        content = target.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
+    # Size is enforced on the resolved target before reading (F6):
+    # a symlink to a huge file inside the skill dir is refused here
+    # even though it passes the relative_to check above.
+    content = _read_capped(target, REFERENCE_CAP)
+    if content is None:
         return None
     return {"skill": skill["slug"], "reference": reference,
             "content": content[:REFERENCE_CAP]}
@@ -208,6 +261,8 @@ def install_skill(src_dir, dest_root, slug: str | None = None) -> dict:
         shutil.rmtree(dest)
     shutil.copytree(src, dest)
     info = _skill_dir_info(dest)
+    if info is None:
+        raise ValueError(f"skill is too large or unreadable: {dest}")
     return {"slug": dest.name, "name": info["name"],
             "description": info["description"], "path": str(dest),
             "reference_count": len(info["references"])}

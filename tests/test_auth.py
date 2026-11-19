@@ -32,17 +32,34 @@ import app
 PASSWORD = "test-tool-password"
 
 
-def _http(port, method, path, payload=None, headers=None):
+def _parse_body(raw):
+    """JSON when the server sent JSON; error pages (send_error HTML)
+    come back as plain text instead of crashing the helper."""
+    try:
+        return json.loads(raw or b"{}")
+    except (ValueError, UnicodeDecodeError):
+        return {"_raw": (raw or b"").decode("utf-8", "replace")}
+
+
+def _http(port, method, path, payload=None, headers=None,
+          follow_redirects=True):
     """Returns (status, response-headers, parsed-body)."""
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}{path}", data=data, method=method,
         headers={"Content-Type": "application/json", **(headers or {})})
+    if follow_redirects:
+        opener = urllib.request.build_opener()
+    else:
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+        opener = urllib.request.build_opener(_NoRedirect)
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.status, resp.headers, json.loads(resp.read() or b"{}")
+        with opener.open(req, timeout=10) as resp:
+            return resp.status, resp.headers, _parse_body(resp.read())
     except urllib.error.HTTPError as exc:
-        return exc.code, exc.headers, json.loads(exc.read() or b"{}")
+        return exc.code, exc.headers, _parse_body(exc.read())
 
 
 # (method, path, payload) for every protected write/action endpoint.
@@ -122,8 +139,10 @@ class AuthTest(unittest.TestCase):
             else:
                 os.environ[key] = value
 
-    def _call(self, method, path, payload=None, headers=None):
-        return _http(self.port, method, path, payload, headers)
+    def _call(self, method, path, payload=None, headers=None,
+              follow_redirects=True):
+        return _http(self.port, method, path, payload, headers,
+                     follow_redirects)
 
     def _login(self, password, headers=None):
         status, resp_headers, _ = self._call(
@@ -248,6 +267,101 @@ class AuthTest(unittest.TestCase):
         del os.environ["RENDER"]
         _, cookie = self._login(PASSWORD)
         self.assertNotIn("; Secure", cookie)
+
+    # --- F1 follow-up: Meta OAuth protection (Big Chat, 2026-11-18) ---
+
+    def _meta_env(self):
+        """Enable Meta OAuth for one test; returns old values to restore."""
+        old = {k: os.environ.get(k) for k in ("META_APP_ID", "META_APP_SECRET")}
+        os.environ["META_APP_ID"] = "test-app-id"
+        os.environ["META_APP_SECRET"] = "test-app-secret"
+        return old
+
+    def _restore_env(self, old):
+        for key, value in old.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def _mint_meta_state(self, headers):
+        """Authenticated GET /api/meta/login; returns the state from the
+        302 Location header."""
+        from urllib.parse import urlparse, parse_qs
+        # The 302 target is facebook.com: do NOT follow it (the test
+        # must not fetch Facebook). _http returns the 302 itself.
+        status, resp_headers, _ = self._call(
+            "GET", "/api/meta/login", headers=headers,
+            follow_redirects=False)
+        self.assertEqual(status, 302, resp_headers)
+        location = resp_headers.get("Location", "")
+        self.assertIn("facebook.com", location)
+        return parse_qs(urlparse(location).query)["state"][0]
+
+    def test_meta_login_requires_auth(self):
+        """GET /api/meta/login 401s without a cookie; 302s when logged in."""
+        old = self._meta_env()
+        try:
+            os.environ["VEKTORCODE_TOOL_PASSWORD"] = PASSWORD
+            status, _, body = self._call("GET", "/api/meta/login")
+            self.assertEqual(status, 401, body)
+            _, cookie = self._login(PASSWORD)
+            headers = {"Cookie": cookie.split(";")[0]}
+            state = self._mint_meta_state(headers)
+            self.assertTrue(state)
+        finally:
+            self._restore_env(old)
+
+    def test_meta_login_fails_closed_on_render(self):
+        """No password + RENDER: the OAuth initiation refuses too."""
+        old = self._meta_env()
+        try:
+            os.environ["RENDER"] = "true"
+            status, _, body = self._call("GET", "/api/meta/login")
+            self.assertEqual(status, 401, body)
+        finally:
+            self._restore_env(old)
+
+    def test_meta_callback_state_single_use_and_expiry(self):
+        """Callback: wrong state and missing code leave the state alone;
+        a matched state is consumed on first use; expired states refuse."""
+        import time
+        old = self._meta_env()
+        try:
+            os.environ["VEKTORCODE_TOOL_PASSWORD"] = PASSWORD
+            _, cookie = self._login(PASSWORD)
+            headers = {"Cookie": cookie.split(";")[0]}
+            state = self._mint_meta_state(headers)
+            base = "/api/meta/callback?state="
+            # Wrong state: 400, and the real state survives.
+            status, _, _ = self._call(
+                "GET", base + "not-the-state&code=fake-code", headers=headers)
+            self.assertEqual(status, 400)
+            # No code: 400, and the real state survives.
+            status, _, _ = self._call(
+                "GET", base + state, headers=headers)
+            self.assertEqual(status, 400)
+            # Right state + fake code: the exchange fails (502 from
+            # Facebook, or a network error — either way not a login),
+            # and the state is consumed by that first match.
+            status, _, _ = self._call(
+                "GET", base + state + "&code=fake-code", headers=headers)
+            self.assertEqual(status, 502)
+            # Replay of the same callback URL: 400 — single-use.
+            status, _, _ = self._call(
+                "GET", base + state + "&code=fake-code", headers=headers)
+            self.assertEqual(status, 400)
+            # Expired state: mint again, backdate the stored creation
+            # time, and the callback must refuse it.
+            state2 = self._mint_meta_state(headers)
+            stub = object.__new__(app.Handler)
+            stub.save_setting("meta_oauth_state", {
+                "state": state2, "created": time.time() - 700})
+            status, _, _ = self._call(
+                "GET", base + state2 + "&code=fake-code", headers=headers)
+            self.assertEqual(status, 400)
+        finally:
+            self._restore_env(old)
 
 
 if __name__ == "__main__":
