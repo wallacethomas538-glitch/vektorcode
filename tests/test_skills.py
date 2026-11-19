@@ -2,14 +2,19 @@
 
 Covers vektor_cloud/skills.py only — no server, no network.
 """
+import os
 import shutil
+import socket
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
 from vektor_cloud.skills import (
     REFERENCE_CAP,
     SKILL_BODY_CAP,
+    _copy_skill_tree,
     _note_info,
     _read_capped,
     _skill_dir_info,
@@ -19,6 +24,7 @@ from vektor_cloud.skills import (
     load_skill,
     load_skill_reference,
     parse_skill_markdown,
+    recover_interrupted_installs,
     slugify,
 )
 
@@ -363,6 +369,261 @@ class InstallValidationTest(unittest.TestCase):
         # refuses it.
         self.assertIsNone(_read_capped(self.base, SKILL_BODY_CAP))
         self.assertIsNone(_read_capped(self.base, REFERENCE_CAP))
+
+
+class InstallHardeningTest(unittest.TestCase):
+    """F6 (follow-up 5): symlinked roots, special files, concurrent
+    installs, crash recovery, and traversal hardening. Same good
+    install as InstallValidationTest, then one bad shape at a time.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.dest_root = self.base / "skills"
+        self.dest_root.mkdir()
+        good_src = self.base / "good"
+        (good_src / "references").mkdir(parents=True)
+        (good_src / "SKILL.md").write_text(SKILL_MD)
+        (good_src / "references" / "a.md").write_text("a")
+        install_skill(good_src, self.dest_root, "demo")
+        self.dest = self.dest_root / "demo"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _old_install_intact(self):
+        self.assertEqual((self.dest / "SKILL.md").read_text(), SKILL_MD)
+        self.assertEqual((self.dest / "references" / "a.md").read_text(), "a")
+        self.assertIn("demo",
+                      {s["slug"] for s in discover_skills(self.base, None)})
+        leftovers = [p for p in self.dest_root.iterdir()
+                     if p.name.startswith(".demo.")]
+        self.assertEqual(leftovers, [], [str(p) for p in leftovers])
+
+    def _bad_src(self, name):
+        src = self.base / name
+        src.mkdir()
+        return src
+
+    def _skill_md(self, name):
+        return SKILL_MD.replace("demo-skill", name)
+
+    def test_install_rejects_symlinked_source_root(self):
+        # The source root itself is a symlink to a valid skill dir:
+        # refused before anything is read or copied.
+        real = self.base / "real"
+        (real / "references").mkdir(parents=True)
+        (real / "SKILL.md").write_text(self._skill_md("evil-skill"))
+        (real / "references" / "a.md").write_text("a")
+        link = self.base / "linkroot"
+        link.symlink_to(real, target_is_directory=True)
+        with self.assertRaises(ValueError):
+            install_skill(link, self.dest_root, "demo")
+        self._old_install_intact()
+
+    def test_install_rejects_fifo(self):
+        # A FIFO in the source: refused as a special file at
+        # validation time. (The old code skipped it in validation
+        # and failed later with a shutil.Error from copy2; a FIFO
+        # in a reference would also block _read_capped — see the
+        # O_NONBLOCK test below.)
+        src = self._bad_src("fifosrc")
+        (src / "SKILL.md").write_text(SKILL_MD)
+        os.mkfifo(src / "references-fifo")
+        with self.assertRaises(ValueError):
+            install_skill(src, self.dest_root, "demo")
+        self._old_install_intact()
+
+    def test_install_rejects_socket(self):
+        # A Unix socket in the source: refused like any special file.
+        src = self._bad_src("socksrc")
+        (src / "SKILL.md").write_text(SKILL_MD)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.bind(str(src / "agent.sock"))
+            with self.assertRaises(ValueError):
+                install_skill(src, self.dest_root, "demo")
+        finally:
+            sock.close()
+        self._old_install_intact()
+
+    def test_read_capped_fifo_returns_none_quickly(self):
+        # _read_capped opens with O_NONBLOCK: a FIFO returns None
+        # immediately instead of blocking until a writer appears.
+        # The read runs in a thread so a regression fails the test
+        # instead of hanging the suite.
+        fifo = self.base / "reader.fifo"
+        os.mkfifo(fifo)
+        holder = {}
+
+        def _read():
+            holder["result"] = _read_capped(fifo, SKILL_BODY_CAP)
+
+        thread = threading.Thread(target=_read, daemon=True)
+        started = time.monotonic()
+        thread.start()
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertIsNone(holder["result"])
+
+    def test_concurrent_installs_same_slug_serialized(self):
+        # Two threads install different contents for the same slug
+        # at once: both must succeed, and the final install must be
+        # exactly one complete version — never a mix, never an error.
+        v1 = self._bad_src("conc-v1")
+        (v1 / "SKILL.md").write_text(self._skill_md("version-one"))
+        v2 = self._bad_src("conc-v2")
+        (v2 / "SKILL.md").write_text(self._skill_md("version-two"))
+        errors = []
+
+        def _install(src):
+            try:
+                install_skill(src, self.dest_root, "demo")
+            except Exception as exc:  # noqa: BLE001 — collected, asserted
+                errors.append(exc)
+
+        threads = [threading.Thread(target=_install, args=(v1,)),
+                   threading.Thread(target=_install, args=(v2,))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        self.assertFalse(any(t.is_alive() for t in threads))
+        self.assertEqual(errors, [])
+        final = (self.dest / "SKILL.md").read_text()
+        self.assertIn(final, [self._skill_md("version-one"),
+                              self._skill_md("version-two")])
+        leftovers = [p for p in self.dest_root.iterdir()
+                     if p.name.startswith(".demo.")]
+        self.assertEqual(leftovers, [], [str(p) for p in leftovers])
+
+    def _simulate_crash_between_renames(self):
+        # The state after the first rename, before the second: the
+        # destination is missing and the old install sits in a
+        # backup directory (a process crash, not an OSError).
+        backup = self.dest_root / ".demo.backup-crashsim"
+        self.dest.rename(backup)
+        self.assertFalse(self.dest.exists())
+        return backup
+
+    def test_crash_recovery_restores_missing_dest(self):
+        self._simulate_crash_between_renames()
+        result = recover_interrupted_installs(self.dest_root)
+        self.assertEqual(result["recovered"], ["demo"])
+        self.assertEqual((self.dest / "SKILL.md").read_text(), SKILL_MD)
+        self.assertEqual((self.dest / "references" / "a.md").read_text(), "a")
+        leftovers = [p for p in self.dest_root.iterdir()
+                     if p.name.startswith(".demo.")]
+        self.assertEqual(leftovers, [], [str(p) for p in leftovers])
+
+    def test_install_after_crash_installs_new_version(self):
+        # A crash leaves the old install in a backup; the next
+        # install heals it first, then swaps in the new version.
+        self._simulate_crash_between_renames()
+        v2 = self._bad_src("after-crash")
+        (v2 / "SKILL.md").write_text(self._skill_md("version-two"))
+        install_skill(v2, self.dest_root, "demo")
+        self.assertEqual((self.dest / "SKILL.md").read_text(),
+                         self._skill_md("version-two"))
+        leftovers = [p for p in self.dest_root.iterdir()
+                     if p.name.startswith(".demo.")]
+        self.assertEqual(leftovers, [], [str(p) for p in leftovers])
+
+    def test_recovery_cleans_orphan_backup_and_staging(self):
+        # Destination exists (a completed install) plus an orphan
+        # backup and a staging leftover: recovery removes both and
+        # leaves the live install untouched.
+        orphan = self.dest_root / ".demo.backup-orphan"
+        shutil.copytree(self.dest, orphan)
+        staging = self.dest_root / ".demo.staging-left"
+        (staging / "references").mkdir(parents=True)
+        (staging / "SKILL.md").write_text(self._skill_md("staged"))
+        result = recover_interrupted_installs(self.dest_root)
+        self.assertEqual(result["cleaned"], ["demo", "demo"])
+        self.assertEqual((self.dest / "SKILL.md").read_text(), SKILL_MD)
+        self.assertFalse(orphan.exists())
+        self.assertFalse(staging.exists())
+
+    def test_copy_refuses_symlinked_subdir(self):
+        # The fd-based copy refuses a symlinked directory itself —
+        # it does not trust the listing, and the target is never read.
+        outside = self.base / "outside-dir"
+        outside.mkdir()
+        (outside / "marker.txt").write_text("outside content")
+        src = self._bad_src("copylink")
+        (src / "SKILL.md").write_text(SKILL_MD)
+        (src / "refs").symlink_to(outside, target_is_directory=True)
+        dst = self.base / "copy-out"
+        with self.assertRaises(ValueError):
+            _copy_skill_tree(src, dst)
+        self.assertFalse((dst / "refs" / "marker.txt").exists())
+
+    def test_copy_refuses_symlinked_root(self):
+        real = self.base / "copyreal"
+        (real / "references").mkdir(parents=True)
+        (real / "SKILL.md").write_text(SKILL_MD)
+        link = self.base / "copylinkroot"
+        link.symlink_to(real, target_is_directory=True)
+        with self.assertRaises(ValueError):
+            _copy_skill_tree(link, self.base / "copy-out2")
+
+    def test_copy_refuses_fifo(self):
+        src = self._bad_src("copyfifo")
+        (src / "SKILL.md").write_text(SKILL_MD)
+        os.mkfifo(src / "blocked.fifo")
+        with self.assertRaises(ValueError):
+            _copy_skill_tree(src, self.base / "copy-out3")
+
+    def test_copy_mid_traversal_swap(self):
+        # A directory swapped for a symlink DURING the copy: the
+        # first subdir holds many small files so the copy is still
+        # running when the swap lands on the last subdir. The copy
+        # must refuse the symlinked directory and never copy through
+        # it to the outside marker.
+        outside = self.base / "swap-outside"
+        outside.mkdir()
+        (outside / "marker.txt").write_text("outside content")
+        src = self._bad_src("swap")
+        (src / "SKILL.md").write_text(SKILL_MD)
+        slow = src / "aaa-slow"
+        slow.mkdir()
+        for i in range(1000):
+            (slow / f"f{i:04d}.txt").write_text("x")
+        target_dir = src / "zzz-target"
+        target_dir.mkdir()
+        (target_dir / "orig.txt").write_text("original")
+        dst = self.base / "swap-out"
+        errors = []
+
+        def _copy():
+            try:
+                _copy_skill_tree(src, dst)
+            except Exception as exc:  # noqa: BLE001 — asserted below
+                errors.append(exc)
+
+        thread = threading.Thread(target=_copy, daemon=True)
+        thread.start()
+        shutil.rmtree(target_dir)
+        (src / "zzz-target").symlink_to(outside, target_is_directory=True)
+        thread.join(timeout=30)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIsInstance(errors[0], ValueError)
+        self.assertFalse((dst / "zzz-target" / "marker.txt").exists())
+
+    def test_discover_skips_dot_prefixed_entries(self):
+        # Staging/backup leftovers must never appear as skills in a
+        # concurrent listing (the follow-up-4 phantom-entry residual).
+        for name in (".demo.staging-x", ".demo.backup-y"):
+            d = self.dest_root / name
+            d.mkdir()
+            (d / "SKILL.md").write_text(self._skill_md("phantom"))
+        slugs = {s["slug"] for s in discover_skills(self.base, None)}
+        self.assertIn("demo", slugs)
+        self.assertFalse(any("staging" in s or "backup" in s
+                             for s in slugs), slugs)
 
 
 if __name__ == "__main__":

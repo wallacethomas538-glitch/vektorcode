@@ -411,6 +411,22 @@ _SHELL_APPROVALS_LOCK = threading.Lock()
 # stored state (mint in /api/meta/login, consume in the callback)
 # goes through this lock, so exactly one callback can consume a
 # valid state. The lock is never held during the token exchange.
+#
+# F1 (follow-up 5): scope of this lock, stated plainly. The lock is
+# a threading.Lock: it serializes threads inside ONE process only.
+# The state itself lives in the durable store (SQLite or Supabase),
+# and get_setting/set_setting are separate, non-atomic operations —
+# there is no transaction, row lock, or compare-and-swap in this
+# path. The deployment is a single process (one ThreadingHTTPServer,
+# main.py), so within the deployed architecture the consume is
+# exactly-once. If a second process ever ran against the same store
+# (a second Render instance, a local dev server on the same Supabase
+# project, a future multi-worker setup), the two processes would each
+# hold their own lock and could both read the same valid state and
+# both consume it — the race this lock closes would return. Closing
+# it would need a store-level atomic consume, which is an
+# architectural change and is NOT made here: the single-process
+# implementation is preserved by design (see the follow-up-5 report).
 _META_OAUTH_STATE_LOCK = threading.Lock()
 
 
