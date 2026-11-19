@@ -179,15 +179,20 @@ def _scan_proc(proc_dir=None):
     Raises OSError when the process table cannot be listed at all —
     the caller treats that as "cannot inspect", never as "empty".
     Raises _IncompleteProcScan when individual processes could not
-    be inspected for a reason other than exiting mid-scan: a
-    process that vanishes between listdir and the stat read raises
-    FileNotFoundError (or the read comes back torn/empty, a
-    ValueError/IndexError) and is simply gone — an ordinary exit
-    race, skipped silently. Any other per-process error
-    (PermissionError, I/O error) means the inspection is incomplete,
-    and the caller must not report successful monitoring. proc_dir
-    defaults to the _PROC_DIR module constant, read at call time so
-    tests can redirect it.
+    be inspected for a reason other than exiting mid-scan. Only a
+    missing entry (FileNotFoundError / ProcessLookupError) is an
+    ordinary exit race, skipped silently: the process died between
+    the listdir and the stat read. A stat that exists but cannot
+    be read (PermissionError, I/O error) or parsed (ValueError /
+    IndexError on a malformed or truncated stat) is incomplete
+    inspection, not an exit race — a live process with an
+    unreadable entry is never treated as absent. (Follow-up 9:
+    ValueError / IndexError were previously classified as "torn
+    reads" and skipped; that treated a live process with a
+    malformed stat as gone. The classification now matches
+    _children_of in _sandbox_launcher.py, fixed the same way in
+    follow-up 8.) proc_dir defaults to the _PROC_DIR module
+    constant, read at call time so tests can redirect it.
     """
     if proc_dir is None:
         proc_dir = _PROC_DIR
@@ -217,11 +222,16 @@ def _scan_proc(proc_dir=None):
                                + int(rest[13]) + int(rest[14])) / clk,
                 "starttime": int(rest[19]),
             }
-        except (FileNotFoundError, ProcessLookupError, ValueError,
-                IndexError):
-            # Exit race (or a torn read of an exiting process).
+        except (FileNotFoundError, ProcessLookupError):
+            # Exit race: the process died between the directory
+            # listing and the stat read. Only a missing entry
+            # proves the process is gone.
             continue
-        except OSError:
+        except (OSError, ValueError, IndexError):
+            # Incomplete inspection: the entry exists but cannot
+            # be read (e.g. PermissionError) or parsed (a
+            # malformed / truncated stat). A live process with an
+            # unreadable entry is never treated as absent.
             incomplete.append(pid)
     if incomplete:
         raise _IncompleteProcScan(procs, incomplete)

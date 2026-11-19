@@ -51,6 +51,16 @@ harness is also fixed: the file had two `if __name__ == "__main__"`
 blocks (one before SupervisorInspectionTest, one at the end), so
 direct execution invoked unittest.main() before the class was
 defined; only the final block remains.
+
+Follow-up 9: the same classification is aligned in _scan_proc
+(the parent-side watchdog). ValueError / IndexError on a stat
+parse are incomplete inspection, not an exit race — only a
+missing entry proves the process is gone. _scan_proc raises
+_IncompleteProcScan on malformed or truncated stats, and the
+watchdog fails closed on it. Tests use a fabricated proc_dir
+(a temp dir shaped like /proc) for _scan_proc directly, and a
+patched open returning garbage stats for the end-to-end
+watchdog test.
 """
 import io
 import os
@@ -72,6 +82,7 @@ from vektor_cloud._sandbox_launcher import (
 )
 from vektor_cloud.sandbox import (
     Sandbox,
+    _IncompleteProcScan,
     _kill_tree,
     _scan_proc,
 )
@@ -398,6 +409,100 @@ class ResourceLimitTest(unittest.TestCase):
         elapsed = time.monotonic() - started
         self.assertFalse(res["watchdog_failed"], res)
         self.assertTrue(res["timed_out"], res)
+        self.assertLess(elapsed, 10, res)
+
+    # -- Follow-up 9: _scan_proc fail-closed parsing --------------
+    def _fake_proc_dir(self, entries):
+        # A temp dir shaped like /proc: {pid: stat-bytes} (a pid
+        # mapped to None gets a directory with no stat file, i.e.
+        # the entry vanished). Returned TemporaryDirectory; the
+        # caller owns it (use as a context manager in the test).
+        tmp = tempfile.TemporaryDirectory()
+        for pid, stat in entries.items():
+            os.mkdir(os.path.join(tmp.name, str(pid)))
+            if stat is not None:
+                with open(os.path.join(tmp.name, str(pid), "stat"),
+                          "wb") as f:
+                    f.write(stat)
+        return tmp
+
+    # A hand-built valid stat: fields after ")" are state, ppid,
+    # pgrp, session, tty_nr, tpgid, flags, minflt, cminflt,
+    # majflt, cmajflt, utime, stime, cutime, cstime, priority,
+    # nice, num_threads, itrealvalue, starttime, vsize, rss.
+    # rest[19] is the starttime (1000 here), rest[21] the rss.
+    _GOOD_STAT = (b"11111 (sleep) S 1 11111 11111 0 -1 4194304 100 "
+                  b"0 0 0 10 5 0 0 20 0 1 0 1000 1000000 100")
+
+    def test_scan_proc_raises_on_malformed_stat(self):
+        # Follow-up 9: a stat that exists but cannot be parsed
+        # (ValueError on int()) is incomplete inspection, not an
+        # exit race. _scan_proc must raise _IncompleteProcScan
+        # with the pid in .pids.
+        with self._fake_proc_dir(
+                {12345: b"not a stat file at all"}) as tmp:
+            with self.assertRaises(_IncompleteProcScan) as cm:
+                _scan_proc(proc_dir=tmp)
+        self.assertIn(12345, cm.exception.pids)
+
+    def test_scan_proc_raises_on_truncated_stat(self):
+        # Follow-up 9: a truncated stat — too few fields for
+        # rest[2] (IndexError) — is incomplete inspection too.
+        with self._fake_proc_dir(
+                {22222: b"22222 (sleep) S 1"}) as tmp:
+            with self.assertRaises(_IncompleteProcScan) as cm:
+                _scan_proc(proc_dir=tmp)
+        self.assertIn(22222, cm.exception.pids)
+
+    def test_scan_proc_skips_missing_stat_entry(self):
+        # Control: a directory with no stat file at all is a
+        # missing entry (FileNotFoundError) — the ordinary exit
+        # race — and stays a silent skip. The scan completes and
+        # returns an empty snapshot, no raise.
+        with self._fake_proc_dir({12345: None}) as tmp:
+            procs = _scan_proc(proc_dir=tmp)
+        self.assertEqual(procs, {})
+
+    def test_scan_proc_partial_snapshot_keeps_good_entries(self):
+        # On an incomplete scan, the partial snapshot keeps the
+        # entries that parsed cleanly (the kill path uses it for
+        # what it knows) and .pids names only the unreadable
+        # ones. The malformed entry is not silently dropped into
+        # the snapshot as if it were gone.
+        with self._fake_proc_dir(
+                {11111: self._GOOD_STAT,
+                 22222: b"22222 (sleep) S 1"}) as tmp:
+            with self.assertRaises(_IncompleteProcScan) as cm:
+                _scan_proc(proc_dir=tmp)
+        self.assertIn(22222, cm.exception.pids)
+        self.assertIn(11111, cm.exception.procs)
+        self.assertEqual(cm.exception.procs[11111]["starttime"], 1000)
+
+    def test_watchdog_fails_closed_on_malformed_stat(self):
+        # Follow-up 9, end to end: the watchdog reads a malformed
+        # stat for a tree member and must fail closed —
+        # watchdog_failed True and the tree killed — never
+        # silently report success. The patched open returns
+        # garbage for /proc/<pid>/stat reads only; everything
+        # else delegates to the real open. The kill itself does
+        # not depend on /proc: _kill_tree signals the supervisor,
+        # whose handler kills the command child by pid from
+        # inside.
+        real_open = open
+
+        def guarded(path, *args, **kwargs):
+            s = os.fspath(path)
+            if isinstance(s, str) and re.fullmatch(r"/proc/\d+/stat", s):
+                return io.BytesIO(b"not a stat file at all")
+            return real_open(path, *args, **kwargs)
+
+        started = time.monotonic()
+        with mock.patch("builtins.open", side_effect=guarded):
+            res = self.box.run(["/bin/sh", "-c", "sleep 30"],
+                               timeout=10)
+        elapsed = time.monotonic() - started
+        self.assertTrue(res["watchdog_failed"], res)
+        self.assertLess(res["returncode"], 0, res)
         self.assertLess(elapsed, 10, res)
 
     # -- P6 helpers -------------------------------------------------
