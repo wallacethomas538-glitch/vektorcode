@@ -180,6 +180,24 @@ class ShellToolTest(unittest.TestCase):
             for name in key_vars:
                 del os.environ[name]
 
+    def test_extra_env_cannot_reintroduce_keys(self):
+        # F2 hardening: extra_env is merged AFTER the os.environ
+        # scrub, so it must be scrubbed with the same suffixes —
+        # otherwise a caller could reintroduce a live key.
+        from vektor_cloud.sandbox import Sandbox
+        with tempfile.TemporaryDirectory() as tmp:
+            sb = Sandbox(tmp)
+            env = sb._scrubbed_env({"GEMINI_KEYS": "leak-me",
+                                     "gemini_keys": "leak-me-too",
+                                     "SUPABASE_KEY": "leak-me-three",
+                                     "MY_OK_VAR": "fine",
+                                     "PATH": "/custom/bin"})
+            self.assertNotIn("GEMINI_KEYS", env)
+            self.assertNotIn("gemini_keys", env)
+            self.assertNotIn("SUPABASE_KEY", env)
+            self.assertEqual(env.get("MY_OK_VAR"), "fine")
+            self.assertEqual(env.get("PATH"), "/custom/bin")
+
     def test_output_capped(self):
         approval_id = self._stage_and_approve(
             "python3 -c \"print('x'*10000)\"")

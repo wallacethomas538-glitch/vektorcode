@@ -504,9 +504,10 @@ def vektor_system_prompt():
 # Replaces the old unsigned literal cookie (vc_auth=1). The signing secret
 # comes from VEKTORCODE_SESSION_SECRET; when unset, a random per-process
 # secret is used and sessions invalidate on restart. The secret is never
-# logged. When VEKTORCODE_TOOL_PASSWORD is unset, auth stays OPEN (everyone
-# passes) so local dev and current Render behavior don't break — setting a
-# tool password is what turns auth enforcement on.
+# logged. When VEKTORCODE_TOOL_PASSWORD is unset, auth stays OPEN for
+# local dev only — on Render (RENDER env set) requests are refused, so a
+# missing password can never silently leave production unauthenticated.
+# Setting a tool password is what turns auth enforcement on everywhere.
 AUTH_COOKIE = "vc_auth"
 AUTH_TTL_SECONDS = 30 * 24 * 3600
 _PROCESS_SECRET = secrets.token_hex(32)
@@ -550,13 +551,15 @@ def verify_auth_token(token):
 def require_auth(handler):
     """True when the request is allowed.
 
-    Open when VEKTORCODE_TOOL_PASSWORD is unset (local dev / current
-    Render). When a password IS set, only a valid HMAC-signed vc_auth
-    cookie passes — the old unsigned literal (vc_auth=1) is rejected.
+    When VEKTORCODE_TOOL_PASSWORD is set, only a valid HMAC-signed
+    vc_auth cookie passes — the old unsigned literal (vc_auth=1) is
+    rejected. When no password is set, local dev stays open, but on
+    Render (production) the request is refused: production must not
+    silently become unauthenticated.
     """
     expected = os.environ.get("VEKTORCODE_TOOL_PASSWORD")
     if not expected:
-        return True
+        return not bool(os.environ.get("RENDER"))
     cookie = handler.headers.get("Cookie", "") or ""
     for part in cookie.split(";"):
         part = part.strip()
@@ -1685,6 +1688,17 @@ class Handler(BaseHTTPRequestHandler):
             except (HTTPError, URLError, KeyError, ValueError) as exc: self.send_error(502, "Meta login failed: " + str(exc)[:160])
             return
         if self.path == "/api/state":
+            auth_enabled = bool(os.environ.get("VEKTORCODE_TOOL_PASSWORD"))
+            authenticated = require_auth(self)
+            if not authenticated:
+                # Unauthenticated callers get only what the login page
+                # needs. Sessions, receipts (which include shell
+                # commands), models, tools, skills and MCP status stay
+                # behind auth. setup_required tells the login page the
+                # server needs a password configured before anyone can
+                # log in.
+                setup_required = bool(os.environ.get("RENDER")) and not auth_enabled
+                self.send_json({"auth": {"enabled": auth_enabled, "authenticated": False, "setup_required": setup_required}}); return
             current = store()
             sessions = current.list_sessions()
             receipts = current.list_receipts(30)
@@ -1692,8 +1706,6 @@ class Handler(BaseHTTPRequestHandler):
             active_name = self.setting("active_model_name", "") or None
             if active_name not in FREE_MODELS.get(active, []):
                 active_name = None
-            auth_enabled = bool(os.environ.get("VEKTORCODE_TOOL_PASSWORD"))
-            authenticated = require_auth(self)
             mcp = mcp_status()
             self.send_json({"models":provider_models(self), "tools":[{"id":a,"name":b,"description":c,"status":_tool_status(a, a in enabled),"enabled":a in enabled,"locked":bool(a in RISKY_TOOLS and auth_enabled and not authenticated),"approval_required":a in RISKY_TOOLS} for a,b,c in TOOLS], "active_model":active, "active_model_name":active_name, "qwen_source":QWEN_SOURCE, "ollama_base_url":ollama_base_url(self), "qwen_api_url":qwen_api_url(self), "health":self.setting("health", {"providers":[]}), "mcp":{"connected":mcp.get("connected",False),"configured":mcp.get("configured",False),"transport":mcp.get("transport","streamable-http"),"tool_count":mcp.get("tool_count",0),"protocol":mcp.get("protocol"),"error":mcp.get("error"),"capabilities":[x[1] for x in TOOLS]}, "mcp_servers":mcp_status_all(), "composio":{"connected":mcp.get("connected",False),"mcp_url_set":bool(os.environ.get("COMPOSIO_MCP_URL")),"api_key_set":bool(os.environ.get("COMPOSIO_API_KEY"))}, "storage":current.status(), "meta":{"configured":meta_ready(),"profile":self.setting("meta_profile", None)}, "media":{"provider":"Pollinations","configured":bool(os.environ.get("POLLINATIONS_API_KEY"))}, "skills":discover_skills(ROOT, VEKTOR_STATE), "auth":{"enabled":auth_enabled,"authenticated":authenticated}, "sessions":sessions, "receipts":receipts, "kill_switch":self.setting("kill_switch", False)}); return
         if self.path == "/api/skills":
@@ -1791,7 +1803,12 @@ class Handler(BaseHTTPRequestHandler):
             if key: headers["Authorization"] = "Bearer " + key
             receipt("media_generate", {"kind":kind,"provider":"Pollinations"})
             self.send_json({"ok":True,"kind":kind,"url":endpoint,"provider":"Pollinations"}); return
-        if path == "/api/receipt": receipt(data.get("action","manual action"), data.get("detail",{}), data.get("sensitive",False), data.get("approved",False)); self.send_json({"ok":True}); return
+        if path == "/api/receipt":
+            # Receipts are the audit trail (shell approvals record the
+            # command); unauthenticated callers must not be able to
+            # forge them.
+            if not require_auth(self): self.send_json({"ok":False,"error":"Authentication required"}, 401); return
+            receipt(data.get("action","manual action"), data.get("detail",{}), data.get("sensitive",False), data.get("approved",False)); self.send_json({"ok":True}); return
         if path == "/api/memory/save":
             # Durable memory (2026-11-07): the old version appended to a
             # file under VEKTOR_STATE/memories — ephemeral on Render, lost
@@ -1859,11 +1876,25 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"ok":True, "approval_id": approval_id, "command": ap["command"]}); return
         if path == "/api/login":
             expected = os.environ.get("VEKTORCODE_TOOL_PASSWORD")
+            if not expected and os.environ.get("RENDER"):
+                # Production with no password configured: fail closed.
+                # No login can succeed until a password is set.
+                self.send_json({"ok": False, "error": "Authentication is not configured on this server"}, 401)
+                receipt("login", {"success": False}); return
             ok = not expected or secrets.compare_digest(str(data.get("password","")), expected)
             if ok:
                 token = issue_auth_token()
                 self.send_response(204)
-                self.send_header("Set-Cookie", f"{AUTH_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={AUTH_TTL_SECONDS}")
+                # Secure only when the request arrived over HTTPS
+                # (Render terminates TLS and sets X-Forwarded-Proto, and
+                # RENDER always means HTTPS). Local HTTP dev keeps
+                # working without it.
+                secure = ("https" in (self.headers.get("X-Forwarded-Proto") or "")
+                          or bool(os.environ.get("RENDER")))
+                cookie = f"{AUTH_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={AUTH_TTL_SECONDS}"
+                if secure:
+                    cookie += "; Secure"
+                self.send_header("Set-Cookie", cookie)
                 self.end_headers()
             else: self.send_json({"ok":False}, 401)
             receipt("login", {"success":ok}); return

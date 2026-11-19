@@ -66,6 +66,7 @@ async function refreshState() {
     const next = await api('/api/state');
     if (!next) return; // 401/network: api() already surfaced it
     state = next;
+    if (!state.models) { renderSettingsBits(); return; } // unauthenticated minimal state: login only
     renderModels();
     renderSessions();
     renderSkills();
@@ -798,8 +799,23 @@ function closeSettings() {
     $('settings-modal').style.display = 'none';
 }
 
+function renderLoginBits() {
+    // Only what the login form needs; safe on the minimal
+    // unauthenticated state ({auth} only).
+    $('login-status').textContent = state.auth.setup_required
+        ? 'This server requires a password, but none is configured — set VEKTORCODE_TOOL_PASSWORD on the server.'
+        : !state.auth.enabled
+            ? 'Auth is not configured on this server — tools are open, no login needed.'
+            : state.auth.authenticated
+                ? 'Logged in (session cookie set).'
+                : 'Not logged in — auth-gated tools are locked until you unlock.';
+    $('login-form').style.display = state.auth.enabled && !state.auth.authenticated ? 'block' : 'none';
+}
+
 function renderSettingsBits() {
     if (!state) return;
+    renderLoginBits();
+    if (!state.models) return; // unauthenticated minimal state: login only
     const active = state.models.find((m) => m.id === state.active_model) || {};
     $('settings-model').textContent =
         (active.name || state.active_model) + ((state.active_model_name || active.model) ? ' (' + (state.active_model_name || active.model) + ')' : '');
@@ -820,12 +836,6 @@ function renderSettingsBits() {
             ).join('') + '</tbody></table>' +
             '<p class="muted">Qwen routes: Groq-hosted Qwen3 first, local Ollama Qwen when Groq keys are absent, DashScope compat third. The fork itself does not run on Render.</p>';
     }
-    $('login-status').textContent = !state.auth.enabled
-        ? 'Auth is not configured on this server — tools are open, no login needed.'
-        : state.auth.authenticated
-            ? 'Logged in (session cookie set).'
-            : 'Not logged in — auth-gated tools are locked until you unlock.';
-    $('login-form').style.display = state.auth.enabled && !state.auth.authenticated ? 'block' : 'none';
     $('kill-status').textContent = state.kill_switch
         ? 'ACTIVE — chat is stopped (server returns 423)'
         : 'Off';

@@ -67,7 +67,11 @@ class Sandbox:
         env = {k: v for k, v in os.environ.items()
                if not k.upper().endswith(_SCRUB_SUFFIXES)}
         if extra_env:
-            env.update(extra_env)
+            # Scrub extra_env with the same suffixes: it is merged
+            # AFTER the os.environ scrub, so without this a caller
+            # could reintroduce a live key through extra_env.
+            env.update({k: v for k, v in extra_env.items()
+                        if not k.upper().endswith(_SCRUB_SUFFIXES)})
         return env
 
     def run(self, cmd: list, timeout: int = DEFAULT_TIMEOUT,
