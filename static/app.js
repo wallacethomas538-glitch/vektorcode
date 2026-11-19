@@ -116,11 +116,14 @@ function renderModelNameSelect(select) {
 
 function renderSessions() {
     const list = $('session-list');
-    if (!state.sessions.length) {
+    // Defensive: minimal unauthenticated state has no sessions array.
+    // Any caller (init, refresh, resume) must be safe to run logged out.
+    const sessions = (state && state.sessions) || [];
+    if (!sessions.length) {
         list.innerHTML = '<div class="muted">No sessions yet.</div>';
         return;
     }
-    list.innerHTML = state.sessions.map((s) =>
+    list.innerHTML = sessions.map((s) =>
         `<div class="session-item ${s.id === currentSessionId ? 'active' : ''}" onclick="resumeSession('${esc(s.id)}')" title="${esc(s.title)} — ${esc(s.model)} · ${s.tokens || 0} tokens">` +
         `<span class="session-title">${esc(s.title)}</span>` +
         `<button class="session-del" aria-label="Delete session ${esc(s.title)}" onclick="event.stopPropagation(); deleteSession('${esc(s.id)}')">×</button>` +
@@ -1237,10 +1240,15 @@ async function init() {
     initVoice();
     await refreshState();
     await updateStatus();
-    if (currentSessionId && state && !state.sessions.some((s) => s.id === currentSessionId)) {
+    // Unauthenticated minimal state ({auth} only): the login screen is
+    // the whole UI. Nothing below may assume full state — state.sessions
+    // is undefined here, and a stored session id from an earlier login
+    // would otherwise crash on state.sessions.some().
+    if (!state || !state.sessions) return;
+    if (currentSessionId && !state.sessions.some((s) => s.id === currentSessionId)) {
         setCurrentSession(null); // stored session no longer exists server-side
     }
-    if (state) renderSessions();
+    renderSessions();
 }
 
 init();

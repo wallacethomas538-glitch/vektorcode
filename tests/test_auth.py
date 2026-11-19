@@ -1,11 +1,15 @@
 """Tests for authentication enforcement (Hypit auth follow-up, 2026-11-18).
 
-Covers Big Chat's follow-up items 1-3 and 5:
+Covers Big Chat's follow-up items 1-3 and 5, plus the second
+follow-up (2026-11-18, commit 71b1d7f4 review):
 - fail-closed behavior when VEKTORCODE_TOOL_PASSWORD is missing
   (open only for local dev; refused on Render),
 - minimal /api/state for unauthenticated callers,
 - unauthorized (no-cookie) access to every protected write/action
-  endpoint,
+  endpoint, including POST /api/health, POST /api/media and POST
+  /api/tool for a NON-risky tool (file_ops is the only one),
+- missing-password + RENDER=true refusal for those endpoints too,
+- legitimate authenticated behavior still works on them,
 - the login flow and the Secure cookie flag.
 
 Pattern follows tests/test_shell_tool.py: a live in-process server.
@@ -44,6 +48,7 @@ def _http(port, method, path, payload=None, headers=None):
 # (method, path, payload) for every protected write/action endpoint.
 # The auth check runs before payload validation, so minimal bodies 401.
 # /api/tool needs a known RISKY tool: an unknown tool 400s before auth.
+# file_ops is the only NON-risky tool: it must 401 too (follow-up 2).
 PROTECTED_POST = [
     ("POST", "/api/chat", {"message": "hi", "session_id": "t"}),
     ("POST", "/api/shell/approve", {"approval_id": "no-such-id"}),
@@ -56,6 +61,9 @@ PROTECTED_POST = [
     ("POST", "/api/model", {"model": "groq"}),
     ("POST", "/api/settings", {}),
     ("POST", "/api/tool", {"tool": "shell", "enabled": True}),
+    ("POST", "/api/tool", {"tool": "file_ops", "enabled": True}),
+    ("POST", "/api/health", {}),
+    ("POST", "/api/media", {"kind": "image", "prompt": "a test image"}),
     ("POST", "/api/mcp", {"tool": "COMPOSIO_SEARCH_TOOLS"}),
     ("POST", "/api/mcp/servers", {"id": "x", "url": "https://example.com/mcp"}),
     ("POST", "/api/memory", {}),
@@ -137,6 +145,16 @@ class AuthTest(unittest.TestCase):
         status, _, body = self._call(
             "POST", "/api/chat", {"message": "hi", "session_id": "t"})
         self.assertEqual(status, 401, body)
+        # Follow-up 2: the newly gated writes refuse here too, not just
+        # with a configured password.
+        for method, path, payload in [
+                ("POST", "/api/health", {}),
+                ("POST", "/api/media",
+                 {"kind": "image", "prompt": "a test image"}),
+                ("POST", "/api/tool", {"tool": "file_ops", "enabled": True}),
+                ("POST", "/api/tool", {"tool": "shell", "enabled": True})]:
+            status, _, body = self._call(method, path, payload)
+            self.assertEqual(status, 401, f"{method} {path} -> {status}: {body}")
         status, _, _ = self._call(
             "POST", "/api/login", {"password": "anything"})
         self.assertEqual(status, 401)
@@ -146,6 +164,34 @@ class AuthTest(unittest.TestCase):
         self.assertFalse(body["auth"]["enabled"])
         self.assertFalse(body["auth"]["authenticated"])
         self.assertTrue(body["auth"]["setup_required"])
+
+    def test_authenticated_writes_still_work(self):
+        """Logged in, the newly gated writes behave as before."""
+        os.environ["VEKTORCODE_TOOL_PASSWORD"] = PASSWORD
+        status, cookie = self._login(PASSWORD)
+        self.assertEqual(status, 204)
+        headers = {"Cookie": cookie.split(";")[0]}
+        # Health refresh: only the local provider is configured in the
+        # test env (no provider keys), so the probe is a fast local
+        # connection-refused, not an outbound call.
+        status, _, body = self._call("POST", "/api/health", {}, headers)
+        self.assertEqual(status, 200, body)
+        self.assertIn("health", body)
+        self.assertIn("providers", body["health"])
+        # Media: returns a provider URL; no outbound call is made.
+        status, _, body = self._call(
+            "POST", "/api/media", {"kind": "image", "prompt": "a cat"},
+            headers)
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body.get("url", "").startswith("https://"))
+        # Non-risky tool toggle persists and shows in state.
+        status, _, body = self._call(
+            "POST", "/api/tool", {"tool": "file_ops", "enabled": True},
+            headers)
+        self.assertEqual(status, 200, body)
+        status, _, body = self._call("GET", "/api/state", headers=headers)
+        tools = {t["id"]: t for t in body.get("tools", [])}
+        self.assertTrue(tools["file_ops"]["enabled"])
 
     def test_missing_password_open_locally(self):
         """No password + no RENDER (local dev): behavior stays open."""

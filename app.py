@@ -1794,6 +1794,10 @@ class Handler(BaseHTTPRequestHandler):
             if not require_auth(self): self.send_json({"ok": False, "error": "Authentication required", "retryable": False}, 401); return
             self.web_search(data); return
         if path == "/api/media":
+            # Generates a provider URL (spends provider quota) and writes
+            # a receipt — a state-changing action, so it requires auth
+            # like every other write endpoint. No public-write exception.
+            if not require_auth(self): self.send_json({"ok":False,"error":"Authentication required"}, 401); return
             kind, prompt = data.get("kind"), data.get("prompt", "")
             if kind not in {"image", "audio"} or not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 1200:
                 self.send_json({"ok":False,"error":"Choose image or audio and enter a prompt up to 1200 characters"}, 400); return
@@ -1938,10 +1942,14 @@ class Handler(BaseHTTPRequestHandler):
             receipt("settings_saved", {"keys": sorted(saved.keys())})
             self.send_json({"ok":True, "ollama_base_url": ollama_base_url(self), "qwen_api_url": qwen_api_url(self)}); return
         if path == "/api/tool":
+            # Consistent production policy: changing any tool setting
+            # writes persisted state and a receipt, so every toggle
+            # requires auth — not just the risky ones. (file_ops is the
+            # only non-risky tool; it was previously toggleable
+            # without login. No undocumented public-write exception.)
+            if not require_auth(self): self.send_json({"ok":False,"error":"Authentication required"}, 401); return
             tool = data.get("tool"); enabled = bool(data.get("enabled"));
             if tool not in {x[0] for x in TOOLS}: self.send_json({"ok":False}, 400); return
-            if tool in RISKY_TOOLS and not require_auth(self):
-                self.send_json({"ok":False,"error":"Authentication required"}, 401); return
             enabled_tools = set(self.setting("tools", [])); enabled_tools.discard(tool)
             if enabled: enabled_tools.add(tool)
             self.save_setting("tools", sorted(enabled_tools)); receipt("tool_toggle", {"tool":tool,"enabled":enabled}, tool in RISKY_TOOLS); self.send_json({"ok":True}); return
@@ -1968,6 +1976,11 @@ class Handler(BaseHTTPRequestHandler):
             if not require_auth(self): self.send_json({"ok":False,"error":"Authentication required", "retryable":False}, 401); return
             self.save_setting("kill_switch", True); receipt("kill_switch",{"enabled":True},True,True); self.send_json({"ok":True,"kill_switch":True}); return
         if path == "/api/health":
+            # Probes every configured provider outbound (with live keys),
+            # saves the results to settings, and writes a receipt — a
+            # state-changing action, so it requires auth. GET /health
+            # stays the public liveness check; this refresh does not.
+            if not require_auth(self): self.send_json({"ok":False,"error":"Authentication required"}, 401); return
             results=[]
             for pid,name,key_env,url,model in PROVIDERS:
                 if pid == "qwen":
