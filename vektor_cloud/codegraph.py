@@ -213,10 +213,14 @@ def _prepare_db_path(db_path: Path) -> None:
     """Make room for a fresh database, deleting only what is verified.
 
     The database is a single KuzuDB file. An existing file is removed
-    only when _is_vektorgraph_db() verifies it — a read-only open plus
-    the expected schema. An existing directory is removed only when
-    empty — a directory is never a KuzuDB database, so a non-empty one
-    is never deleted. Anything else raises instead of being deleted.
+    only when _is_vektorgraph_db() verifies it — a read-only open
+    requiring BOTH the exact expected schema AND valid VektorGraph
+    identity metadata (the identity record and a supported schema
+    version). Schema alone is not enough: an unrelated database can
+    carry the same schema without the identity record. An existing
+    directory is removed only when empty — a directory is never a
+    KuzuDB database, so a non-empty one is never deleted. Anything
+    else raises instead of being deleted.
     """
     if not db_path.exists():
         return
