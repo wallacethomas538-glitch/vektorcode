@@ -357,6 +357,86 @@ def test_build_refuses_rel_with_properties(repo, tmp_path):
     _assert_intact(victim, {"Module", "Symbol", "DEFINES", "IMPORTS", "CALLS"})
 
 
+# --- Follow-up 4: identity metadata ------------------------------------
+# Schema alone is not ownership. These tests build unrelated databases
+# with the exact graph schema and prove each one is refused AND left
+# intact because it lacks valid VektorGraph identity metadata.
+
+_META_DDL = ("CREATE NODE TABLE VektorGraphMeta"
+             "(key STRING, value STRING, PRIMARY KEY(key))")
+_META_TABLES = {"Module", "Symbol", "DEFINES", "IMPORTS", "CALLS",
+                "VektorGraphMeta"}
+
+
+@needs_deps
+def test_build_refuses_exact_schema_without_identity(repo, tmp_path):
+    # THE discriminator (negative control: this test FAILS on the
+    # follow-up 3 code). An unrelated database with the exact graph
+    # schema — same five tables, same definitions — but no identity
+    # metadata at all. Follow-up 3 verifies schema only, so it accepts
+    # this database and deletes it. Follow-up 4 refuses it.
+    victim = _unrelated_db(tmp_path, "graph.db", _CORRECT_DDL)
+    with pytest.raises(ValueError, match="not a verified VektorGraph database"):
+        codegraph.build_graph(repo, victim)
+    _assert_intact(victim, {"Module", "Symbol", "DEFINES", "IMPORTS", "CALLS"})
+
+
+@needs_deps
+def test_build_refuses_empty_identity_table(repo, tmp_path):
+    # All six tables, correct definitions — but the identity table is
+    # empty. No identity record, no replacement.
+    victim = _unrelated_db(tmp_path, "graph.db", _CORRECT_DDL + [_META_DDL])
+    with pytest.raises(ValueError, match="not a verified VektorGraph database"):
+        codegraph.build_graph(repo, victim)
+    _assert_intact(victim, _META_TABLES)
+
+
+@needs_deps
+def test_build_refuses_wrong_identity_value(repo, tmp_path):
+    victim = _unrelated_db(
+        tmp_path, "graph.db", _CORRECT_DDL + [_META_DDL],
+        setup=[_SENTINEL,
+               "CREATE (:VektorGraphMeta {key: 'identity', value: 'something-else'})",
+               "CREATE (:VektorGraphMeta {key: 'schema_version', value: '1'})"])
+    with pytest.raises(ValueError, match="not a verified VektorGraph database"):
+        codegraph.build_graph(repo, victim)
+    _assert_intact(victim, _META_TABLES)
+
+
+@needs_deps
+def test_build_refuses_unsupported_schema_version(repo, tmp_path):
+    victim = _unrelated_db(
+        tmp_path, "graph.db", _CORRECT_DDL + [_META_DDL],
+        setup=[_SENTINEL,
+               "CREATE (:VektorGraphMeta {key: 'identity', value: 'vektorgraph'})",
+               "CREATE (:VektorGraphMeta {key: 'schema_version', value: '99'})"])
+    with pytest.raises(ValueError, match="not a verified VektorGraph database"):
+        codegraph.build_graph(repo, victim)
+    _assert_intact(victim, _META_TABLES)
+
+
+@needs_deps
+def test_build_replaces_genuine_database_with_identity(repo, tmp_path):
+    # A genuine VektorGraph database — built by build_graph, identity
+    # rows included — can still be safely replaced, and the rebuilt
+    # database still carries its identity.
+    db = tmp_path / "graph.db"
+    first = codegraph.build_graph(repo, db)
+    assert first["complete"] is True
+    (repo / "d.py").write_text("def extra():\n    return 3\n")
+    second = codegraph.build_graph(repo, db)
+    assert second["complete"] is True
+    assert second["files"] == 4
+    assert second["modules"] == 4
+    import kuzu
+    conn_db = kuzu.Database(str(db), read_only=True)
+    conn = kuzu.Connection(conn_db)
+    meta = {row[0]: row[1] for row in conn.execute(
+        "MATCH (m:VektorGraphMeta) RETURN m.key, m.value")}
+    assert meta == {"identity": "vektorgraph", "schema_version": "1"}
+    del conn, conn_db
+
+
 @needs_deps
 def test_build_refuses_symlink_to_repo_root(repo, tmp_path):
     link = tmp_path / "db-link"

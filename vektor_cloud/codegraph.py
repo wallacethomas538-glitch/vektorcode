@@ -40,16 +40,21 @@ Honest limits (by design, not hidden):
     fail the build instead.
   - The database file is REPLACED on rebuild. build_graph() only
     replaces a file it can verify is a VektorGraph database: it opens
-    the file read-only and checks the actual definitions against the
-    expected schema — table types, columns, data types, primary keys,
-    defaults, relationship endpoints, and no extra tables. Table
-    names alone are NOT verification: an unrelated database can carry
-    the same five names with incompatible definitions. It refuses to
-    delete the repository, anything containing it, the filesystem
-    root, the home directory, a symlink destination, an unverified
-    file, or any non-empty directory. The old database is replaced
-    only AFTER the code is parsed and validated, so a failed strict
-    build leaves the previous graph intact.
+    the file read-only and requires BOTH the exact expected schema —
+    table types, columns, data types, primary keys, defaults,
+    relationship endpoints, and no extra tables — AND valid
+    VektorGraph identity metadata (the VektorGraphMeta table holding
+    the identity record and a supported schema version). Table names
+    alone are NOT verification, and neither is the schema alone: an
+    unrelated database can carry the same names and definitions
+    without the identity record. The identity check is an ownership
+    discriminator against accidental deletion, not cryptographic
+    proof. It refuses to delete the repository, anything containing
+    it, the filesystem root, the home directory, a symlink
+    destination, an unverified file, or any non-empty directory. The
+    old database is replaced only AFTER the code is parsed and
+    validated, so a failed strict build leaves the previous graph
+    intact.
 """
 
 import os
@@ -92,8 +97,17 @@ def _require_available() -> None:
 # as a KuzuDB database AND its actual definitions match this schema
 # exactly: table types, columns, data types, primary keys, defaults,
 # relationship endpoints, and no extra tables. Table NAMES alone are
-# not verification — an unrelated database can carry the same five
-# names with incompatible columns or relationships.
+# not verification — an unrelated database can carry the same names
+# with incompatible columns or relationships. AND the database must
+# carry VektorGraph identity metadata (see below): a database with
+# the exact schema but no identity record is still not ours. This is
+# an ownership discriminator against accidental deletion, not
+# cryptographic proof of ownership.
+_SCHEMA_VERSION = "1"
+_SUPPORTED_SCHEMA_VERSIONS = frozenset({"1"})
+_IDENTITY_KEY = "identity"
+_IDENTITY_VALUE = "vektorgraph"
+_SCHEMA_VERSION_KEY = "schema_version"
 _EXPECTED_NODE_TABLES = {
     # table: {property: (data type, is primary key, default)}
     "Module": {
@@ -105,6 +119,10 @@ _EXPECTED_NODE_TABLES = {
         "kind": ("STRING", False, "NULL"),
         "module": ("STRING", False, "NULL"),
     },
+    "VektorGraphMeta": {
+        "key": ("STRING", True, "NULL"),
+        "value": ("STRING", False, "NULL"),
+    },
 }
 _EXPECTED_REL_TABLES = {
     # table: {(from table, to table, from property, to property)}
@@ -115,16 +133,18 @@ _EXPECTED_REL_TABLES = {
 
 
 def _is_vektorgraph_db(db_path) -> bool:
-    """True only when the file is a KuzuDB database with our schema.
+    """True only when the file is a VektorGraph database.
 
-    Opens the file read-only and checks the actual definitions:
-    exactly the five expected tables, node tables with the right
-    columns, data types, primary keys and defaults, relationship
-    tables with no extra properties and the right endpoints. Anything
-    that cannot be opened, or whose definitions differ in any way,
-    is not a VektorGraph database — including a database that carries
-    the same five table names with incompatible columns or
-    relationships.
+    Opens the file read-only and requires BOTH:
+    (a) the exact expected schema — six tables, node tables with the
+    right columns, data types, primary keys and defaults, relationship
+    tables with no extra properties and the right endpoints; and
+    (b) valid VektorGraph identity metadata — the VektorGraphMeta
+    table holding exactly the identity record ("vektorgraph") and a
+    supported schema version. Anything that cannot be opened, or
+    whose definitions or identity differ in any way, is not a
+    VektorGraph database — including a database with the exact schema
+    but no identity record.
     """
     try:
         db = kuzu.Database(str(db_path), read_only=True)
@@ -132,6 +152,7 @@ def _is_vektorgraph_db(db_path) -> bool:
         tables = {row[1]: row[2] for row in conn.execute(
             "CALL SHOW_TABLES() RETURN *")}
         expected_types = {"Module": "NODE", "Symbol": "NODE",
+                          "VektorGraphMeta": "NODE",
                           "DEFINES": "REL", "IMPORTS": "REL",
                           "CALLS": "REL"}
         if tables != expected_types:
@@ -148,6 +169,14 @@ def _is_vektorgraph_db(db_path) -> bool:
                 f"CALL SHOW_CONNECTION('{table}') RETURN *")}
             if actual != expected:
                 return False
+        meta = {row[0]: row[1] for row in conn.execute(
+            "MATCH (m:VektorGraphMeta) RETURN m.key, m.value")}
+        if set(meta) != {_IDENTITY_KEY, _SCHEMA_VERSION_KEY}:
+            return False
+        if meta[_IDENTITY_KEY] != _IDENTITY_VALUE:
+            return False
+        if meta[_SCHEMA_VERSION_KEY] not in _SUPPORTED_SCHEMA_VERSIONS:
+            return False
         return True
     except Exception:
         return False
@@ -380,9 +409,23 @@ def build_graph(repo_root, db_path, strict=False):
     conn = kuzu.Connection(db)
     conn.execute("CREATE NODE TABLE Module(name STRING, path STRING, PRIMARY KEY(name))")
     conn.execute("CREATE NODE TABLE Symbol(name STRING, kind STRING, module STRING, PRIMARY KEY(name))")
+    conn.execute("CREATE NODE TABLE VektorGraphMeta(key STRING, value STRING, PRIMARY KEY(key))")
     conn.execute("CREATE REL TABLE DEFINES(FROM Module TO Symbol)")
     conn.execute("CREATE REL TABLE IMPORTS(FROM Module TO Module)")
     conn.execute("CREATE REL TABLE CALLS(FROM Symbol TO Symbol)")
+    # Identity metadata: every genuine VektorGraph database carries
+    # these two rows. Replacement requires them (see
+    # _is_vektorgraph_db) — they are the ownership discriminator
+    # against accidentally deleting an unrelated database that happens
+    # to share the schema. Not cryptographic proof of ownership.
+    conn.execute(
+        "CREATE (:VektorGraphMeta {key: $k, value: $v})",
+        {"k": _IDENTITY_KEY, "v": _IDENTITY_VALUE},
+    )
+    conn.execute(
+        "CREATE (:VektorGraphMeta {key: $k, value: $v})",
+        {"k": _SCHEMA_VERSION_KEY, "v": _SCHEMA_VERSION},
+    )
     conn.execute(
         "UNWIND $rows AS r CREATE (:Module {name: r[1], path: r[2]})",
         {"rows": [[m, p] for m, p in modules.items()]},
