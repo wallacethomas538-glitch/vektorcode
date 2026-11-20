@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """VektorCode dashboard: dependency-free local control plane."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import base64, hashlib, hmac, json, os, secrets, sqlite3, time, uuid
+import base64, hashlib, hmac, json, os, secrets, sqlite3, threading, time, uuid
 from urllib.request import Request, urlopen
 from urllib.parse import urlencode, unquote, urlparse, parse_qs
 import re
@@ -9,6 +9,10 @@ from urllib.error import HTTPError, URLError
 from pathlib import Path
 
 from vektor_cloud import composio_mcp, mcp_client
+from vektor_cloud.aegis import aegis_gate
+from vektor_cloud.sandbox import DEFAULT_TIMEOUT as SANDBOX_TIMEOUT, Sandbox
+from vektor_cloud.skills import (discover_skills, format_skill_for_prompt,
+                                 load_skill, load_skill_reference)
 from vektor_cloud.egress import (EgressBlocked, guard_url, load_mcp_hosts,
                                 vektor_http)
 from vektor_cloud.storage import (DashboardStore, MEMORY_KINDS,
@@ -338,6 +342,155 @@ WEB_TOOL_SCHEMAS = [
                                    "api.github.com)"}},
             "required": ["url"]}}},
 ]
+# --- Sandboxed shell tool (hypit-integration, 2026-11-15) ---
+# Model-callable `run_shell`: one command string, run as `sh -c` with
+# cwd inside the sandbox work dir and a scrubbed environment (no key
+# material — see vektor_cloud/sandbox.py). NOTHING runs without a
+# per-command approval from Wallace: the first call only STAGES the
+# command and returns an approval_id; the command runs only after
+# Wallace approves that exact command via POST /api/shell/approve,
+# and only when the model re-issues the call with the matching
+# approval_id. Approval is single-use and expires after 10 minutes.
+# Honest limit: Sandbox.run is not a chroot — the jail covers cwd and
+# the file helpers, but a shell command can name absolute paths
+# outside the work dir. The approval gate (Wallace sees the exact
+# command) is the control for that; do not claim stronger confinement.
+SHELL_TOOL_SCHEMA = {"type": "function", "function": {
+    "name": "run_shell",
+    "description": ("Run one shell command inside the sandbox work "
+                    "directory (cwd is jailed, environment scrubbed of "
+                    "keys/secrets). Requires Wallace's approval: the "
+                    "first call only STAGES the command and returns an "
+                    "approval_id — nothing runs until he approves that "
+                    "exact command, then call again with approval_id. "
+                    "Approval is single-use and expires after 10 minutes."),
+    "parameters": {"type": "object", "properties": {
+        "command": {"type": "string",
+                    "description": "Shell command to run, 1-2000 characters"},
+        "approval_id": {"type": "string",
+                        "description": "Approval id returned by the staging call, after Wallace approves it"},
+        "timeout": {"type": "integer",
+                    "description": "Seconds to wait, 1-120 (default 120)"}},
+        "required": ["command"]}}}
+# Read-only companion to a loaded skill: one reference file from
+# inside an installed skill, jailed to that skill's directory.
+READ_SKILL_REFERENCE_SCHEMA = {"type": "function", "function": {
+    "name": "read_skill_reference",
+    "description": ("Read one reference file from inside an installed "
+                    "skill (read-only, jailed to the skill directory). "
+                    "Use it for the reference files a loaded skill names."),
+    "parameters": {"type": "object", "properties": {
+        "skill": {"type": "string",
+                  "description": "Skill slug, e.g. hypit"},
+        "reference": {"type": "string",
+                      "description": "Path relative to the skill directory, e.g. references/environment/distribution.md"}},
+        "required": ["skill", "reference"]}}}
+SHELL_APPROVAL_TTL_SECONDS = 600
+# Meta OAuth state lifetime: a login must complete within 10 minutes
+# of initiation, and the state is single-use (consumed on first match).
+META_OAUTH_STATE_TTL_SECONDS = 600
+SHELL_CALL_CAP_PER_SESSION = 5
+# Pending shell approvals: approval_id -> {command, session_id,
+# expires, approved, used}. In-memory only: a restart drops pending
+# (unapproved) approvals, which must then be staged again.
+_SHELL_APPROVALS = {}
+_SHELL_CALL_COUNTS = {}
+# F4: every read-modify-write on the approval dicts goes through this
+# lock (consume, approve, stage, list). Without it, two threads
+# calling run_shell with the same approval_id could both pass the
+# checks before either marked it used, and the command would run
+# twice on one approval. The lock is never held during subprocess
+# execution — only for the validate + mark-used step.
+_SHELL_APPROVALS_LOCK = threading.Lock()
+
+# F1 (follow-up 4): the Meta OAuth state is consumed atomically.
+# The callback used to read the stored state, validate it, and clear
+# it as three separate steps — two concurrent callbacks could both
+# read the same valid state before either cleared it, and both would
+# proceed to the token exchange. Every read-modify-write on the
+# stored state (mint in /api/meta/login, consume in the callback)
+# goes through this lock, so exactly one callback can consume a
+# valid state. The lock is never held during the token exchange.
+#
+# F1 (follow-up 5): scope of this lock, stated plainly. The lock is
+# a threading.Lock: it serializes threads inside ONE process only.
+# The state itself lives in the durable store (SQLite or Supabase),
+# and get_setting/set_setting are separate, non-atomic operations —
+# there is no transaction, row lock, or compare-and-swap in this
+# path. The deployment is a single process (one ThreadingHTTPServer,
+# main.py), so within the deployed architecture the consume is
+# exactly-once. If a second process ever ran against the same store
+# (a second Render instance, a local dev server on the same Supabase
+# project, a future multi-worker setup), the two processes would each
+# hold their own lock and could both read the same valid state and
+# both consume it — the race this lock closes would return. Closing
+# it would need a store-level atomic consume, which is an
+# architectural change and is NOT made here: the single-process
+# implementation is preserved by design (see the follow-up-5 report).
+_META_OAUTH_STATE_LOCK = threading.Lock()
+
+
+def _consume_meta_oauth_state(handler, state: str, code: str) -> bool:
+    """Atomically validate and consume one Meta OAuth state (F1).
+
+    Under _META_OAUTH_STATE_LOCK: read the stored {"state", "created"}
+    dict, compare it with `state`, and clear it when it matches (or
+    when it is expired). Returns True only when the state matched and
+    was consumed — the caller may then run the token exchange. A
+    missing code or a wrong state leaves the stored state untouched,
+    so the legitimate redirect can still complete; an expired state
+    is cleared and refused.
+    """
+    if not code:
+        return False
+    with _META_OAUTH_STATE_LOCK:
+        saved = handler.setting("meta_oauth_state", "")
+        saved_state = saved.get("state", "") if isinstance(saved, dict) else ""
+        saved_created = saved.get("created", 0) if isinstance(saved, dict) else 0
+        if not saved_state or not secrets.compare_digest(state, saved_state):
+            return False
+        handler.save_setting("meta_oauth_state", "")
+        if time.time() - saved_created > META_OAUTH_STATE_TTL_SECONDS:
+            return False
+        return True
+
+
+def _consume_shell_approval(approval_id: str, command: str,
+                            sid: str) -> str | None:
+    """Atomically validate and consume one shell approval (F4).
+
+    Under _SHELL_APPROVALS_LOCK: check unknown/used/expired/
+    unapproved/command+session match/session cap, then mark the
+    approval used and reserve one slot of the per-session cap.
+    Returns None when the approval is consumed (the caller may run
+    the command), or the refusal message otherwise. The entry stays
+    in the dict with used=True so a second call still reports
+    "already used" instead of "unknown".
+    """
+    with _SHELL_APPROVALS_LOCK:
+        ap = _SHELL_APPROVALS.get(approval_id)
+        if ap is None:
+            return ("Unknown approval_id; stage the command again "
+                    "without approval_id")
+        if ap["used"]:
+            return ("Approval already used (single-use); stage the "
+                    "command again")
+        if time.time() > ap["expires"]:
+            return ("Approval expired (10 minutes); stage the command "
+                    "again")
+        if not ap["approved"]:
+            return ("Command not yet approved by Wallace; approve via "
+                    "POST /api/shell/approve, then call again")
+        if ap["command"] != command or ap["session_id"] != (sid or ""):
+            return ("approval_id does not match this exact "
+                    "command/session")
+        count = _SHELL_CALL_COUNTS.get(sid or "", 0)
+        if count >= SHELL_CALL_CAP_PER_SESSION:
+            return ("Shell call cap reached for this session "
+                    "(5 executed commands)")
+        ap["used"] = True
+        _SHELL_CALL_COUNTS[sid or ""] = count + 1
+        return None
 # A model can emit tool_calls for any name, so write-capable names are
 # refused before any network call. Substrings, uppercased. The Composio
 # meta-tools are exempt: they are the sanctioned discovery path when
@@ -450,9 +603,10 @@ def vektor_system_prompt():
 # Replaces the old unsigned literal cookie (vc_auth=1). The signing secret
 # comes from VEKTORCODE_SESSION_SECRET; when unset, a random per-process
 # secret is used and sessions invalidate on restart. The secret is never
-# logged. When VEKTORCODE_TOOL_PASSWORD is unset, auth stays OPEN (everyone
-# passes) so local dev and current Render behavior don't break — setting a
-# tool password is what turns auth enforcement on.
+# logged. When VEKTORCODE_TOOL_PASSWORD is unset, auth stays OPEN for
+# local dev only — on Render (RENDER env set) requests are refused, so a
+# missing password can never silently leave production unauthenticated.
+# Setting a tool password is what turns auth enforcement on everywhere.
 AUTH_COOKIE = "vc_auth"
 AUTH_TTL_SECONDS = 30 * 24 * 3600
 _PROCESS_SECRET = secrets.token_hex(32)
@@ -496,13 +650,15 @@ def verify_auth_token(token):
 def require_auth(handler):
     """True when the request is allowed.
 
-    Open when VEKTORCODE_TOOL_PASSWORD is unset (local dev / current
-    Render). When a password IS set, only a valid HMAC-signed vc_auth
-    cookie passes — the old unsigned literal (vc_auth=1) is rejected.
+    When VEKTORCODE_TOOL_PASSWORD is set, only a valid HMAC-signed
+    vc_auth cookie passes — the old unsigned literal (vc_auth=1) is
+    rejected. When no password is set, local dev stays open, but on
+    Render (production) the request is refused: production must not
+    silently become unauthenticated.
     """
     expected = os.environ.get("VEKTORCODE_TOOL_PASSWORD")
     if not expected:
-        return True
+        return not bool(os.environ.get("RENDER"))
     cookie = handler.headers.get("Cookie", "") or ""
     for part in cookie.split(";"):
         part = part.strip()
@@ -662,18 +818,35 @@ def mcp_status_all(force=False):
             for cfg in _mcp_configs()]
 
 
-def _tool_status(tool_id):
+def _tool_status(tool_id, enabled=False):
     """Live status label for one tool in /api/state. Web is wired by
-    construction; Composio reflects the live handshake; the rest are
-    registered but have no executor."""
+    construction; Composio reflects the live handshake; shell is wired
+    (sandboxed, approval-gated) when enabled; the rest are registered
+    but have no executor."""
     if tool_id == "web":
         return "Wired — native fetch/search"
+    if tool_id == "shell":
+        return ("Wired — sandboxed, approval-gated" if enabled
+                else "Registered — enable in Settings")
     if tool_id == "composio":
         st = mcp_status()
         if st.get("connected"):
             return f"Wired — {st.get('tool_count', 0)} tools"
         return f"Offline — {st.get('error') or 'not configured'}"
     return "Registered, not executable"
+
+
+def resolve_invoked_skill(data, messages):
+    """Skill slug from a chat payload: an explicit "skill" field, or a
+    leading "/skill <slug>" in the latest user message. None when the
+    turn invokes no skill."""
+    if isinstance(data.get("skill"), str) and data["skill"].strip():
+        return data["skill"].strip()
+    last_user = next(
+        (m.get("content", "") for m in reversed(messages)
+         if m.get("role") == "user"), "")
+    match = re.match(r"\s*/skill\s+([A-Za-z0-9_-]+)", last_user or "")
+    return match.group(1) if match else None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -742,6 +915,86 @@ class Handler(BaseHTTPRequestHandler):
         walk(args or {})
         return found
 
+    def _shell_workdir(self):
+        """Sandbox work dir for shell commands (created on demand)."""
+        workdir = VEKTOR_STATE / "sandbox"
+        workdir.mkdir(parents=True, exist_ok=True)
+        return workdir
+
+    def _run_shell_tool(self, args, sid):
+        """run_shell: approval-gated, sandboxed shell execution.
+
+        Flow: model calls with {command} -> the command is STAGED
+        (nothing runs) and an approval_id is returned. Wallace approves
+        that exact command via POST /api/shell/approve. The model then
+        re-issues the call with {command, approval_id} and it runs once
+        inside the sandbox (cwd jailed, env scrubbed, timeout + output
+        caps). Approvals are single-use, expire after 10 minutes, and
+        are bound to the exact command string and session. Every stage
+        is receipted. Requires the "shell" tool enabled in Settings and
+        an authenticated session when a tool password is set.
+        """
+        if "shell" not in set(self.setting("tools", [])):
+            return ({"ok": False, "error": "Shell tool is disabled"},
+                    "run_shell")
+        if not require_auth(self):
+            return ({"ok": False, "error": "Authentication required"},
+                    "run_shell")
+        command = args.get("command", "")
+        if (not isinstance(command, str) or not command.strip()
+                or len(command) > 2000 or "\x00" in command):
+            return ({"ok": False,
+                     "error": "command must be 1-2000 characters"},
+                    "run_shell")
+        command = command.strip()
+        gate = aegis_gate("execute_shell", risk=4)
+        if not gate.get("allowed"):
+            receipt("shell_refused",
+                    {"command": command[:200], "mode": gate.get("mode")},
+                    True)
+            return ({"ok": False,
+                     "error": "Aegis gate refused shell execution: "
+                              + str(gate.get("mode"))}, "run_shell")
+        approval_id = args.get("approval_id", "")
+        if not isinstance(approval_id, str) or not approval_id:
+            approval_id = str(uuid.uuid4())
+            with _SHELL_APPROVALS_LOCK:
+                _SHELL_APPROVALS[approval_id] = {
+                    "command": command, "session_id": sid or "",
+                    "expires": time.time() + SHELL_APPROVAL_TTL_SECONDS,
+                    "approved": False, "used": False}
+            receipt("shell_staged",
+                    {"approval_id": approval_id,
+                     "command": command[:500]}, True)
+            return ({"ok": False, "approval_required": True,
+                     "approval_id": approval_id, "command": command,
+                     "note": ("This command is staged, NOT run. Ask "
+                              "Wallace to approve it (POST "
+                              "/api/shell/approve with this approval_id), "
+                              "then call run_shell again with the same "
+                              "command and approval_id.")}, "run_shell")
+        # F4: validate + consume atomically; the lock is released
+        # before the subprocess runs, so concurrent calls cannot both
+        # execute on one approval.
+        refusal = _consume_shell_approval(approval_id, command, sid)
+        if refusal is not None:
+            return ({"ok": False, "error": refusal}, "run_shell")
+        try:
+            timeout_s = int(args.get("timeout", SANDBOX_TIMEOUT))
+        except (TypeError, ValueError):
+            timeout_s = SANDBOX_TIMEOUT
+        timeout_s = max(1, min(120, timeout_s))
+        sandbox = Sandbox(str(self._shell_workdir()))
+        result = sandbox.run(["/bin/sh", "-c", command],
+                             timeout=timeout_s)
+        receipt("shell_executed",
+                {"command": command[:500],
+                 "returncode": result["returncode"],
+                 "timed_out": result["timed_out"]}, True, True)
+        return ({"ok": True, "returncode": result["returncode"],
+                 "stdout": result["stdout"], "stderr": result["stderr"],
+                 "timed_out": result["timed_out"]}, "run_shell")
+
     def _run_tool_call(self, name, args, sid):
         """Execute one tool call. Returns (result_dict, tools_used_entry).
 
@@ -755,6 +1008,23 @@ class Handler(BaseHTTPRequestHandler):
                 return ({"ok": False, "error": "Web research tool is disabled"},
                         name)
             return self._run_web_tool(name, args, sid)
+        if name == "run_shell":
+            return self._run_shell_tool(args, sid)
+        if name == "read_skill_reference":
+            skill = args.get("skill", "")
+            reference = args.get("reference", "")
+            if not isinstance(skill, str) or not isinstance(reference, str):
+                return ({"ok": False,
+                         "error": "skill and reference must be strings"},
+                        name)
+            ref = load_skill_reference(ROOT, VEKTOR_STATE, skill, reference)
+            if ref is None:
+                return ({"ok": False,
+                         "error": "Reference not found (or escapes the "
+                                  "skill directory)"}, name)
+            return ({"ok": True, "skill": ref["skill"],
+                     "reference": ref["reference"],
+                     "content": ref["content"]}, name)
         # Composio meta-tools (two-hop): check the discovered tool at
         # execution time — the meta-tool name itself is exempt, the tool
         # it is about to run is not.
@@ -825,7 +1095,7 @@ class Handler(BaseHTTPRequestHandler):
         return call_mcp_tool(name, args, server="composio"), name
 
     def _resolve_tools(self, result, endpoint, headers, model,
-                       llm_messages, sid=None):
+                       llm_messages, sid=None, skill_slug=None):
         """Run tool-call rounds for one provider reply, up to
         MAX_TOOL_ROUNDS. Returns (message, tools_used).
 
@@ -871,7 +1141,7 @@ class Handler(BaseHTTPRequestHandler):
             follow = messages + [{"role": "assistant", "tool_calls": tool_calls}] + tool_results
             payload = json.dumps({"model": model, "messages": follow,
                                   "stream": False,
-                                  "tools": self._declared_tools()}).encode()
+                                  "tools": self._declared_tools(skill_slug)}).encode()
             guard_url(endpoint)  # egress check on the follow-up call too
             req = Request(endpoint, data=payload, headers=headers, method="POST")
             with urlopen(req, timeout=120) as response:
@@ -948,14 +1218,22 @@ class Handler(BaseHTTPRequestHandler):
                 break
         return schemas
 
-    def _declared_tools(self):
+    def _declared_tools(self, skill_slug=None):
         """Tool schemas sent to the model in chat payloads: the union of
         the native read-only web tools, the Composio meta-tools, and the
-        namespaced schemas of every enabled + exposed MCP server."""
+        namespaced schemas of every enabled + exposed MCP server. The
+        sandboxed shell schema appears only when the "shell" tool is
+        enabled; the skill-reference schema only when a skill is loaded
+        for this turn (so a turn with no skill declares no extra tools)."""
         enabled = set(self.setting("tools", []))
         tools = []
         if "web" in enabled:
             tools.extend(WEB_TOOL_SCHEMAS)
+        if "shell" in enabled:
+            tools.append(SHELL_TOOL_SCHEMA)
+        if (skill_slug is not None
+                and load_skill(ROOT, VEKTOR_STATE, skill_slug) is not None):
+            tools.append(READ_SKILL_REFERENCE_SCHEMA)
         if "composio" in enabled:
             tools.extend(self._composio_meta_schemas())
         for cfg in _mcp_configs():
@@ -1065,6 +1343,29 @@ class Handler(BaseHTTPRequestHandler):
         llm_messages = [{"role": "system", "content": system_prompt}] + [
             {"role": m["role"], "content": m["content"]} for m in history]
 
+        # --- Skill invocation: /skill <slug> loads an installed skill ---
+        # Also accepts an explicit "skill" field in the chat payload.
+        # The loaded skill becomes a second system message, so the model
+        # follows it for this turn. An unknown slug is reported to the
+        # model (with the installed list) instead of failing silently.
+        skill_slug = resolve_invoked_skill(data, messages)
+        if skill_slug:
+            skill = load_skill(ROOT, VEKTOR_STATE, skill_slug)
+            if skill is not None:
+                llm_messages.append(
+                    {"role": "system",
+                     "content": format_skill_for_prompt(skill)})
+            else:
+                installed = ", ".join(
+                    s["slug"] for s in discover_skills(ROOT, VEKTOR_STATE)
+                ) or "none"
+                llm_messages.append(
+                    {"role": "system",
+                     "content": (f"Wallace asked for skill '{skill_slug}', "
+                                 f"but it is not installed. Installed "
+                                 f"skills: {installed}. Tell him so and "
+                                 f"offer to help without it.")})
+
         keys = [k for k in KEY_POOLS.get(pid, []) if k.strip()]
         if pid == "local":
             # Local Ollama needs no API key; an empty key means "no auth header".
@@ -1100,11 +1401,11 @@ class Handler(BaseHTTPRequestHandler):
                                _provider_endpoint(self, fpid), fkeys, frotate))
 
         if data.get("stream"):
-            self._chat_stream(sid, candidates, llm_messages)
+            self._chat_stream(sid, candidates, llm_messages, skill_slug)
             return
-        self._chat_once(sid, candidates, llm_messages)
+        self._chat_once(sid, candidates, llm_messages, skill_slug)
 
-    def _chat_once(self, sid, candidates, llm_messages):
+    def _chat_once(self, sid, candidates, llm_messages, skill_slug=None):
         """Non-streaming chat: try each candidate provider in order.
 
         Within a provider, rotate through its key pool on
@@ -1126,13 +1427,13 @@ class Handler(BaseHTTPRequestHandler):
                            "User-Agent": LLM_USER_AGENT}
                 if key:
                     headers["Authorization"] = "Bearer " + key
-                payload = json.dumps({"model": model, "messages": llm_messages, "stream": False, "tools": self._declared_tools()}).encode()
+                payload = json.dumps({"model": model, "messages": llm_messages, "stream": False, "tools": self._declared_tools(skill_slug)}).encode()
                 try:
                     guard_url(endpoint)  # egress guard on the chat path
                     req = Request(endpoint, data=payload, headers=headers, method="POST")
                     with urlopen(req, timeout=30) as response:
                         result = json.loads(response.read())
-                    message, tools_used = self._resolve_tools(result, endpoint, headers, model, llm_messages, sid)
+                    message, tools_used = self._resolve_tools(result, endpoint, headers, model, llm_messages, sid, skill_slug)
                     if not isinstance(message, str) or not message.strip():
                         continue
                     latency = round((time.time() - started) * 1000)
@@ -1158,7 +1459,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"ok": False, "error": "LLM unavailable: " + str(exc)[:240], "retryable": True, "session_id": sid}, 502); return
         self.send_json({"ok": False, "error": last_error, "retryable": True, "session_id": sid, "attempts": attempt_errors}, last_status)
 
-    def _chat_stream(self, sid, candidates, llm_messages):
+    def _chat_stream(self, sid, candidates, llm_messages, skill_slug=None):
         """Streaming chat: SSE tokens, with a full-reply fallback.
 
         Tries each candidate provider in order (same fallback as
@@ -1186,7 +1487,7 @@ class Handler(BaseHTTPRequestHandler):
                            "User-Agent": LLM_USER_AGENT}
                 if key:
                     headers["Authorization"] = "Bearer " + key
-                payload = json.dumps({"model": model, "messages": llm_messages, "stream": True, "tools": self._declared_tools()}).encode()
+                payload = json.dumps({"model": model, "messages": llm_messages, "stream": True, "tools": self._declared_tools(skill_slug)}).encode()
                 try:
                     guard_url(endpoint)  # egress guard on the chat path
                 except EgressBlocked as exc:
@@ -1221,7 +1522,7 @@ class Handler(BaseHTTPRequestHandler):
                         if "text/event-stream" not in ctype:
                             # Fallback: provider returned a complete JSON reply.
                             result = json.loads(response.read())
-                            message, tools_used = self._resolve_tools(result, endpoint, headers, model, llm_messages, sid)
+                            message, tools_used = self._resolve_tools(result, endpoint, headers, model, llm_messages, sid, skill_slug)
                             if isinstance(message, str) and message.strip():
                                 self._sse({"type": "delta", "content": message})
                                 self._finish_stream(sid, provider, model, message, tools_used, started)
@@ -1251,11 +1552,11 @@ class Handler(BaseHTTPRequestHandler):
                         if tool_calls_seen:
                             # Redo the turn non-streaming to get complete
                             # tool calls, run them, emit the final message.
-                            follow_payload = json.dumps({"model": model, "messages": llm_messages, "stream": False, "tools": self._declared_tools()}).encode()
+                            follow_payload = json.dumps({"model": model, "messages": llm_messages, "stream": False, "tools": self._declared_tools(skill_slug)}).encode()
                             req = Request(endpoint, data=follow_payload, headers=headers, method="POST")
                             with urlopen(req, timeout=120) as follow_resp:
                                 result = json.loads(follow_resp.read())
-                            message, tools_used = self._resolve_tools(result, endpoint, headers, model, llm_messages, sid)
+                            message, tools_used = self._resolve_tools(result, endpoint, headers, model, llm_messages, sid, skill_slug)
                             if isinstance(message, str) and message.strip():
                                 self._sse({"type": "delta", "content": message})
                                 self._finish_stream(sid, provider, model, message, tools_used, started)
@@ -1442,14 +1743,42 @@ class Handler(BaseHTTPRequestHandler):
             if not require_auth(self): self.send_json({"ok": False, "error": "Authentication required", "retryable": False}, 401); return
             self.send_json({"ok": True, "servers": store().mcp_server_list()}); return
         if self.path == "/api/meta/login":
+            # OAuth initiation mints a server-side state token, so only
+            # an authenticated session may start it. Before this gate,
+            # anyone could mint a state and complete the flow, binding
+            # their own Facebook profile to the server.
+            if not require_auth(self): self.send_json({"ok": False, "error": "Authentication required", "retryable": False}, 401); return
             if not meta_ready(): self.send_json({"ok":False,"error":"Meta OAuth is not configured on Render"}, 503); return
-            state = secrets.token_urlsafe(24); self.save_setting("meta_oauth_state", state)
+            state = secrets.token_urlsafe(24)
+            # Stored with a creation time so the callback can expire it.
+            # (Settings are JSON-serialized; a legacy plain-string
+            # value reads back as a non-dict and is treated as invalid.)
+            # Minting takes the state lock so a new state cannot land
+            # between a callback's read and clear (see F1).
+            with _META_OAUTH_STATE_LOCK:
+                self.save_setting("meta_oauth_state", {"state": state, "created": time.time()})
             redirect = os.environ.get("META_REDIRECT_URI", public_base(self) + "/api/meta/callback")
             params = urlencode({"client_id":os.environ["META_APP_ID"],"redirect_uri":redirect,"state":state,"scope":os.environ.get("META_SCOPES","public_profile,email"),"response_type":"code"})
             self.send_response(302); self.send_header("Location", "https://www.facebook.com/v24.0/dialog/oauth?" + params); self.end_headers(); return
         if self.path.startswith("/api/meta/callback"):
             query = parse_qs(urlparse(self.path).query); code = query.get("code", [""])[0]; state = query.get("state", [""])[0]
-            if not code or not secrets.compare_digest(state, self.setting("meta_oauth_state", "")):
+            # State validation is atomic (see _consume_meta_oauth_state,
+            # F1): the stored state is read, compared, and cleared under
+            # one lock, so two concurrent callbacks cannot both consume
+            # the same state. A matching state is consumed BEFORE the
+            # token exchange, so a replayed callback URL cannot complete
+            # a second login, and an expired state (10 minutes) is
+            # refused outright. A missing code or wrong state leaves the
+            # stored state untouched — the legitimate redirect has not
+            # completed yet.
+            # Residual, stated plainly: the callback itself cannot carry
+            # the session cookie (vc_auth is SameSite=Strict, and the
+            # redirect from Facebook is cross-site), so the single-use,
+            # time-limited state is the binding between the initiation
+            # (which requires auth) and this callback. Allowing the
+            # cookie on the callback would need SameSite=Lax — a
+            # decision for Big Chat, not a silent change here.
+            if not _consume_meta_oauth_state(self, state, code):
                 self.send_error(400, "Invalid Meta OAuth state"); return
             redirect = os.environ.get("META_REDIRECT_URI", public_base(self) + "/api/meta/callback")
             token_url = "https://graph.facebook.com/v24.0/oauth/access_token?" + urlencode({"client_id":os.environ["META_APP_ID"],"client_secret":os.environ["META_APP_SECRET"],"redirect_uri":redirect,"code":code})
@@ -1461,9 +1790,21 @@ class Handler(BaseHTTPRequestHandler):
                 self.save_setting("meta_access_token", access_token)
                 receipt("meta_login", {"id":profile.get("id"),"name":profile.get("name")}, True, True)
                 self.send_response(302); self.send_header("Location", "/?meta=connected"); self.end_headers()
-            except (HTTPError, URLError, KeyError, ValueError) as exc: self.send_error(502, "Meta login failed: " + str(exc)[:160])
+            except (HTTPError, URLError, KeyError, ValueError,
+                    TimeoutError) as exc: self.send_error(502, "Meta login failed: " + str(exc)[:160])
             return
         if self.path == "/api/state":
+            auth_enabled = bool(os.environ.get("VEKTORCODE_TOOL_PASSWORD"))
+            authenticated = require_auth(self)
+            if not authenticated:
+                # Unauthenticated callers get only what the login page
+                # needs. Sessions, receipts (which include shell
+                # commands), models, tools, skills and MCP status stay
+                # behind auth. setup_required tells the login page the
+                # server needs a password configured before anyone can
+                # log in.
+                setup_required = bool(os.environ.get("RENDER")) and not auth_enabled
+                self.send_json({"auth": {"enabled": auth_enabled, "authenticated": False, "setup_required": setup_required}}); return
             current = store()
             sessions = current.list_sessions()
             receipts = current.list_receipts(30)
@@ -1471,10 +1812,24 @@ class Handler(BaseHTTPRequestHandler):
             active_name = self.setting("active_model_name", "") or None
             if active_name not in FREE_MODELS.get(active, []):
                 active_name = None
-            auth_enabled = bool(os.environ.get("VEKTORCODE_TOOL_PASSWORD"))
-            authenticated = require_auth(self)
             mcp = mcp_status()
-            self.send_json({"models":provider_models(self), "tools":[{"id":a,"name":b,"description":c,"status":_tool_status(a),"enabled":a in enabled,"locked":bool(a in RISKY_TOOLS and auth_enabled and not authenticated),"approval_required":a in RISKY_TOOLS} for a,b,c in TOOLS], "active_model":active, "active_model_name":active_name, "qwen_source":QWEN_SOURCE, "ollama_base_url":ollama_base_url(self), "qwen_api_url":qwen_api_url(self), "health":self.setting("health", {"providers":[]}), "mcp":{"connected":mcp.get("connected",False),"configured":mcp.get("configured",False),"transport":mcp.get("transport","streamable-http"),"tool_count":mcp.get("tool_count",0),"protocol":mcp.get("protocol"),"error":mcp.get("error"),"capabilities":[x[1] for x in TOOLS]}, "mcp_servers":mcp_status_all(), "composio":{"connected":mcp.get("connected",False),"mcp_url_set":bool(os.environ.get("COMPOSIO_MCP_URL")),"api_key_set":bool(os.environ.get("COMPOSIO_API_KEY"))}, "storage":current.status(), "meta":{"configured":meta_ready(),"profile":self.setting("meta_profile", None)}, "media":{"provider":"Pollinations","configured":bool(os.environ.get("POLLINATIONS_API_KEY"))}, "auth":{"enabled":auth_enabled,"authenticated":authenticated}, "sessions":sessions, "receipts":receipts, "kill_switch":self.setting("kill_switch", False)}); return
+            self.send_json({"models":provider_models(self), "tools":[{"id":a,"name":b,"description":c,"status":_tool_status(a, a in enabled),"enabled":a in enabled,"locked":bool(a in RISKY_TOOLS and auth_enabled and not authenticated),"approval_required":a in RISKY_TOOLS} for a,b,c in TOOLS], "active_model":active, "active_model_name":active_name, "qwen_source":QWEN_SOURCE, "ollama_base_url":ollama_base_url(self), "qwen_api_url":qwen_api_url(self), "health":self.setting("health", {"providers":[]}), "mcp":{"connected":mcp.get("connected",False),"configured":mcp.get("configured",False),"transport":mcp.get("transport","streamable-http"),"tool_count":mcp.get("tool_count",0),"protocol":mcp.get("protocol"),"error":mcp.get("error"),"capabilities":[x[1] for x in TOOLS]}, "mcp_servers":mcp_status_all(), "composio":{"connected":mcp.get("connected",False),"mcp_url_set":bool(os.environ.get("COMPOSIO_MCP_URL")),"api_key_set":bool(os.environ.get("COMPOSIO_API_KEY"))}, "storage":current.status(), "meta":{"configured":meta_ready(),"profile":self.setting("meta_profile", None)}, "media":{"provider":"Pollinations","configured":bool(os.environ.get("POLLINATIONS_API_KEY"))}, "skills":discover_skills(ROOT, VEKTOR_STATE), "auth":{"enabled":auth_enabled,"authenticated":authenticated}, "sessions":sessions, "receipts":receipts, "kill_switch":self.setting("kill_switch", False)}); return
+        if self.path == "/api/skills":
+            self.send_json({"skills": discover_skills(ROOT, VEKTOR_STATE)}); return
+        if self.path == "/api/shell/approvals":
+            if not require_auth(self): self.send_json({"ok": False, "error": "Authentication required", "retryable": False}, 401); return
+            now = time.time()
+            # F4: snapshot under the lock so a concurrent consume
+            # cannot mutate the dict mid-iteration.
+            with _SHELL_APPROVALS_LOCK:
+                items = list(_SHELL_APPROVALS.items())
+            pending = [{"approval_id": aid, "command": ap["command"],
+                        "session_id": ap["session_id"],
+                        "approved": ap["approved"], "used": ap["used"],
+                        "expires_in_s": max(0, int(ap["expires"] - now))}
+                       for aid, ap in items
+                       if not ap["used"] and now <= ap["expires"]]
+            self.send_json({"approvals": pending}); return
         if self.path == "/api/voice/status":
             try:
                 from voice_agent.config import VoiceConfig
@@ -1549,6 +1904,10 @@ class Handler(BaseHTTPRequestHandler):
             if not require_auth(self): self.send_json({"ok": False, "error": "Authentication required", "retryable": False}, 401); return
             self.web_search(data); return
         if path == "/api/media":
+            # Generates a provider URL (spends provider quota) and writes
+            # a receipt — a state-changing action, so it requires auth
+            # like every other write endpoint. No public-write exception.
+            if not require_auth(self): self.send_json({"ok":False,"error":"Authentication required"}, 401); return
             kind, prompt = data.get("kind"), data.get("prompt", "")
             if kind not in {"image", "audio"} or not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 1200:
                 self.send_json({"ok":False,"error":"Choose image or audio and enter a prompt up to 1200 characters"}, 400); return
@@ -1558,7 +1917,12 @@ class Handler(BaseHTTPRequestHandler):
             if key: headers["Authorization"] = "Bearer " + key
             receipt("media_generate", {"kind":kind,"provider":"Pollinations"})
             self.send_json({"ok":True,"kind":kind,"url":endpoint,"provider":"Pollinations"}); return
-        if path == "/api/receipt": receipt(data.get("action","manual action"), data.get("detail",{}), data.get("sensitive",False), data.get("approved",False)); self.send_json({"ok":True}); return
+        if path == "/api/receipt":
+            # Receipts are the audit trail (shell approvals record the
+            # command); unauthenticated callers must not be able to
+            # forge them.
+            if not require_auth(self): self.send_json({"ok":False,"error":"Authentication required"}, 401); return
+            receipt(data.get("action","manual action"), data.get("detail",{}), data.get("sensitive",False), data.get("approved",False)); self.send_json({"ok":True}); return
         if path == "/api/memory/save":
             # Durable memory (2026-11-07): the old version appended to a
             # file under VEKTOR_STATE/memories — ephemeral on Render, lost
@@ -1605,14 +1969,50 @@ class Handler(BaseHTTPRequestHandler):
             target = VEKTOR_STATE / "skills" / f"{slug}.md"
             append_shared_file(target, heading, content)
             receipt("skill_saved", {"path":str(target),"title":heading}, True, True)
-            self.send_json({"ok":True,"path":str(target)}); return
+            self.send_json({"ok":True,"path":str(target),"slug":slug,"loadable":True}); return
+        if path == "/api/shell/approve":
+            # Approve one staged shell command (single-use, 10-minute
+            # expiry). The model must then re-issue run_shell with the
+            # same command + approval_id for it to execute.
+            if not require_auth(self): self.send_json({"ok":False,"error":"Authentication required"}, 401); return
+            approval_id = data.get("approval_id", "")
+            if not isinstance(approval_id, str) or not approval_id:
+                self.send_json({"ok":False,"error":"approval_id is required"}, 400); return
+            # F4: the approve write goes through the same lock as the
+            # consume step, so an approval cannot be approved and
+            # consumed in a torn state.
+            with _SHELL_APPROVALS_LOCK:
+                ap = _SHELL_APPROVALS.get(approval_id)
+                if ap is None:
+                    self.send_json({"ok":False,"error":"Unknown approval_id"}, 404); return
+                if ap["used"]:
+                    self.send_json({"ok":False,"error":"Approval already used"}, 409); return
+                if time.time() > ap["expires"]:
+                    self.send_json({"ok":False,"error":"Approval expired"}, 410); return
+                ap["approved"] = True
+            receipt("shell_approved", {"approval_id": approval_id, "command": ap["command"][:500]}, True, True)
+            self.send_json({"ok":True, "approval_id": approval_id, "command": ap["command"]}); return
         if path == "/api/login":
             expected = os.environ.get("VEKTORCODE_TOOL_PASSWORD")
+            if not expected and os.environ.get("RENDER"):
+                # Production with no password configured: fail closed.
+                # No login can succeed until a password is set.
+                self.send_json({"ok": False, "error": "Authentication is not configured on this server"}, 401)
+                receipt("login", {"success": False}); return
             ok = not expected or secrets.compare_digest(str(data.get("password","")), expected)
             if ok:
                 token = issue_auth_token()
                 self.send_response(204)
-                self.send_header("Set-Cookie", f"{AUTH_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={AUTH_TTL_SECONDS}")
+                # Secure only when the request arrived over HTTPS
+                # (Render terminates TLS and sets X-Forwarded-Proto, and
+                # RENDER always means HTTPS). Local HTTP dev keeps
+                # working without it.
+                secure = ("https" in (self.headers.get("X-Forwarded-Proto") or "")
+                          or bool(os.environ.get("RENDER")))
+                cookie = f"{AUTH_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={AUTH_TTL_SECONDS}"
+                if secure:
+                    cookie += "; Secure"
+                self.send_header("Set-Cookie", cookie)
                 self.end_headers()
             else: self.send_json({"ok":False}, 401)
             receipt("login", {"success":ok}); return
@@ -1656,10 +2056,14 @@ class Handler(BaseHTTPRequestHandler):
             receipt("settings_saved", {"keys": sorted(saved.keys())})
             self.send_json({"ok":True, "ollama_base_url": ollama_base_url(self), "qwen_api_url": qwen_api_url(self)}); return
         if path == "/api/tool":
+            # Consistent production policy: changing any tool setting
+            # writes persisted state and a receipt, so every toggle
+            # requires auth — not just the risky ones. (file_ops is the
+            # only non-risky tool; it was previously toggleable
+            # without login. No undocumented public-write exception.)
+            if not require_auth(self): self.send_json({"ok":False,"error":"Authentication required"}, 401); return
             tool = data.get("tool"); enabled = bool(data.get("enabled"));
             if tool not in {x[0] for x in TOOLS}: self.send_json({"ok":False}, 400); return
-            if tool in RISKY_TOOLS and not require_auth(self):
-                self.send_json({"ok":False,"error":"Authentication required"}, 401); return
             enabled_tools = set(self.setting("tools", [])); enabled_tools.discard(tool)
             if enabled: enabled_tools.add(tool)
             self.save_setting("tools", sorted(enabled_tools)); receipt("tool_toggle", {"tool":tool,"enabled":enabled}, tool in RISKY_TOOLS); self.send_json({"ok":True}); return
@@ -1686,6 +2090,11 @@ class Handler(BaseHTTPRequestHandler):
             if not require_auth(self): self.send_json({"ok":False,"error":"Authentication required", "retryable":False}, 401); return
             self.save_setting("kill_switch", True); receipt("kill_switch",{"enabled":True},True,True); self.send_json({"ok":True,"kill_switch":True}); return
         if path == "/api/health":
+            # Probes every configured provider outbound (with live keys),
+            # saves the results to settings, and writes a receipt — a
+            # state-changing action, so it requires auth. GET /health
+            # stays the public liveness check; this refresh does not.
+            if not require_auth(self): self.send_json({"ok":False,"error":"Authentication required"}, 401); return
             results=[]
             for pid,name,key_env,url,model in PROVIDERS:
                 if pid == "qwen":

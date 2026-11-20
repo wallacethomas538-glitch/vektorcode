@@ -66,6 +66,7 @@ async function refreshState() {
     const next = await api('/api/state');
     if (!next) return; // 401/network: api() already surfaced it
     state = next;
+    if (!state.models) { renderSettingsBits(); return; } // unauthenticated minimal state: login only
     renderModels();
     renderSessions();
     renderSkills();
@@ -115,11 +116,14 @@ function renderModelNameSelect(select) {
 
 function renderSessions() {
     const list = $('session-list');
-    if (!state.sessions.length) {
+    // Defensive: minimal unauthenticated state has no sessions array.
+    // Any caller (init, refresh, resume) must be safe to run logged out.
+    const sessions = (state && state.sessions) || [];
+    if (!sessions.length) {
         list.innerHTML = '<div class="muted">No sessions yet.</div>';
         return;
     }
-    list.innerHTML = state.sessions.map((s) =>
+    list.innerHTML = sessions.map((s) =>
         `<div class="session-item ${s.id === currentSessionId ? 'active' : ''}" onclick="resumeSession('${esc(s.id)}')" title="${esc(s.title)} — ${esc(s.model)} · ${s.tokens || 0} tokens">` +
         `<span class="session-title">${esc(s.title)}</span>` +
         `<button class="session-del" aria-label="Delete session ${esc(s.title)}" onclick="event.stopPropagation(); deleteSession('${esc(s.id)}')">×</button>` +
@@ -798,8 +802,23 @@ function closeSettings() {
     $('settings-modal').style.display = 'none';
 }
 
+function renderLoginBits() {
+    // Only what the login form needs; safe on the minimal
+    // unauthenticated state ({auth} only).
+    $('login-status').textContent = state.auth.setup_required
+        ? 'This server requires a password, but none is configured — set VEKTORCODE_TOOL_PASSWORD on the server.'
+        : !state.auth.enabled
+            ? 'Auth is not configured on this server — tools are open, no login needed.'
+            : state.auth.authenticated
+                ? 'Logged in (session cookie set).'
+                : 'Not logged in — auth-gated tools are locked until you unlock.';
+    $('login-form').style.display = state.auth.enabled && !state.auth.authenticated ? 'block' : 'none';
+}
+
 function renderSettingsBits() {
     if (!state) return;
+    renderLoginBits();
+    if (!state.models) return; // unauthenticated minimal state: login only
     const active = state.models.find((m) => m.id === state.active_model) || {};
     $('settings-model').textContent =
         (active.name || state.active_model) + ((state.active_model_name || active.model) ? ' (' + (state.active_model_name || active.model) + ')' : '');
@@ -820,12 +839,6 @@ function renderSettingsBits() {
             ).join('') + '</tbody></table>' +
             '<p class="muted">Qwen routes: Groq-hosted Qwen3 first, local Ollama Qwen when Groq keys are absent, DashScope compat third. The fork itself does not run on Render.</p>';
     }
-    $('login-status').textContent = !state.auth.enabled
-        ? 'Auth is not configured on this server — tools are open, no login needed.'
-        : state.auth.authenticated
-            ? 'Logged in (session cookie set).'
-            : 'Not logged in — auth-gated tools are locked until you unlock.';
-    $('login-form').style.display = state.auth.enabled && !state.auth.authenticated ? 'block' : 'none';
     $('kill-status').textContent = state.kill_switch
         ? 'ACTIVE — chat is stopped (server returns 423)'
         : 'Off';
@@ -1227,10 +1240,15 @@ async function init() {
     initVoice();
     await refreshState();
     await updateStatus();
-    if (currentSessionId && state && !state.sessions.some((s) => s.id === currentSessionId)) {
+    // Unauthenticated minimal state ({auth} only): the login screen is
+    // the whole UI. Nothing below may assume full state — state.sessions
+    // is undefined here, and a stored session id from an earlier login
+    // would otherwise crash on state.sessions.some().
+    if (!state || !state.sessions) return;
+    if (currentSessionId && !state.sessions.some((s) => s.id === currentSessionId)) {
         setCurrentSession(null); // stored session no longer exists server-side
     }
-    if (state) renderSessions();
+    renderSessions();
 }
 
 init();

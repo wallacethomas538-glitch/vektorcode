@@ -1,0 +1,716 @@
+"""Skill system for VektorCode (hypit-integration, 2026-11-15).
+
+A skill is a directory with a SKILL.md (YAML frontmatter ``name`` /
+``description`` + Markdown body) and optional ``references/`` files, or
+a loose Markdown note saved via POST /api/skill/save. Two roots are
+searched, in order:
+
+  - repo skills dir: <repo>/skills   (shipped with the code; deploys)
+  - state skills dir: $VEKTOR_STATE_DIR/skills  (Wallace-saved notes)
+
+Repo wins on slug collision. Only these two roots are ever read: the
+model can load an installed skill by slug, never an arbitrary path.
+Skill content loads as *instructions* for the model when Wallace
+invokes the skill — unlike web/MCP results, which are untrusted
+external data. The trust boundary is the install/save path: repo
+skills ship with code Wallace approved, state notes are saved by
+Wallace through the authenticated /api/skill/save endpoint.
+"""
+import fcntl
+import os
+import re
+import shutil
+import stat
+import threading
+import uuid
+from contextlib import contextmanager
+from pathlib import Path
+
+SKILL_BODY_CAP = 12000
+REFERENCE_CAP = 8000
+MAX_REFERENCES = 100
+
+_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
+_KEYVAL_RE = re.compile(r"^([A-Za-z0-9_-]+):\s*(.*)$")
+
+
+def slugify(text: str) -> str:
+    """Lowercase slug: runs of non-alphanumerics become one hyphen."""
+    slug = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
+    return slug or "skill"
+
+
+def parse_skill_markdown(text: str, fallback_name: str = "") -> dict:
+    """Split SKILL.md into name/description/body.
+
+    Frontmatter (``---`` block) wins; without it the name falls back
+    to ``fallback_name`` (usually the directory/file slug) and the
+    description to the first non-empty, non-heading line.
+    """
+    name = fallback_name
+    description = ""
+    body = text or ""
+    match = _FRONTMATTER_RE.match(body)
+    if match:
+        for line in match.group(1).splitlines():
+            kv = _KEYVAL_RE.match(line.strip())
+            if kv:
+                if kv.group(1).lower() == "name" and kv.group(2).strip():
+                    name = kv.group(2).strip()
+                elif kv.group(1).lower() == "description":
+                    description = kv.group(2).strip()
+        body = body[match.end():]
+    if not description:
+        for line in body.splitlines():
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                description = stripped[:200]
+                break
+    return {"name": name or fallback_name or "skill",
+            "description": description, "body": body}
+
+
+def _read_capped(path: Path, cap_chars: int) -> str | None:
+    """Read a skill file with the size enforced BEFORE its content is
+    held in memory (F6), and with the open hardened against
+    symlink / time-of-check-time-of-use swaps (follow-up 4).
+
+    1. Resolve symlinks first, so a link to a huge file elsewhere is
+       measured by its target, not by the link.
+    2. Stat the resolved target and refuse WITHOUT opening when the
+       byte size exceeds cap_chars * 4 + 1024 (max 4 bytes per UTF-8
+       char, plus frontmatter slack — a bigger file cannot be within
+       the char cap).
+    3. Open with O_NOFOLLOW (and O_NONBLOCK, so opening a FIFO returns
+       immediately instead of blocking until a writer appears), then
+       fstat the open descriptor and refuse unless it is the same
+       regular file that was just statted (same device + inode) and
+       still within the byte cap. A swap between the stat and the
+       open — a different file, a symlink planted at the path, or
+       growth past the cap — is refused instead of read.
+    4. Read at most cap_chars + 1 chars, so the held content stays
+       bounded by the cap even when the byte pre-check passes.
+    Returns None when the file is missing, unreadable, oversized,
+    not a regular file, or swapped between stat and open.
+    """
+    try:
+        resolved = path.resolve()
+        pre = resolved.stat()
+    except OSError:
+        return None
+    if pre.st_size > cap_chars * 4 + 1024:
+        return None
+    flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+             | getattr(os, "O_NONBLOCK", 0))
+    try:
+        fd = os.open(resolved, flags)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        if (st.st_dev, st.st_ino) != (pre.st_dev, pre.st_ino):
+            return None
+        if st.st_size > cap_chars * 4 + 1024:
+            return None
+        with os.fdopen(fd, encoding="utf-8") as f:
+            return f.read(cap_chars + 1)
+    except (OSError, UnicodeDecodeError):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return None
+
+
+def _skill_dir_info(skill_dir: Path) -> dict | None:
+    """Read one skill directory. Returns None when it has no SKILL.md."""
+    skill_file = skill_dir / "SKILL.md"
+    if not skill_file.is_file():
+        return None
+    # The SKILL.md itself must live in this directory: resolve it and
+    # refuse when a symlink points the read elsewhere.
+    try:
+        if skill_file.resolve().parent != skill_dir.resolve():
+            return None
+    except OSError:
+        return None
+    text = _read_capped(skill_file, SKILL_BODY_CAP)
+    if text is None:
+        return None
+    try:
+        parsed = parse_skill_markdown(text, fallback_name=skill_dir.name)
+    except (OSError, UnicodeDecodeError):
+        return None
+    references = []
+    refs_dir = skill_dir / "references"
+    if refs_dir.is_dir():
+        for path in sorted(refs_dir.rglob("*")):
+            if path.is_file() and len(references) < MAX_REFERENCES:
+                references.append(str(path.relative_to(skill_dir)))
+    return {"slug": slugify(skill_dir.name), "name": parsed["name"],
+            "description": parsed["description"], "body": parsed["body"],
+            "references": references, "path": str(skill_dir),
+            "kind": "skill"}
+
+
+def _note_info(note_file: Path) -> dict | None:
+    """Read one loose Markdown note (saved via /api/skill/save)."""
+    # Same rule as skills: the note must resolve inside its own
+    # directory — a symlink pointing elsewhere is refused.
+    try:
+        if note_file.resolve().parent != note_file.parent.resolve():
+            return None
+    except OSError:
+        return None
+    text = _read_capped(note_file, SKILL_BODY_CAP)
+    if text is None:
+        return None
+    try:
+        parsed = parse_skill_markdown(text, fallback_name=note_file.stem)
+    except (OSError, UnicodeDecodeError):
+        return None
+    return {"slug": slugify(note_file.stem), "name": parsed["name"],
+            "description": parsed["description"], "body": parsed["body"],
+            "references": [], "path": str(note_file), "kind": "note"}
+
+
+def _iter_roots(repo_root, state_dir):
+    """(skills_dir, source) pairs, repo first so it wins collisions."""
+    roots = []
+    if repo_root is not None:
+        roots.append((Path(repo_root) / "skills", "repo"))
+    if state_dir is not None:
+        roots.append((Path(state_dir) / "skills", "state"))
+    return roots
+
+
+def discover_skills(repo_root=None, state_dir=None) -> list:
+    """Every installed skill + saved note, as list entries.
+
+    Each entry: slug, name, description, kind ("skill" or "note"),
+    source ("repo" or "state"), path, reference_count. Repo wins when
+    the same slug exists in both roots.
+    """
+    found = {}
+    for skills_dir, source in _iter_roots(repo_root, state_dir):
+        if not skills_dir.is_dir():
+            continue
+        for child in sorted(skills_dir.iterdir()):
+            # Staging/backup leftovers are dot-prefixed and must never
+            # appear as skills (F6, follow-up 5): a concurrent listing
+            # used to show phantom entries while an install was
+            # staging or after a crash. recover_interrupted_installs
+            # removes them; discovery ignores them either way.
+            if child.name.startswith("."):
+                continue
+            # A symlinked skill entry could point the read anywhere
+            # (F6 alternate-path bypass): only real entries load.
+            if child.is_symlink():
+                continue
+            if child.is_dir():
+                info = _skill_dir_info(child)
+            elif child.is_file() and child.suffix.lower() == ".md":
+                info = _note_info(child)
+            else:
+                continue
+            if info is None:
+                continue
+            slug = info["slug"]
+            if slug in found:
+                continue
+            found[slug] = {
+                "slug": slug, "name": info["name"],
+                "description": info["description"], "kind": info["kind"],
+                "source": source, "path": info["path"],
+                "reference_count": len(info["references"])}
+    return [found[slug] for slug in sorted(found)]
+
+
+def load_skill(repo_root=None, state_dir=None, slug: str = "") -> dict | None:
+    """Full skill content for chat: body + reference list.
+
+    Returns None for an unknown slug. The body is capped so one skill
+    cannot blow out the prompt budget.
+    """
+    want = slugify(slug)
+    for skills_dir, _source in _iter_roots(repo_root, state_dir):
+        if not skills_dir.is_dir():
+            continue
+        for child in sorted(skills_dir.iterdir()):
+            # Symlinked entries are refused (see discover_skills).
+            if child.is_symlink():
+                continue
+            if child.is_dir():
+                info = _skill_dir_info(child)
+            elif child.is_file() and child.suffix.lower() == ".md":
+                info = _note_info(child)
+            else:
+                continue
+            if info is not None and info["slug"] == want:
+                info["body"] = info["body"][:SKILL_BODY_CAP]
+                return info
+    return None
+
+
+def load_skill_reference(repo_root=None, state_dir=None,
+                         slug: str = "", reference: str = "") -> dict | None:
+    """One reference file from inside an installed skill, jailed.
+
+    ``reference`` must stay under the skill directory (no absolute
+    paths, no ``..`` escapes). Returns None for an unknown skill, a
+    missing file, or an escape attempt. Content is capped.
+    """
+    skill = load_skill(repo_root, state_dir, slug)
+    if skill is None:
+        return None
+    if not reference or reference.startswith(("/", "\\")):
+        return None
+    skill_dir = Path(skill["path"])
+    if skill["kind"] == "note":
+        return None
+    target = (skill_dir / reference).resolve()
+    try:
+        target.relative_to(skill_dir.resolve())
+    except ValueError:
+        return None
+    if not target.is_file():
+        return None
+    # Size is enforced on the resolved target before reading (F6):
+    # a symlink to a huge file inside the skill dir is refused here
+    # even though it passes the relative_to check above.
+    content = _read_capped(target, REFERENCE_CAP)
+    if content is None:
+        return None
+    return {"skill": skill["slug"], "reference": reference,
+            "content": content[:REFERENCE_CAP]}
+
+
+def _file_cap(path: Path) -> int:
+    """Byte cap for one installed file: SKILL.md gets the body cap,
+    everything else (references, agents) gets the reference cap."""
+    if path.name == "SKILL.md":
+        return SKILL_BODY_CAP * 4 + 1024
+    return REFERENCE_CAP * 4 + 1024
+
+
+def _validate_skill_tree(skill_dir: Path) -> dict:
+    """Validate a skill directory completely, without modifying
+    anything (F6, follow-up 4).
+
+    Every entry must be a real file or directory — symlinks are
+    refused outright, so a link can never smuggle outside content
+    into an install, and special objects (FIFOs, sockets, devices)
+    are refused outright, so a FIFO can never block a read or a copy
+    waiting for a writer. Every file must be a regular file within
+    its byte cap and readable through _read_capped. SKILL.md must
+    exist and parse. The source root itself must not be a symlink.
+    Raises ValueError on the first problem; the caller installs
+    nothing when this raises. Entries are checked with lstat (never
+    following a link); the copy stage re-checks every entry at copy
+    time, so validation is defense-in-depth and the copy is the
+    enforcement boundary.
+    """
+    skill_dir = Path(skill_dir)
+    skill_file = skill_dir / "SKILL.md"
+    if not skill_dir.is_dir():
+        raise ValueError(f"not a skill directory: {skill_dir}")
+    if skill_dir.is_symlink():
+        raise ValueError(f"symlinked skill root refused: {skill_dir}")
+    if not skill_file.is_file() or skill_file.is_symlink():
+        raise ValueError(f"not a skill directory (no SKILL.md): {skill_dir}")
+    for entry in sorted(skill_dir.rglob("*")):
+        try:
+            st = os.lstat(entry)
+        except OSError as exc:
+            raise ValueError(f"unreadable entry: {entry}") from exc
+        mode = st.st_mode
+        if stat.S_ISLNK(mode):
+            raise ValueError(f"symlinked entry refused: {entry}")
+        if stat.S_ISDIR(mode):
+            continue
+        if not stat.S_ISREG(mode):
+            raise ValueError(f"special file refused: {entry}")
+        if st.st_size > _file_cap(entry):
+            raise ValueError(f"file too large: {entry}")
+    info = _skill_dir_info(skill_dir)
+    if info is None:
+        raise ValueError(f"skill is too large or unreadable: {skill_dir}")
+    for ref in info["references"]:
+        if _read_capped(skill_dir / ref, REFERENCE_CAP) is None:
+            raise ValueError(f"reference too large or unreadable: {ref}")
+    return info
+
+
+# One lock per installed skill slug, in two layers (follow-up 6):
+# a threading lock for threads in this process, and an flock(2)
+# exclusive lock on a per-slug lock file for processes. The threading
+# lock is taken first: it serializes threads, and it also makes the
+# flock acquisition safe — flock conflicts even within one process
+# across separate opens, so code that already holds a slug's lock
+# (install_skill calling recovery for the same slug) must not try
+# to flock it again. The lock files are never deleted: deleting a
+# lock file reintroduces the race it exists to close. flock is
+# released by the OS when the holder dies, so a crashed install's
+# lock does not block the recovery that follows it. The lock file is
+# dot-prefixed, so discover_skills never lists it as a skill.
+_INSTALL_LOCKS: dict[str, threading.Lock] = {}
+_INSTALL_LOCKS_GUARD = threading.Lock()
+
+
+def _thread_install_lock(slug):
+    """Return the in-process install lock for one slug."""
+    with _INSTALL_LOCKS_GUARD:
+        return _INSTALL_LOCKS.setdefault(slug, threading.Lock())
+
+
+@contextmanager
+def _slug_lock(skills_dir, slug):
+    """Hold both layers of the per-slug install lock: the threading
+    lock, then an exclusive flock on `.<slug>.lock` in the skills
+    directory. Blocks until every other thread and process
+    installing the same slug has finished. The caller must ensure
+    the skills directory exists first."""
+    skills_dir = Path(skills_dir)
+    lock_path = skills_dir / f".{slug}.lock"
+    thread_lock = _thread_install_lock(slug)
+    with thread_lock:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+        finally:
+            os.close(fd)
+
+
+def _remove_tree_or_link(path):
+    """Remove a directory tree, a file, or a symlink (never follow it)."""
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def _recover_locked(skills_dir, slug):
+    """Heal one slug's interrupted install. The caller must hold
+    that slug's lock (see _slug_lock): recovery deletes staging
+    directories and renames backups, so it must never run while
+    another process is actively installing the same slug — without
+    the lock it could delete a live staging directory out from
+    under a running install (follow-up 6)."""
+    skills_dir = Path(skills_dir)
+    recovered, cleaned = [], []
+    try:
+        children = sorted(skills_dir.iterdir())
+    except OSError:
+        return {"recovered": recovered, "cleaned": cleaned}
+    for child in children:
+        name = child.name
+        if not name.startswith("."):
+            continue
+        parsed = None
+        for marker, kind in ((".backup-", "backup"),
+                             (".staging-", "staging")):
+            rest = name[1:]
+            if marker in rest:
+                base, _tag = rest.rsplit(marker, 1)
+                if base:
+                    parsed = (base, kind)
+                break
+        if parsed is None:
+            continue
+        target_slug, kind = parsed
+        if target_slug != slug:
+            continue
+        dest = skills_dir / target_slug
+        try:
+            if kind == "staging":
+                _remove_tree_or_link(child)
+                cleaned.append(target_slug)
+            elif kind == "backup":
+                if not dest.exists() and not dest.is_symlink():
+                    child.rename(dest)
+                    recovered.append(target_slug)
+                else:
+                    _remove_tree_or_link(child)
+                    cleaned.append(target_slug)
+        except OSError:
+            continue
+    return {"recovered": recovered, "cleaned": cleaned}
+
+
+def _leftover_slugs(skills_dir):
+    """Slugs with a backup or staging leftover in a skills dir."""
+    skills_dir = Path(skills_dir)
+    slugs = set()
+    try:
+        children = sorted(skills_dir.iterdir())
+    except OSError:
+        return slugs
+    for child in children:
+        name = child.name
+        if not name.startswith("."):
+            continue
+        for marker in (".backup-", ".staging-"):
+            rest = name[1:]
+            if marker in rest:
+                base, _tag = rest.rsplit(marker, 1)
+                if base:
+                    slugs.add(base)
+                break
+    return slugs
+
+
+def recover_interrupted_installs(skills_dir, slug=None):
+    """Heal interrupted installs in a skills directory (F6, follow-up 5).
+
+    A crash between install_skill's two renames leaves the destination
+    missing and the old install as `.<slug>.backup-<tag>`; a crash
+    during staging leaves `.<slug>.staging-<tag>` behind. For each
+    leftover: a backup whose destination is missing is renamed back
+    into place (the old install is restored, exactly as it was — no
+    validation, recovery restores the previous state); a backup whose
+    destination exists is an orphan from a completed install and is
+    removed; a staging directory was never live and is removed.
+    When slug is given, only that slug is healed (called under the
+    install lock at the start of install_skill); otherwise every
+    leftover is healed. Returns {"recovered": [...], "cleaned": [...]}.
+    Idempotent: a leftover that vanished mid-scan (another thread
+    healed it) is skipped.
+
+    Cross-process safety (follow-up 6): every slug's recovery runs
+    under that slug's lock, so recovery can never delete another
+    process's ACTIVE staging directory — an active install holds
+    the lock, and recovery blocks on it instead. When healing every
+    slug, locks are taken one at a time in sorted slug order, so two
+    processes recovering different slug sets cannot deadlock.
+    """
+    skills_dir = Path(skills_dir)
+    if not skills_dir.is_dir():
+        return {"recovered": [], "cleaned": []}
+    if slug is not None:
+        with _slug_lock(skills_dir, slug):
+            return _recover_locked(skills_dir, slug)
+    recovered, cleaned = [], []
+    for target_slug in sorted(_leftover_slugs(skills_dir)):
+        with _slug_lock(skills_dir, target_slug):
+            result = _recover_locked(skills_dir, target_slug)
+        recovered.extend(result["recovered"])
+        cleaned.extend(result["cleaned"])
+    return {"recovered": recovered, "cleaned": cleaned}
+
+
+def _copy_skill_tree(src, dst):
+    """Copy a skill directory with per-entry checks at copy time (F6,
+    follow-up 5). Replaces shutil.copytree + ignore/copy_function:
+    that split the traversal into two moments (listing time for the
+    ignore filter, copy time for the copy function), so a directory
+    or symlink swapped between the two could be followed. This copy
+    opens every directory with O_NOFOLLOW and stats every entry
+    relative to its parent directory's file descriptor, so a path
+    swap during traversal is caught at the entry it touches:
+    symlinks, non-regular files (FIFO, socket, device), and over-cap
+    files are refused; directories are recursed through their own
+    descriptor, never through a path. Files are streamed in bounded
+    chunks (no whole-file read) and opened with O_NOFOLLOW, then
+    re-checked by fstat (same device + inode, regular, within cap)
+    before a byte is copied.
+    """
+    src = Path(src)
+    dst = Path(dst)
+    try:
+        dfd = os.open(src, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                      | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as exc:
+        raise ValueError(f"cannot open skill directory: {src}") from exc
+    try:
+        st = os.fstat(dfd)
+        if not stat.S_ISDIR(st.st_mode):
+            raise ValueError(f"not a skill directory: {src}")
+        os.mkdir(dst)
+        _copy_skill_dir_fd(dfd, dst)
+    finally:
+        os.close(dfd)
+
+
+def _copy_skill_dir_fd(dfd, dst):
+    """Copy every entry of an already-open directory (see _copy_skill_tree)."""
+    for name in sorted(os.listdir(dfd)):
+        try:
+            st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+        except OSError as exc:
+            raise ValueError(f"unreadable entry: {name}") from exc
+        mode = st.st_mode
+        target = dst / name
+        if stat.S_ISLNK(mode):
+            raise ValueError(f"symlinked entry refused: {name}")
+        if stat.S_ISDIR(mode):
+            try:
+                sub = os.open(name,
+                              os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                              | getattr(os, "O_NOFOLLOW", 0),
+                              dir_fd=dfd)
+            except OSError as exc:
+                raise ValueError(f"cannot open directory: {name}") from exc
+            try:
+                fst = os.fstat(sub)
+                if not stat.S_ISDIR(fst.st_mode):
+                    raise ValueError(f"not a directory: {name}")
+                os.mkdir(target)
+                _copy_skill_dir_fd(sub, target)
+            finally:
+                os.close(sub)
+        elif stat.S_ISREG(mode):
+            cap = max(SKILL_BODY_CAP, REFERENCE_CAP) * 4 + 1024
+            if st.st_size > cap:
+                raise ValueError(f"file too large: {name}")
+            _copy_skill_file(dfd, name, st, target, cap)
+        else:
+            raise ValueError(f"special file refused: {name}")
+
+
+def _copy_skill_file(dfd, name, pre_stat, target, cap):
+    """Copy one regular file: open with O_NOFOLLOW + O_NONBLOCK
+    relative to its parent directory's descriptor, re-check by
+    fstat, stream in bounded chunks (see _copy_skill_tree).
+
+    O_NONBLOCK matters because O_NOFOLLOW does NOT refuse a FIFO:
+    without it, a regular file swapped for a FIFO between the
+    pre-stat and the open would block the open until a writer
+    appears. With O_NONBLOCK the open returns immediately and the
+    fstat S_ISREG check below refuses it. The cumulative byte cap
+    is enforced WHILE streaming (follow-up 6): the pre-check only
+    bounds the size at open time, so a file that grows during the
+    copy (concurrent writer) would otherwise be copied past the
+    cap. When the running total exceeds the cap, the copy aborts
+    and the partial target is removed — no over-cap file is ever
+    left in place.
+    """
+    try:
+        fd = os.open(name,
+                     os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                     | getattr(os, "O_NONBLOCK", 0),
+                     dir_fd=dfd)
+    except OSError as exc:
+        raise ValueError(f"cannot open file: {name}") from exc
+    try:
+        fst = os.fstat(fd)
+        if not stat.S_ISREG(fst.st_mode):
+            raise ValueError(f"not a regular file: {name}")
+        if (fst.st_dev, fst.st_ino) != (pre_stat.st_dev, pre_stat.st_ino):
+            raise ValueError(f"file changed during copy: {name}")
+        if fst.st_size > cap:
+            raise ValueError(f"file too large: {name}")
+        out = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        try:
+            total = 0
+            while True:
+                chunk = os.read(fd, 64 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > cap:
+                    raise ValueError(
+                        f"file grew past cap during copy: {name}")
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(out, view)
+                    view = view[written:]
+        except OSError as exc:
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise ValueError(f"cannot copy file: {name}") from exc
+        except ValueError:
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        finally:
+            os.close(out)
+    finally:
+        os.close(fd)
+
+
+def install_skill(src_dir, dest_root, slug: str | None = None) -> dict:
+    """Copy a skill directory (SKILL.md + references/ + agents/) into
+    ``dest_root/<slug>``. The replacement is validated COMPLETELY
+    before anything already installed is touched (F6, follow-up 4):
+    the source is validated, the copy is staged beside the
+    destination and validated again, and only then is the old
+    installation swapped aside and the staged copy renamed into
+    place. A failed validation or a failed swap leaves the previous
+    valid installation exactly as it was. Refuses sources without a
+    SKILL.md, and refuses symlinked, oversized, unreadable, or
+    special (FIFO / socket / device) entries anywhere in the
+    replacement, including a symlinked source root. Concurrent
+    installs of the same slug are serialized by a per-slug lock
+    that works across processes as well as threads (follow-up 6):
+    a threading lock plus an flock on `.<slug>.lock`. Interrupted
+    installs are healed first: a crash between the two renames
+    leaves the old install as a backup directory, and
+    recover_interrupted_installs restores it before the new install
+    proceeds."""
+    src = Path(src_dir)
+    slug = slugify(slug or src.name)
+    dest_root = Path(dest_root)
+    dest_root.mkdir(parents=True, exist_ok=True)
+    with _slug_lock(dest_root, slug):
+        _recover_locked(dest_root, slug)
+        _validate_skill_tree(src)
+        dest = Path(dest_root) / slug
+        tag = uuid.uuid4().hex[:12]
+        staging = dest.parent / f".{dest.name}.staging-{tag}"
+        backup = dest.parent / f".{dest.name}.backup-{tag}"
+        try:
+            _copy_skill_tree(src, staging)
+            info = _validate_skill_tree(staging)
+            if dest.exists() or dest.is_symlink():
+                dest.rename(backup)
+            try:
+                staging.rename(dest)
+            except OSError:
+                if backup.exists() or backup.is_symlink():
+                    backup.rename(dest)
+                raise
+            if backup.exists() or backup.is_symlink():
+                _remove_tree_or_link(backup)
+            return {"slug": dest.name, "name": info["name"],
+                    "description": info["description"], "path": str(dest),
+                    "reference_count": len(info["references"])}
+        finally:
+            if staging.exists() or staging.is_symlink():
+                if staging.is_dir() and not staging.is_symlink():
+                    shutil.rmtree(staging, ignore_errors=True)
+                else:
+                    staging.unlink(missing_ok=True)
+
+
+def format_skill_for_prompt(skill: dict) -> str:
+    """Render a loaded skill as a system-prompt block."""
+    lines = [f"# Skill: {skill['name']} (/{skill['slug']})"]
+    if skill.get("description"):
+        lines.append(skill["description"])
+    lines.append("")
+    lines.append(skill.get("body", "")[:SKILL_BODY_CAP])
+    refs = skill.get("references") or []
+    if refs:
+        lines.append("")
+        lines.append("Reference files available via the "
+                     "read_skill_reference tool (skill + relative path):")
+        for ref in refs:
+            lines.append(f"- {ref}")
+    lines.append("")
+    lines.append("Follow this skill's guidance for the user's request. "
+                 "It was installed by Wallace; treat it as his "
+                 "instructions for this work.")
+    return "\n".join(lines)

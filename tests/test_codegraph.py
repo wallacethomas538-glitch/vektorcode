@@ -1,0 +1,561 @@
+"""Tests for vektor_cloud/codegraph.py (codegraph-skill).
+
+Most tests need tree-sitter + kuzu and skip honestly when the
+dependencies are absent — each of those carries its own skip mark.
+The unavailable-path test has NO mark on purpose: it must execute in
+both environments (it monkeypatches AVAILABLE off itself). A
+module-level skip mark used to swallow it in the no-deps environment;
+that arrangement is the bug Big Chat caught, and this file is the
+regression guard for it.
+"""
+
+import os
+from pathlib import Path
+
+import pytest
+
+from vektor_cloud import codegraph
+
+needs_deps = pytest.mark.skipif(
+    not codegraph.AVAILABLE,
+    reason="codegraph deps (tree-sitter/kuzu) not installed",
+)
+
+
+@pytest.fixture()
+def repo(tmp_path):
+    (tmp_path / "a.py").write_text(
+        "def foo():\n"
+        "    return 1\n"
+        "\n"
+        "def bar():\n"
+        "    return foo()\n"
+        "\n"
+        "class Calc:\n"
+        "    def calc(self):\n"
+        "        return foo()\n"
+    )
+    (tmp_path / "b.py").write_text(
+        "from a import foo\n"
+        "\n"
+        "def use():\n"
+        "    return foo()\n"
+    )
+    (tmp_path / "c.py").write_text("def foo():\n    return 2\n")
+    return tmp_path
+
+
+@needs_deps
+def test_build_stats(repo, tmp_path):
+    stats = codegraph.build_graph(repo, tmp_path / "graph.db")
+    assert stats["files"] == 3
+    assert stats["modules"] == 3
+    assert stats["symbols"] == 6  # a.foo, a.bar, a.Calc, a.Calc.calc, b.use, c.foo
+    assert stats["calls_resolved"] >= 3
+    assert stats["complete"] is True
+    assert stats["failed_files"] == []
+
+
+@needs_deps
+def test_impact_direct_callers_flagged_ambiguous_on_collision(repo, tmp_path):
+    # a.foo and c.foo share the simple name "foo", so the direct callers
+    # of a.foo are POTENTIALLY AMBIGUOUS: they may be callers of c.foo.
+    # The API must say so instead of presenting them as exact.
+    db = tmp_path / "graph.db"
+    codegraph.build_graph(repo, db)
+    result = codegraph.impact(db, "a.foo")
+    assert set(result["direct"]) == {"a.bar", "a.Calc.calc", "b.use"}
+    assert result["direct_ambiguous"] is True
+    assert result["ambiguous_definitions"] == ["a.foo", "c.foo"]
+
+
+@needs_deps
+def test_impact_direct_callers_unambiguous_when_unique(repo, tmp_path):
+    # "bar" is defined exactly once, so its direct callers are not
+    # ambiguous — the flag must stay off for the unique case.
+    db = tmp_path / "graph.db"
+    codegraph.build_graph(repo, db)
+    result = codegraph.impact(db, "a.bar")
+    assert result["direct"] == []
+    assert result["direct_ambiguous"] is False
+    assert result["ambiguous_definitions"] == ["a.bar"]
+
+
+@needs_deps
+def test_name_collision_is_reported_not_hidden(repo, tmp_path):
+    # b.use, a.bar and a.Calc.calc all call foo() by bare name, so each
+    # resolves to BOTH a.foo and c.foo. The graph must show that honestly
+    # instead of silently picking one — so the two impacts are identical,
+    # and the caller cannot tell from the graph alone which foo was meant.
+    db = tmp_path / "graph.db"
+    codegraph.build_graph(repo, db)
+    a_foo = codegraph.impact(db, "a.foo")
+    c_foo = codegraph.impact(db, "c.foo")
+    assert set(a_foo["direct"]) == {"a.bar", "a.Calc.calc", "b.use"}
+    assert set(c_foo["direct"]) == set(a_foo["direct"])
+    assert a_foo["direct_ambiguous"] is True
+    assert c_foo["direct_ambiguous"] is True
+
+
+@needs_deps
+def test_importers(repo, tmp_path):
+    db = tmp_path / "graph.db"
+    codegraph.build_graph(repo, db)
+    assert codegraph.importers(db, "a") == ["b"]
+    assert codegraph.importers(db, "c") == []
+
+
+@needs_deps
+def test_stats_counts(repo, tmp_path):
+    db = tmp_path / "graph.db"
+    codegraph.build_graph(repo, db)
+    s = codegraph.stats(db)
+    assert s["modules"] == 3
+    assert s["symbols"] == 6
+    assert s["defines"] == 6
+    assert s["imports"] == 1
+    assert s["calls"] >= 3
+
+
+def test_build_raises_plainly_without_deps(monkeypatch, tmp_path):
+    monkeypatch.setattr(codegraph, "AVAILABLE", False)
+    with pytest.raises(RuntimeError, match="code graph unavailable"):
+        codegraph.build_graph(tmp_path, tmp_path / "graph.db")
+
+
+# --- Correction 1: database path safety -------------------------------
+# build_graph() replaces the database directory on rebuild. It must
+# only delete a directory it can verify is a VektorGraph database (or
+# an empty one). Everything else must raise, with the data intact.
+
+
+@needs_deps
+def test_build_refuses_repo_root(repo, tmp_path):
+    with pytest.raises(ValueError, match="refusing to use database path"):
+        codegraph.build_graph(repo, repo)
+    assert (repo / "a.py").is_file()  # repo untouched
+
+
+@needs_deps
+def test_build_refuses_parent_of_repo(repo, tmp_path):
+    with pytest.raises(ValueError, match="refusing to use database path"):
+        codegraph.build_graph(repo, repo.parent)
+    assert (repo / "a.py").is_file()
+
+
+@needs_deps
+def test_build_refuses_filesystem_root(repo, tmp_path):
+    with pytest.raises(ValueError, match="refusing to use database path"):
+        codegraph.build_graph(repo, Path("/"))
+
+
+@needs_deps
+def test_build_refuses_home_directory(repo, tmp_path):
+    with pytest.raises(ValueError, match="refusing to use database path"):
+        codegraph.build_graph(repo, Path.home())
+
+
+@needs_deps
+def test_build_refuses_unmarked_nonempty_dir(repo, tmp_path):
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    sentinel = foreign / "keep-me.txt"
+    sentinel.write_text("not a database")
+    with pytest.raises(ValueError, match="not a VektorGraph database"):
+        codegraph.build_graph(repo, foreign)
+    assert sentinel.is_file()  # nothing deleted
+
+
+@needs_deps
+def test_build_refuses_existing_file(repo, tmp_path):
+    victim = tmp_path / "not-a-dir"
+    victim.write_text("precious")
+    with pytest.raises(ValueError, match="not a verified VektorGraph database"):
+        codegraph.build_graph(repo, victim)
+    assert victim.read_text() == "precious"
+
+
+@needs_deps
+def test_build_refuses_forged_marker(repo, tmp_path):
+    # The old marker check accepted any file carrying the predictable
+    # marker string. A forged marker must NOT authorize deletion.
+    # (Negative control: this test FAILS on the follow-up 1 code.)
+    victim = tmp_path / "graph.db"
+    victim.write_text("unrelated data, do not delete")
+    marker = tmp_path / "graph.db.vektorgraph-db"
+    marker.write_text("vektorgraph-db-v1\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="not a verified VektorGraph database"):
+        codegraph.build_graph(repo, victim)
+    assert victim.read_text() == "unrelated data, do not delete"
+
+
+@needs_deps
+def test_build_refuses_valid_kuzu_db_wrong_schema(repo, tmp_path):
+    # A real KuzuDB database built for something else is not ours,
+    # even though it opens cleanly.
+    import kuzu
+
+    victim = tmp_path / "graph.db"
+    db = kuzu.Database(str(victim))
+    conn = kuzu.Connection(db)
+    conn.execute("CREATE NODE TABLE Other(name STRING, PRIMARY KEY(name))")
+    del conn, db
+    with pytest.raises(ValueError, match="not a verified VektorGraph database"):
+        codegraph.build_graph(repo, victim)
+    assert victim.is_file()
+    check = kuzu.Database(str(victim), read_only=True)
+    names = {r[0] for r in kuzu.Connection(check).execute(
+        "CALL SHOW_TABLES() RETURN name")}
+    assert names == {"Other"}
+
+
+@needs_deps
+def test_build_refuses_random_bytes_file(repo, tmp_path):
+    victim = tmp_path / "graph.db"
+    victim.write_bytes(b"\x00\x01not a database at all\xff\xfe")
+    with pytest.raises(ValueError, match="not a verified VektorGraph database"):
+        codegraph.build_graph(repo, victim)
+    assert victim.read_bytes().startswith(b"\x00\x01")
+
+
+# --- Follow-up 3: definition verification -------------------------------
+# Table names alone are not verification. These tests build unrelated
+# databases that carry the expected names with incompatible
+# definitions, and prove each one is refused AND left intact.
+
+_CORRECT_DDL = [
+    "CREATE NODE TABLE Module(name STRING, path STRING, PRIMARY KEY(name))",
+    "CREATE NODE TABLE Symbol(name STRING, kind STRING, module STRING, PRIMARY KEY(name))",
+    "CREATE REL TABLE DEFINES(FROM Module TO Symbol)",
+    "CREATE REL TABLE IMPORTS(FROM Module TO Module)",
+    "CREATE REL TABLE CALLS(FROM Symbol TO Symbol)",
+]
+_SENTINEL = "CREATE (:Module {name: 'keep-me', path: 'keep.py'})"
+
+
+def _unrelated_db(tmp_path, name, ddl, setup=None):
+    """Build an unrelated KuzuDB with a sentinel row; return its path."""
+    import kuzu
+
+    path = tmp_path / name
+    db = kuzu.Database(str(path))
+    conn = kuzu.Connection(db)
+    for stmt in ddl:
+        conn.execute(stmt)
+    for stmt in (setup if setup is not None else [_SENTINEL]):
+        conn.execute(stmt)
+    del conn, db
+    return path
+
+
+def _assert_intact(path, expected_tables, sentinel_value="keep-me"):
+    """Prove the unrelated database is untouched: same tables, same row."""
+    import kuzu
+
+    assert path.is_file()
+    db = kuzu.Database(str(path), read_only=True)
+    conn = kuzu.Connection(db)
+    names = {row[0] for row in conn.execute("CALL SHOW_TABLES() RETURN name")}
+    assert names == expected_tables
+    rows = list(conn.execute("MATCH (m:Module) RETURN m.name"))
+    assert rows == [[sentinel_value]]
+    del conn, db
+
+
+@needs_deps
+def test_build_refuses_wrong_column_type(repo, tmp_path):
+    ddl = [s.replace("Module(name STRING", "Module(name INT64")
+           for s in _CORRECT_DDL]
+    victim = _unrelated_db(
+        tmp_path, "graph.db", ddl,
+        setup=["CREATE (:Module {name: 1, path: 'keep.py'})"])
+    with pytest.raises(ValueError, match="not a verified VektorGraph database"):
+        codegraph.build_graph(repo, victim)
+    _assert_intact(victim, {"Module", "Symbol", "DEFINES", "IMPORTS", "CALLS"},
+                   sentinel_value=1)
+
+
+@needs_deps
+def test_build_refuses_missing_column(repo, tmp_path):
+    ddl = [s.replace(", path STRING", "") for s in _CORRECT_DDL]
+    # The sentinel cannot set path here — the column does not exist.
+    victim = _unrelated_db(
+        tmp_path, "graph.db", ddl,
+        setup=["CREATE (:Module {name: 'keep-me'})"])
+    with pytest.raises(ValueError, match="not a verified VektorGraph database"):
+        codegraph.build_graph(repo, victim)
+    _assert_intact(victim, {"Module", "Symbol", "DEFINES", "IMPORTS", "CALLS"})
+
+
+@needs_deps
+def test_build_refuses_wrong_primary_key(repo, tmp_path):
+    ddl = [s.replace("PRIMARY KEY(name))", "PRIMARY KEY(kind))")
+           if s.startswith("CREATE NODE TABLE Symbol") else s
+           for s in _CORRECT_DDL]
+    victim = _unrelated_db(tmp_path, "graph.db", ddl)
+    with pytest.raises(ValueError, match="not a verified VektorGraph database"):
+        codegraph.build_graph(repo, victim)
+    _assert_intact(victim, {"Module", "Symbol", "DEFINES", "IMPORTS", "CALLS"})
+
+
+@needs_deps
+def test_build_refuses_node_table_as_rel(repo, tmp_path):
+    ddl = [("CREATE NODE TABLE DEFINES(name STRING, PRIMARY KEY(name))"
+            if s.startswith("CREATE REL TABLE DEFINES") else s)
+           for s in _CORRECT_DDL]
+    victim = _unrelated_db(tmp_path, "graph.db", ddl)
+    with pytest.raises(ValueError, match="not a verified VektorGraph database"):
+        codegraph.build_graph(repo, victim)
+    _assert_intact(victim, {"Module", "Symbol", "DEFINES", "IMPORTS", "CALLS"})
+
+
+@needs_deps
+def test_build_refuses_wrong_rel_endpoints(repo, tmp_path):
+    # Same five names, correct node schema — but CALLS connects
+    # Module->Symbol instead of Symbol->Symbol. Names alone would
+    # accept this database and delete it. (Negative control: this
+    # test FAILS on the follow-up 2 code.)
+    ddl = [s.replace("CALLS(FROM Symbol TO Symbol)",
+                     "CALLS(FROM Module TO Symbol)") for s in _CORRECT_DDL]
+    victim = _unrelated_db(
+        tmp_path, "graph.db", ddl,
+        setup=["CREATE (:Module {name: 'keep-me', path: 'keep.py'})",
+               "CREATE (:Symbol {name: 's1', kind: 'function', module: 'keep-me'})",
+               "MATCH (m:Module {name: 'keep-me'}), (s:Symbol {name: 's1'}) "
+               "CREATE (m)-[:CALLS]->(s)"])
+    with pytest.raises(ValueError, match="not a verified VektorGraph database"):
+        codegraph.build_graph(repo, victim)
+    _assert_intact(victim, {"Module", "Symbol", "DEFINES", "IMPORTS", "CALLS"})
+    import kuzu
+    db = kuzu.Database(str(victim), read_only=True)
+    conn = kuzu.Connection(db)
+    edges = list(conn.execute(
+        "MATCH (:Module)-[:CALLS]->(:Symbol) RETURN count(*)"))
+    assert edges == [[1]]  # the relationship itself survived too
+    del conn, db
+
+
+@needs_deps
+def test_build_refuses_extra_table(repo, tmp_path):
+    ddl = _CORRECT_DDL + [
+        "CREATE NODE TABLE Extra(name STRING, PRIMARY KEY(name))"]
+    victim = _unrelated_db(tmp_path, "graph.db", ddl)
+    with pytest.raises(ValueError, match="not a verified VektorGraph database"):
+        codegraph.build_graph(repo, victim)
+    _assert_intact(victim, {"Module", "Symbol", "DEFINES", "IMPORTS", "CALLS",
+                            "Extra"})
+
+
+@needs_deps
+def test_build_refuses_rel_with_properties(repo, tmp_path):
+    ddl = [s.replace("CALLS(FROM Symbol TO Symbol)",
+                     "CALLS(FROM Symbol TO Symbol, weight INT)")
+           for s in _CORRECT_DDL]
+    victim = _unrelated_db(tmp_path, "graph.db", ddl)
+    with pytest.raises(ValueError, match="not a verified VektorGraph database"):
+        codegraph.build_graph(repo, victim)
+    _assert_intact(victim, {"Module", "Symbol", "DEFINES", "IMPORTS", "CALLS"})
+
+
+# --- Follow-up 4: identity metadata ------------------------------------
+# Schema alone is not ownership. These tests build unrelated databases
+# with the exact graph schema and prove each one is refused AND left
+# intact because it lacks valid VektorGraph identity metadata.
+
+_META_DDL = ("CREATE NODE TABLE VektorGraphMeta"
+             "(key STRING, value STRING, PRIMARY KEY(key))")
+_META_TABLES = {"Module", "Symbol", "DEFINES", "IMPORTS", "CALLS",
+                "VektorGraphMeta"}
+
+
+@needs_deps
+def test_build_refuses_exact_schema_without_identity(repo, tmp_path):
+    # THE discriminator (negative control: this test FAILS on the
+    # follow-up 3 code). An unrelated database with the exact graph
+    # schema — same five tables, same definitions — but no identity
+    # metadata at all. Follow-up 3 verifies schema only, so it accepts
+    # this database and deletes it. Follow-up 4 refuses it.
+    victim = _unrelated_db(tmp_path, "graph.db", _CORRECT_DDL)
+    with pytest.raises(ValueError, match="not a verified VektorGraph database"):
+        codegraph.build_graph(repo, victim)
+    _assert_intact(victim, {"Module", "Symbol", "DEFINES", "IMPORTS", "CALLS"})
+
+
+@needs_deps
+def test_build_refuses_empty_identity_table(repo, tmp_path):
+    # All six tables, correct definitions — but the identity table is
+    # empty. No identity record, no replacement.
+    victim = _unrelated_db(tmp_path, "graph.db", _CORRECT_DDL + [_META_DDL])
+    with pytest.raises(ValueError, match="not a verified VektorGraph database"):
+        codegraph.build_graph(repo, victim)
+    _assert_intact(victim, _META_TABLES)
+
+
+@needs_deps
+def test_build_refuses_wrong_identity_value(repo, tmp_path):
+    victim = _unrelated_db(
+        tmp_path, "graph.db", _CORRECT_DDL + [_META_DDL],
+        setup=[_SENTINEL,
+               "CREATE (:VektorGraphMeta {key: 'identity', value: 'something-else'})",
+               "CREATE (:VektorGraphMeta {key: 'schema_version', value: '1'})"])
+    with pytest.raises(ValueError, match="not a verified VektorGraph database"):
+        codegraph.build_graph(repo, victim)
+    _assert_intact(victim, _META_TABLES)
+
+
+@needs_deps
+def test_build_refuses_unsupported_schema_version(repo, tmp_path):
+    victim = _unrelated_db(
+        tmp_path, "graph.db", _CORRECT_DDL + [_META_DDL],
+        setup=[_SENTINEL,
+               "CREATE (:VektorGraphMeta {key: 'identity', value: 'vektorgraph'})",
+               "CREATE (:VektorGraphMeta {key: 'schema_version', value: '99'})"])
+    with pytest.raises(ValueError, match="not a verified VektorGraph database"):
+        codegraph.build_graph(repo, victim)
+    _assert_intact(victim, _META_TABLES)
+
+
+@needs_deps
+def test_build_replaces_genuine_database_with_identity(repo, tmp_path):
+    # A genuine VektorGraph database — built by build_graph, identity
+    # rows included — can still be safely replaced, and the rebuilt
+    # database still carries its identity.
+    db = tmp_path / "graph.db"
+    first = codegraph.build_graph(repo, db)
+    assert first["complete"] is True
+    (repo / "d.py").write_text("def extra():\n    return 3\n")
+    second = codegraph.build_graph(repo, db)
+    assert second["complete"] is True
+    assert second["files"] == 4
+    assert second["modules"] == 4
+    import kuzu
+    conn_db = kuzu.Database(str(db), read_only=True)
+    conn = kuzu.Connection(conn_db)
+    meta = {row[0]: row[1] for row in conn.execute(
+        "MATCH (m:VektorGraphMeta) RETURN m.key, m.value")}
+    assert meta == {"identity": "vektorgraph", "schema_version": "1"}
+    del conn, conn_db
+
+
+@needs_deps
+def test_build_refuses_symlink_to_repo_root(repo, tmp_path):
+    link = tmp_path / "db-link"
+    os.symlink(repo, link)
+    with pytest.raises(ValueError, match="refusing to use database path"):
+        codegraph.build_graph(repo, link)
+    assert (repo / "a.py").is_file()
+
+
+@needs_deps
+def test_build_refuses_symlink_to_empty_dir(repo, tmp_path):
+    # The old code resolved the symlink, saw an empty directory, and
+    # rmtree'd the TARGET — an unrelated directory the caller never
+    # meant as the database. The link itself must be refused.
+    # (Negative control: this test FAILS on the follow-up 1 code.)
+    victim = tmp_path / "victim-dir"
+    victim.mkdir()
+    link = tmp_path / "db-link"
+    os.symlink(victim, link)
+    with pytest.raises(ValueError, match="symlink"):
+        codegraph.build_graph(repo, link)
+    assert victim.is_dir()  # untouched
+    assert list(victim.iterdir()) == []
+
+
+@needs_deps
+def test_build_replaces_real_database(repo, tmp_path):
+    # A database built by build_graph() verifies by its actual schema,
+    # so a rebuild may replace it.
+    db = tmp_path / "graph.db"
+    first = codegraph.build_graph(repo, db)
+    assert first["complete"] is True
+    assert db.is_file()  # KuzuDB stores the database as a single file
+    second = codegraph.build_graph(repo, db)
+    assert second["complete"] is True
+    assert second["files"] == 3
+
+
+# --- Correction 3: incomplete graph detection --------------------------
+# Files that fail to parse must be recorded, never silently skipped.
+
+
+@needs_deps
+def test_build_records_parse_failures(repo, tmp_path):
+    # A directory named *.py is found by rglob but cannot be read as a
+    # file, so it fails to parse for real — no monkeypatching needed.
+    (tmp_path / "broken.py").mkdir()
+    stats = codegraph.build_graph(repo, tmp_path / "graph.db")
+    assert stats["complete"] is False
+    assert stats["files"] == 4
+    assert stats["files_parsed"] == 3
+    assert [entry["path"] for entry in stats["failed_files"]] == ["broken.py"]
+    assert stats["modules"] == 3  # the good files still build
+
+
+@needs_deps
+def test_build_records_parse_failures_monkeypatched(repo, tmp_path, monkeypatch):
+    real_parse = codegraph.parse_file
+
+    def flaky(path, root):
+        if path.name == "b.py":
+            raise OSError("disk read failed (test)")
+        return real_parse(path, root)
+
+    monkeypatch.setattr(codegraph, "parse_file", flaky)
+    stats = codegraph.build_graph(repo, tmp_path / "graph.db")
+    assert stats["complete"] is False
+    assert [entry["path"] for entry in stats["failed_files"]] == ["b.py"]
+    assert "OSError" in stats["failed_files"][0]["error"]
+
+
+@needs_deps
+def test_build_strict_fails_on_parse_failure(repo, tmp_path):
+    (tmp_path / "broken.py").mkdir()
+    with pytest.raises(RuntimeError, match="incomplete.*broken.py"):
+        codegraph.build_graph(repo, tmp_path / "graph.db", strict=True)
+
+
+@needs_deps
+def test_build_records_malformed_python(repo, tmp_path):
+    # Tree-sitter's has_error marks this file: a syntax error is a
+    # failed file, never a partial graph, and never "complete".
+    (tmp_path / "bad.py").write_text("def broken(:\n    pass\n")
+    stats = codegraph.build_graph(repo, tmp_path / "graph.db")
+    assert stats["complete"] is False
+    assert stats["files"] == 4
+    assert stats["files_parsed"] == 3
+    assert [entry["path"] for entry in stats["failed_files"]] == ["bad.py"]
+    assert "SyntaxError" in stats["failed_files"][0]["error"]
+    assert stats["modules"] == 3  # the good files still build
+
+
+@needs_deps
+def test_build_strict_preserves_previous_graph(repo, tmp_path):
+    # A failed strict build must leave the previous graph intact:
+    # parse and validate happen BEFORE the old database is replaced.
+    # (Negative control: this test FAILS on the follow-up 1 code,
+    # which deleted the database before parsing.)
+    db = tmp_path / "graph.db"
+    first = codegraph.build_graph(repo, db)
+    assert first["complete"] is True
+    before = codegraph.stats(db)
+    assert before["modules"] == 3
+    assert before["symbols"] == 6
+    # Break a file after the good build.
+    (tmp_path / "a.py").write_text("def broken(:\n    pass\n")
+    with pytest.raises(RuntimeError, match="incomplete.*a.py"):
+        codegraph.build_graph(repo, db, strict=True)
+    # The old graph is still there, answering as before.
+    assert db.is_file()
+    after = codegraph.stats(db)
+    assert after == before
+    assert set(codegraph.impact(db, "a.foo")["direct"]) == {
+        "a.bar", "a.Calc.calc", "b.use"}
+
+
+@needs_deps
+def test_build_complete_when_all_parse(repo, tmp_path):
+    stats = codegraph.build_graph(repo, tmp_path / "graph.db")
+    assert stats["complete"] is True
+    assert stats["failed_files"] == []
+    assert stats["files_parsed"] == stats["files"] == 3
