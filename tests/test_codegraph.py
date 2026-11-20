@@ -218,6 +218,145 @@ def test_build_refuses_random_bytes_file(repo, tmp_path):
     assert victim.read_bytes().startswith(b"\x00\x01")
 
 
+# --- Follow-up 3: definition verification -------------------------------
+# Table names alone are not verification. These tests build unrelated
+# databases that carry the expected names with incompatible
+# definitions, and prove each one is refused AND left intact.
+
+_CORRECT_DDL = [
+    "CREATE NODE TABLE Module(name STRING, path STRING, PRIMARY KEY(name))",
+    "CREATE NODE TABLE Symbol(name STRING, kind STRING, module STRING, PRIMARY KEY(name))",
+    "CREATE REL TABLE DEFINES(FROM Module TO Symbol)",
+    "CREATE REL TABLE IMPORTS(FROM Module TO Module)",
+    "CREATE REL TABLE CALLS(FROM Symbol TO Symbol)",
+]
+_SENTINEL = "CREATE (:Module {name: 'keep-me', path: 'keep.py'})"
+
+
+def _unrelated_db(tmp_path, name, ddl, setup=None):
+    """Build an unrelated KuzuDB with a sentinel row; return its path."""
+    import kuzu
+
+    path = tmp_path / name
+    db = kuzu.Database(str(path))
+    conn = kuzu.Connection(db)
+    for stmt in ddl:
+        conn.execute(stmt)
+    for stmt in (setup if setup is not None else [_SENTINEL]):
+        conn.execute(stmt)
+    del conn, db
+    return path
+
+
+def _assert_intact(path, expected_tables, sentinel_value="keep-me"):
+    """Prove the unrelated database is untouched: same tables, same row."""
+    import kuzu
+
+    assert path.is_file()
+    db = kuzu.Database(str(path), read_only=True)
+    conn = kuzu.Connection(db)
+    names = {row[0] for row in conn.execute("CALL SHOW_TABLES() RETURN name")}
+    assert names == expected_tables
+    rows = list(conn.execute("MATCH (m:Module) RETURN m.name"))
+    assert rows == [[sentinel_value]]
+    del conn, db
+
+
+@needs_deps
+def test_build_refuses_wrong_column_type(repo, tmp_path):
+    ddl = [s.replace("Module(name STRING", "Module(name INT64")
+           for s in _CORRECT_DDL]
+    victim = _unrelated_db(
+        tmp_path, "graph.db", ddl,
+        setup=["CREATE (:Module {name: 1, path: 'keep.py'})"])
+    with pytest.raises(ValueError, match="not a verified VektorGraph database"):
+        codegraph.build_graph(repo, victim)
+    _assert_intact(victim, {"Module", "Symbol", "DEFINES", "IMPORTS", "CALLS"},
+                   sentinel_value=1)
+
+
+@needs_deps
+def test_build_refuses_missing_column(repo, tmp_path):
+    ddl = [s.replace(", path STRING", "") for s in _CORRECT_DDL]
+    # The sentinel cannot set path here — the column does not exist.
+    victim = _unrelated_db(
+        tmp_path, "graph.db", ddl,
+        setup=["CREATE (:Module {name: 'keep-me'})"])
+    with pytest.raises(ValueError, match="not a verified VektorGraph database"):
+        codegraph.build_graph(repo, victim)
+    _assert_intact(victim, {"Module", "Symbol", "DEFINES", "IMPORTS", "CALLS"})
+
+
+@needs_deps
+def test_build_refuses_wrong_primary_key(repo, tmp_path):
+    ddl = [s.replace("PRIMARY KEY(name))", "PRIMARY KEY(kind))")
+           if s.startswith("CREATE NODE TABLE Symbol") else s
+           for s in _CORRECT_DDL]
+    victim = _unrelated_db(tmp_path, "graph.db", ddl)
+    with pytest.raises(ValueError, match="not a verified VektorGraph database"):
+        codegraph.build_graph(repo, victim)
+    _assert_intact(victim, {"Module", "Symbol", "DEFINES", "IMPORTS", "CALLS"})
+
+
+@needs_deps
+def test_build_refuses_node_table_as_rel(repo, tmp_path):
+    ddl = [("CREATE NODE TABLE DEFINES(name STRING, PRIMARY KEY(name))"
+            if s.startswith("CREATE REL TABLE DEFINES") else s)
+           for s in _CORRECT_DDL]
+    victim = _unrelated_db(tmp_path, "graph.db", ddl)
+    with pytest.raises(ValueError, match="not a verified VektorGraph database"):
+        codegraph.build_graph(repo, victim)
+    _assert_intact(victim, {"Module", "Symbol", "DEFINES", "IMPORTS", "CALLS"})
+
+
+@needs_deps
+def test_build_refuses_wrong_rel_endpoints(repo, tmp_path):
+    # Same five names, correct node schema — but CALLS connects
+    # Module->Symbol instead of Symbol->Symbol. Names alone would
+    # accept this database and delete it. (Negative control: this
+    # test FAILS on the follow-up 2 code.)
+    ddl = [s.replace("CALLS(FROM Symbol TO Symbol)",
+                     "CALLS(FROM Module TO Symbol)") for s in _CORRECT_DDL]
+    victim = _unrelated_db(
+        tmp_path, "graph.db", ddl,
+        setup=["CREATE (:Module {name: 'keep-me', path: 'keep.py'})",
+               "CREATE (:Symbol {name: 's1', kind: 'function', module: 'keep-me'})",
+               "MATCH (m:Module {name: 'keep-me'}), (s:Symbol {name: 's1'}) "
+               "CREATE (m)-[:CALLS]->(s)"])
+    with pytest.raises(ValueError, match="not a verified VektorGraph database"):
+        codegraph.build_graph(repo, victim)
+    _assert_intact(victim, {"Module", "Symbol", "DEFINES", "IMPORTS", "CALLS"})
+    import kuzu
+    db = kuzu.Database(str(victim), read_only=True)
+    conn = kuzu.Connection(db)
+    edges = list(conn.execute(
+        "MATCH (:Module)-[:CALLS]->(:Symbol) RETURN count(*)"))
+    assert edges == [[1]]  # the relationship itself survived too
+    del conn, db
+
+
+@needs_deps
+def test_build_refuses_extra_table(repo, tmp_path):
+    ddl = _CORRECT_DDL + [
+        "CREATE NODE TABLE Extra(name STRING, PRIMARY KEY(name))"]
+    victim = _unrelated_db(tmp_path, "graph.db", ddl)
+    with pytest.raises(ValueError, match="not a verified VektorGraph database"):
+        codegraph.build_graph(repo, victim)
+    _assert_intact(victim, {"Module", "Symbol", "DEFINES", "IMPORTS", "CALLS",
+                            "Extra"})
+
+
+@needs_deps
+def test_build_refuses_rel_with_properties(repo, tmp_path):
+    ddl = [s.replace("CALLS(FROM Symbol TO Symbol)",
+                     "CALLS(FROM Symbol TO Symbol, weight INT)")
+           for s in _CORRECT_DDL]
+    victim = _unrelated_db(tmp_path, "graph.db", ddl)
+    with pytest.raises(ValueError, match="not a verified VektorGraph database"):
+        codegraph.build_graph(repo, victim)
+    _assert_intact(victim, {"Module", "Symbol", "DEFINES", "IMPORTS", "CALLS"})
+
+
 @needs_deps
 def test_build_refuses_symlink_to_repo_root(repo, tmp_path):
     link = tmp_path / "db-link"

@@ -40,14 +40,16 @@ Honest limits (by design, not hidden):
     fail the build instead.
   - The database file is REPLACED on rebuild. build_graph() only
     replaces a file it can verify is a VektorGraph database: it opens
-    the file read-only and checks the actual tables against the
-    expected schema. A marker string is NOT verification — anyone can
-    write the marker next to an unrelated file. It refuses to delete
-    the repository, anything containing it, the filesystem root, the
-    home directory, a symlink destination, an unverified file, or any
-    non-empty directory. The old database is replaced only AFTER the
-    code is parsed and validated, so a failed strict build leaves the
-    previous graph intact.
+    the file read-only and checks the actual definitions against the
+    expected schema — table types, columns, data types, primary keys,
+    defaults, relationship endpoints, and no extra tables. Table
+    names alone are NOT verification: an unrelated database can carry
+    the same five names with incompatible definitions. It refuses to
+    delete the repository, anything containing it, the filesystem
+    root, the home directory, a symlink destination, an unverified
+    file, or any non-empty directory. The old database is replaced
+    only AFTER the code is parsed and validated, so a failed strict
+    build leaves the previous graph intact.
 """
 
 import os
@@ -87,25 +89,66 @@ def _require_available() -> None:
 
 # The tables a VektorGraph database must have. Replacement of an
 # existing database file is allowed only when the file opens read-only
-# as a KuzuDB database AND contains all of these — the schema is the
-# verification. A marker string is not verification: anyone can write
-# it next to an unrelated file, so it proves nothing.
-_EXPECTED_TABLES = frozenset({"Module", "Symbol", "DEFINES", "IMPORTS", "CALLS"})
+# as a KuzuDB database AND its actual definitions match this schema
+# exactly: table types, columns, data types, primary keys, defaults,
+# relationship endpoints, and no extra tables. Table NAMES alone are
+# not verification — an unrelated database can carry the same five
+# names with incompatible columns or relationships.
+_EXPECTED_NODE_TABLES = {
+    # table: {property: (data type, is primary key, default)}
+    "Module": {
+        "name": ("STRING", True, "NULL"),
+        "path": ("STRING", False, "NULL"),
+    },
+    "Symbol": {
+        "name": ("STRING", True, "NULL"),
+        "kind": ("STRING", False, "NULL"),
+        "module": ("STRING", False, "NULL"),
+    },
+}
+_EXPECTED_REL_TABLES = {
+    # table: {(from table, to table, from property, to property)}
+    "DEFINES": {("Module", "Symbol", "name", "name")},
+    "IMPORTS": {("Module", "Module", "name", "name")},
+    "CALLS": {("Symbol", "Symbol", "name", "name")},
+}
 
 
 def _is_vektorgraph_db(db_path) -> bool:
     """True only when the file is a KuzuDB database with our schema.
 
-    Opens the file read-only and checks the actual tables. Anything
-    that cannot be opened, or lacks the expected tables, is not a
-    VektorGraph database — including a valid KuzuDB database built for
-    something else, an empty file, and random bytes.
+    Opens the file read-only and checks the actual definitions:
+    exactly the five expected tables, node tables with the right
+    columns, data types, primary keys and defaults, relationship
+    tables with no extra properties and the right endpoints. Anything
+    that cannot be opened, or whose definitions differ in any way,
+    is not a VektorGraph database — including a database that carries
+    the same five table names with incompatible columns or
+    relationships.
     """
     try:
         db = kuzu.Database(str(db_path), read_only=True)
         conn = kuzu.Connection(db)
-        tables = {row[0] for row in conn.execute("CALL SHOW_TABLES() RETURN name")}
-        return _EXPECTED_TABLES <= tables
+        tables = {row[1]: row[2] for row in conn.execute(
+            "CALL SHOW_TABLES() RETURN *")}
+        expected_types = {"Module": "NODE", "Symbol": "NODE",
+                          "DEFINES": "REL", "IMPORTS": "REL",
+                          "CALLS": "REL"}
+        if tables != expected_types:
+            return False
+        for table, expected in _EXPECTED_NODE_TABLES.items():
+            actual = {row[1]: (row[2], row[4], row[3]) for row in conn.execute(
+                f"CALL TABLE_INFO('{table}') RETURN *")}
+            if actual != expected:
+                return False
+        for table, expected in _EXPECTED_REL_TABLES.items():
+            if list(conn.execute(f"CALL TABLE_INFO('{table}') RETURN *")):
+                return False
+            actual = {tuple(row) for row in conn.execute(
+                f"CALL SHOW_CONNECTION('{table}') RETURN *")}
+            if actual != expected:
+                return False
+        return True
     except Exception:
         return False
 

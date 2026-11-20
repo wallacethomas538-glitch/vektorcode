@@ -78,8 +78,10 @@ parsed and validated before the old database is replaced. Files with
 syntax errors are recorded as failed files, never silently skipped.
 The database file is replaced on rebuild only when build_graph() can
 verify it is a VektorGraph database: it opens the file read-only and
-checks the actual tables against the expected schema. A marker string
-is not verification. It refuses to delete anything else — including
+checks the actual definitions against the expected schema — table
+types, columns, data types, primary keys, defaults, relationship
+endpoints, and no extra tables. Table names alone are not
+verification. It refuses to delete anything else — including
 the repository itself, a symlink destination, an unverified file, or
 any non-empty directory.
 
